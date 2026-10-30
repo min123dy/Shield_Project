@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Overrides of the WixUI (ko-KR) texts: the first page shows cautions and usage, not a license. -->
+<WixLocalization Culture="ko-KR" Codepage="949" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="WelcomeEulaDlgTitle" Value="{\WixUI_Font_Title}[ProductName] 설치 전 주의사항과 사용법을 확인하세요." />
+  <String Id="WelcomeEulaDlgLicenseAcceptedCheckBox" Value="주의사항을 읽고 이해했습니다(&amp;A)" />
+</WixLocalization>

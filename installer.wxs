@@ -1,0 +1,100 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WiX 5 (built by build.ps1):
+     wix build -arch x64 -culture ko-KR -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+               -d Version=<Cargo.toml version> -d NoticeRtf=<generated rtf>
+               -loc installer.ko-KR.wxl installer.wxs -o Shield.msi -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package Name="Shield" Manufacturer="Shield" Version="$(var.Version)" Language="1042" Codepage="949"
+           UpgradeCode="6B1E5C0A-3D7F-4C52-9A1B-0F8E2D4C7A91" Scope="perMachine">
+    <!-- Any older (or same-version) Shield is removed automatically: installing a new MSI = upgrade. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="더 새로운 버전의 Shield가 이미 설치되어 있습니다. 먼저 제거한 뒤 설치하세요." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="ShieldIcon" SourceFile="target\release\shield.exe" />
+    <Property Id="ARPPRODUCTICON" Value="ShieldIcon" />
+
+    <!-- Installer UI: notice (cautions + usage, must be accepted) -> progress -> finish (+ launch). -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.NoticeRtf)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
+              Value="설치가 끝났습니다. 시작 메뉴의 Shield 또는 파일 탐색기 우클릭 메뉴(Shield로 암호화)로 사용할 수 있습니다. 실행 중인 창은 작업 표시줄에서 우클릭하여 고정할 수 있습니다." />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="지금 Shield 실행" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#ShieldExe]" />
+    <CustomAction Id="LaunchShield" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchShield"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Shield" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Shield" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Shield" Level="1">
+      <ComponentRef Id="AppExe" />
+      <ComponentRef Id="UserGuide" />
+      <ComponentRef Id="ShellEncrypt" />
+      <ComponentRef Id="ShellDecrypt" />
+    </Feature>
+
+    <!-- The Start Menu shortcut launches the app (it can also be pinned to Start / the taskbar). -->
+    <Component Id="AppExe" Directory="INSTALLFOLDER" Bitness="always64">
+      <File Id="ShieldExe" Source="target\release\shield.exe" KeyPath="yes">
+        <Shortcut Id="AppStartMenuShortcut"
+                  Directory="ApplicationProgramsFolder"
+                  Name="Shield"
+                  Description="Shield 파일 암호화"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="ShieldIcon" />
+      </File>
+    </Component>
+
+    <!-- Install the user guide beside the application and create a Start Menu shortcut. -->
+    <Component Id="UserGuide" Directory="INSTALLFOLDER" Bitness="always64">
+      <File Id="UserGuideFile" Source="docs\03_사용_방법.txt" Name="사용 방법.txt" KeyPath="yes">
+        <Shortcut Id="UserGuideStartMenuShortcut"
+                  Directory="ApplicationProgramsFolder"
+                  Name="Shield 사용 설명서"
+                  Description="Shield 암호화 프로그램 사용 방법" />
+      </File>
+      <RemoveFolder Id="RemoveApplicationProgramsFolder"
+                    Directory="ApplicationProgramsFolder" On="uninstall" />
+    </Component>
+
+    <!-- Right-click "Shield로 암호화" on every file and every folder.
+         Win10: shown directly. Win11: shown under "더 많은 옵션 표시" (classic menu). -->
+    <Component Id="ShellEncrypt" Directory="INSTALLFOLDER" Bitness="always64">
+      <RegistryKey Root="HKCR" Key="*\shell\Shield.Encrypt">
+        <RegistryValue Type="string" Value="Shield로 암호화" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield.exe" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield.exe" --encrypt "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKCR" Key="Directory\shell\Shield.Encrypt">
+        <RegistryValue Type="string" Value="Shield로 암호화" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield.exe" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield.exe" --encrypt "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+
+    <!-- Right-click "Shield로 복호화" on .shd files -->
+    <Component Id="ShellDecrypt" Directory="INSTALLFOLDER" Bitness="always64">
+      <RegistryKey Root="HKCR" Key="SystemFileAssociations\.shd\shell\Shield.Decrypt">
+        <RegistryValue Type="string" Value="Shield로 복호화" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield.exe" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield.exe" --decrypt "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+  </Package>
+</Wix>
