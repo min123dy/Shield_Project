@@ -23,6 +23,11 @@ pub const ST_SHRED: u8 = 6;
 pub const ST_WIPE_FREE: u8 = 7;
 pub const ST_REWRAP: u8 = 8;
 pub const ST_TRIM: u8 = 9;
+pub const ST_OPEN: u8 = 10;
+pub const ST_CHECK: u8 = 11;
+pub const ST_REBUILD: u8 = 12;
+pub const ST_REPLACE: u8 = 13;
+pub const ST_SCAN: u8 = 14;
 
 pub const CANCELLED: &str = "취소되었습니다.";
 
@@ -43,21 +48,46 @@ pub fn set_stage(n: u8) {
 }
 pub fn stage_label(n: u8) -> &'static str {
     match n {
-        ST_COMPRESS => "압축 중 (7z/LZMA2, 암호화된 임시 공간 사용)",
-        ST_ENCRYPT => "암호화 중",
-        ST_VERIFY => "암호화 결과 검증 중",
-        ST_DECRYPT => "복호화 중",
-        ST_EXTRACT => "압축 해제 중",
+        ST_COMPRESS => "압축 중 (암호화된 임시 공간 사용, 원본 지문 SHA3-512 계산)",
+        ST_ENCRYPT => "암호화 중 (XChaCha20-Poly1305)",
+        ST_VERIFY => "검증 중 (전체 인증 → 복원 → 원본과 SHA3-512 비교)",
+        ST_DECRYPT => "복호화·전체 인증 중",
+        ST_EXTRACT => "압축 해제 중 (경로·자원 제한 검사)",
         ST_SHRED => "원본 파쇄 중 (취소 불가)",
         ST_WIPE_FREE => "여유 공간 덮어쓰기 중 (오래 걸릴 수 있음)",
         ST_REWRAP => "키 재봉인 중",
         ST_TRIM => "TRIM 실행 중 (취소 불가)",
+        ST_OPEN => "컨테이너 여는 중 (헤더·메타 인증, 7z 목록 읽기)",
+        ST_CHECK => "본문 전체 무결성 검사 중",
+        ST_REBUILD => "컨테이너 재구성 중 (기존 항목 + 추가 항목)",
+        ST_REPLACE => "원자적 교체 중 (취소 불가)",
+        ST_SCAN => "대상 목록 고정 중",
         _ => "준비 중",
     }
 }
-/// Shredding half-way would leave a half-destroyed original; an elevated TRIM can't be stopped.
+pub fn stage_short(n: u8) -> &'static str {
+    match n {
+        ST_COMPRESS => "압축",
+        ST_ENCRYPT => "암호화",
+        ST_VERIFY => "검증",
+        ST_DECRYPT => "복호화",
+        ST_EXTRACT => "압축 해제",
+        ST_SHRED => "원본 파쇄",
+        ST_WIPE_FREE => "여유 공간 덮어쓰기",
+        ST_REWRAP => "키 재봉인",
+        ST_TRIM => "TRIM",
+        ST_OPEN => "열기",
+        ST_CHECK => "무결성 검사",
+        ST_REBUILD => "재구성",
+        ST_REPLACE => "교체",
+        ST_SCAN => "목록 고정",
+        _ => "",
+    }
+}
+/// Shredding half-way would leave a half-destroyed original; an elevated TRIM can't be stopped;
+/// the final rename of a rebuilt container must not be interrupted.
 pub fn stage_cancellable(n: u8) -> bool {
-    !matches!(n, ST_SHRED | ST_TRIM)
+    !matches!(n, ST_SHRED | ST_TRIM | ST_REPLACE)
 }
 pub fn progress_start(total: u64) {
     PROG_TOTAL.store(total, Ordering::Relaxed);

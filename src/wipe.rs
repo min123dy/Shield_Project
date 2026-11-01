@@ -1,10 +1,14 @@
 //! Shredding, disk type detection, free-space overwrite and TRIM.
-//! None of this can guarantee physical erasure on SSDs (wear levelling, spare cells, snapshots).
+//! None of this can guarantee physical erasure on SSDs (wear levelling, spare cells), on volumes
+//! with snapshots (VSS) or in cloud-synced folders (the provider keeps versions).
 
-use crate::entropy::{fill_random, rand_hex};
+use crate::entropy::{bulk_rng, rand_hex};
+use crate::manifest::FileRec;
 use crate::progress::*;
+use crate::sysinfo::{file_id, open_no_follow};
+use rand::RngCore;
 use std::{
-    fs::{self, OpenOptions},
+    fs,
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
@@ -31,11 +35,10 @@ pub fn drive_letter(p: &Path) -> Option<char> {
     (it.next() == Some(':') && a.is_ascii_alphabetic()).then(|| a.to_ascii_uppercase())
 }
 
-/// Absolute path of a System32 tool, so a planted cipher.exe/powershell.exe elsewhere is never run.
+/// Absolute path of a System32 tool (System32 from GetSystemDirectoryW, not from the environment).
 #[cfg(windows)]
 fn sys32(rel: &str) -> PathBuf {
-    let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    root.join("System32").join(rel)
+    crate::sysinfo::system_dir().join(rel)
 }
 
 #[cfg(windows)]
@@ -100,7 +103,7 @@ pub fn trim_volume(l: char) -> R<String> {
     }
     let inner = format!("try {{ Optimize-Volume -DriveLetter {l} -ReTrim -ErrorAction Stop | Out-Null; exit 0 }} catch {{ exit 3 }}");
     if let Some((0, _)) = powershell(&inner) {
-        return Ok(format!("{l}: TRIM 완료"));
+        return Ok(format!("{l}: TRIM 요청 완료"));
     }
     let exe = sys32(r"WindowsPowerShell\v1.0\powershell.exe");
     let elevate = format!(
@@ -111,7 +114,7 @@ pub fn trim_volume(l: char) -> R<String> {
         encode_ps(&inner)
     );
     match powershell(&elevate) {
-        Some((0, _)) => Ok(format!("{l}: TRIM 완료 (관리자 권한)")),
+        Some((0, _)) => Ok(format!("{l}: TRIM 요청 완료 (관리자 권한)")),
         Some((2, _)) => Err("관리자 권한 요청이 거부되어 TRIM을 실행하지 못했습니다.".into()),
         _ => Err(format!("{l}: TRIM 실패 (SSD가 아니거나 TRIM을 지원하지 않는 드라이브일 수 있습니다)")),
     }
@@ -123,7 +126,6 @@ pub fn trim_volume(_l: char) -> R<String> {
 }
 
 /// Overwrites the free space of the volume that holds `dir` (cipher /w: 0x00, 0xFF, random).
-/// Cancellable. Takes a long time: it fills the whole free space three times.
 #[cfg(windows)]
 pub fn wipe_free_space(dir: &Path) -> R<String> {
     use std::os::windows::process::CommandExt;
@@ -162,68 +164,134 @@ pub fn wipe_free_space(_dir: &Path) -> R<String> {
     Err("여유 공간 덮어쓰기는 Windows에서만 지원됩니다.".into())
 }
 
-/// Bytes that `shred_tree` will write (for the progress bar).
-pub fn shred_bytes(p: &Path, passes: usize) -> u64 {
-    crate::archive::tree_size(p, false).saturating_mul(passes as u64)
+pub enum ShredSkip {
+    Changed,
+    HardLink,
+    Failed(String),
 }
 
-/// Overwrite (up to 7 passes), truncate, rename randomly, delete.
-pub fn shred(path: &Path, passes: usize) -> R<()> {
-    let md = fs::metadata(path).map_err(e)?;
-    if md.permissions().readonly() {
-        let mut perm = md.permissions();
-        #[allow(clippy::permissions_set_readonly_false)]
-        perm.set_readonly(false);
-        fs::set_permissions(path, perm).map_err(e)?;
+/// Overwrites through one checked handle, truncates, renames randomly and deletes.
+/// Refuses: anything that is no longer the listed object (ID, size, time), hard links (other names
+/// would keep the data), links/reparse points (handled as the link itself, never the target).
+pub fn shred_checked(r: &FileRec, passes: usize) -> Result<(), ShredSkip> {
+    let fail = |x: String| ShredSkip::Failed(x);
+    let open = || open_no_follow(&r.path, true);
+    let mut f = match open() {
+        Ok(f) => f,
+        Err(x) if x.kind() == std::io::ErrorKind::PermissionDenied => {
+            // read-only attribute: check identity first, then clear it
+            let ro = open_no_follow(&r.path, false).map_err(|x| fail(x.to_string()))?;
+            let id = file_id(&ro).map_err(|x| fail(x.to_string()))?;
+            if id.vol != r.id.vol || id.idx != r.id.idx || id.special {
+                return Err(ShredSkip::Changed);
+            }
+            let mut perm = ro.metadata().map_err(|x| fail(x.to_string()))?.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            drop(ro);
+            fs::set_permissions(&r.path, perm).map_err(|x| fail(x.to_string()))?;
+            open().map_err(|x| fail(x.to_string()))?
+        }
+        Err(x) => return Err(fail(x.to_string())),
+    };
+    let id = file_id(&f).map_err(|x| fail(x.to_string()))?;
+    let md = f.metadata().map_err(|x| fail(x.to_string()))?;
+    if id.special || id.vol != r.id.vol || id.idx != r.id.idx || md.len() != r.size || md.modified().ok() != r.mtime {
+        return Err(ShredSkip::Changed);
+    }
+    if id.nlink > 1 {
+        return Err(ShredSkip::HardLink);
     }
     let len = md.len();
-    let mut f = OpenOptions::new().write(true).open(path).map_err(e)?;
+    let mut rng = bulk_rng().map_err(fail)?;
     let mut buf = vec![0u8; 1 << 20];
     for p in PATTERNS.iter().take(passes.clamp(1, 7)) {
-        f.seek(SeekFrom::Start(0)).map_err(e)?;
+        f.seek(SeekFrom::Start(0)).map_err(|x| fail(x.to_string()))?;
         let mut left = len;
         while left > 0 {
             let n = left.min(buf.len() as u64) as usize;
             match p {
                 Some(b) => buf[..n].fill(*b),
-                None => fill_random(&mut buf[..n]),
+                None => rng.fill_bytes(&mut buf[..n]),
             }
-            f.write_all(&buf[..n]).map_err(e)?;
+            f.write_all(&buf[..n]).map_err(|x| fail(x.to_string()))?;
             left -= n as u64;
             progress_add(n as u64);
         }
-        f.flush().map_err(e)?;
-        f.sync_all().map_err(e)?;
+        f.flush().map_err(|x| fail(x.to_string()))?;
+        f.sync_all().map_err(|x| fail(x.to_string()))?;
     }
-    f.set_len(0).map_err(e)?;
-    f.sync_all().map_err(e)?;
+    f.set_len(0).map_err(|x| fail(x.to_string()))?;
+    f.sync_all().map_err(|x| fail(x.to_string()))?;
     drop(f);
-    let np = path.with_file_name(rand_hex());
-    fs::rename(path, &np).map_err(e)?;
-    fs::remove_file(&np).map_err(e)
+    // hide the name, then delete the object we verified again by handle
+    let np = r.path.with_file_name(rand_hex().map_err(fail)?);
+    fs::rename(&r.path, &np).map_err(|x| fail(x.to_string()))?;
+    let g = open_no_follow(&np, true).map_err(|x| fail(x.to_string()))?;
+    let gid = file_id(&g).map_err(|x| fail(x.to_string()))?;
+    if gid.vol != r.id.vol || gid.idx != r.id.idx {
+        drop(g);
+        let _ = fs::rename(&np, &r.path);
+        return Err(ShredSkip::Changed);
+    }
+    #[cfg(windows)]
+    {
+        crate::sysinfo::delete_by_handle(&g).map_err(|x| fail(x.to_string()))?;
+        drop(g);
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        drop(g);
+        fs::remove_file(&np).map_err(|x| fail(x.to_string()))
+    }
 }
 
-/// Shreds every file below `p`, then removes directories. Symlinks are removed, never followed.
-pub fn shred_tree(p: &Path, passes: usize) -> R<()> {
+/// Removes a folder tree that Shield itself created (staging): files are overwritten once and
+/// deleted; links are removed, never followed.
+pub fn shred_own_tree(p: &Path) -> R<()> {
     let m = fs::symlink_metadata(p).map_err(e)?;
     if m.file_type().is_symlink() {
         return fs::remove_file(p).or_else(|_| fs::remove_dir(p)).map_err(e);
     }
     if m.is_dir() {
+        let mut first_err = None;
         for en in fs::read_dir(p).map_err(e)? {
-            shred_tree(&en.map_err(e)?.path(), passes)?;
+            if let Err(x) = en.map_err(e).and_then(|en| shred_own_tree(&en.path())) {
+                first_err.get_or_insert(x);
+            }
+        }
+        if let Some(x) = first_err {
+            return Err(x);
         }
         return fs::remove_dir(p).map_err(e);
     }
-    shred(p, passes)
+    let len = m.len();
+    if let Ok(mut f) = fs::OpenOptions::new().write(true).open(p) {
+        let buf = vec![0u8; 1 << 20];
+        let mut left = len;
+        while left > 0 {
+            let n = left.min(buf.len() as u64) as usize;
+            if f.write_all(&buf[..n]).is_err() {
+                break;
+            }
+            left -= n as u64;
+        }
+        let _ = f.set_len(0);
+        let _ = f.sync_all();
+    }
+    fs::remove_file(p).map_err(e)
 }
 
 #[cfg(all(test, windows))]
 mod tests {
     #[test]
     fn base64_utf16() {
-        // "ab" -> 61 00 62 00
         assert_eq!(super::encode_ps("ab"), "YQBiAA==");
         assert_eq!(super::encode_ps("abc"), "YQBiAGMA");
+    }
+    #[test]
+    fn system_dir_from_api() {
+        assert!(super::sys32("cipher.exe").is_file());
     }
 }

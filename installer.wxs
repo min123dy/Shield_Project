@@ -19,7 +19,7 @@
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(var.NoticeRtf)" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT"
-              Value="설치가 끝났습니다. 시작 메뉴의 Shield 또는 파일 탐색기 우클릭 메뉴(Shield로 암호화)로 사용할 수 있습니다. 실행 중인 창은 작업 표시줄에서 우클릭하여 고정할 수 있습니다." />
+              Value="설치가 끝났습니다. 시작 메뉴의 Shield(암호화)와 Shield 파일 관리자, 또는 파일 탐색기 우클릭 메뉴(Shield로 암호화 / Shield로 복호화 / SHIELD에서 열기)로 사용할 수 있습니다. Shield 2.0은 1.x 형식(.shd v1)을 열지 않습니다." />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="지금 Shield 실행" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#ShieldExe]" />
@@ -41,6 +41,7 @@
       <ComponentRef Id="UserGuide" />
       <ComponentRef Id="ShellEncrypt" />
       <ComponentRef Id="ShellDecrypt" />
+      <ComponentRef Id="ShellOpen" />
     </Feature>
 
     <!-- The Start Menu shortcut launches the app (it can also be pinned to Start / the taskbar). -->
@@ -50,6 +51,14 @@
                   Directory="ApplicationProgramsFolder"
                   Name="Shield"
                   Description="Shield 파일 암호화"
+                  WorkingDirectory="INSTALLFOLDER"
+                  Icon="ShieldIcon" />
+        <!-- Second window of the same exe: browse folders and open .shd containers. -->
+        <Shortcut Id="ManagerStartMenuShortcut"
+                  Directory="ApplicationProgramsFolder"
+                  Name="Shield 파일 관리자"
+                  Description="파일 탐색 및 .shd 컨테이너 열기"
+                  Arguments="--manager"
                   WorkingDirectory="INSTALLFOLDER"
                   Icon="ShieldIcon" />
       </File>
@@ -93,6 +102,18 @@
         <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield.exe" />
         <RegistryKey Key="command">
           <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield.exe" --decrypt "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+
+    <!-- Right-click "SHIELD에서 열기" on .shd files: view the contents without decrypting everything.
+         Registered and removed with the product, like the two entries above. -->
+    <Component Id="ShellOpen" Directory="INSTALLFOLDER" Bitness="always64">
+      <RegistryKey Root="HKCR" Key="SystemFileAssociations\.shd\shell\Shield.Open">
+        <RegistryValue Type="string" Value="SHIELD에서 열기" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield.exe" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield.exe" --open "%1"' />
         </RegistryKey>
       </RegistryKey>
     </Component>

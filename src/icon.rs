@@ -97,7 +97,7 @@ pub fn ico_bytes(sizes: &[u32]) -> Vec<u8> {
     let mut images: Vec<Vec<u8>> = Vec::new();
     for &s in sizes {
         let rgba = shield_rgba(s);
-        let mask_row = ((s + 31) / 32 * 4) as usize;
+        let mask_row = (s.div_ceil(32) * 4) as usize;
         let mut img = Vec::new();
         img.extend_from_slice(&40u32.to_le_bytes());
         img.extend_from_slice(&(s as i32).to_le_bytes());
@@ -111,7 +111,7 @@ pub fn ico_bytes(sizes: &[u32]) -> Vec<u8> {
                 img.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
             }
         }
-        img.extend(std::iter::repeat(0u8).take(mask_row * s as usize));
+        img.extend(std::iter::repeat_n(0u8, mask_row * s as usize));
         images.push(img);
     }
     let mut out = Vec::new();

@@ -1,57 +1,28 @@
-//! Shield engine (envelope encryption, fully streamed).
-//!
-//! File layout (no magic bytes):
-//!   slot0(64) | slot1(64) | AEAD_DEK(meta, 265 B)(281) | AEAD_DEK chunks (<=64KiB + 16 tag each)
-//!   slot  = salt(16) | AEAD_KEK(DEK 32 B)(48)       <- the "wrapped key" part
-//!   KEK   = Argon2id(password, salt, secret = keyfile digest, m=128MiB, t=3+PIM, p=2)
-//!   DEK   = 32 random bytes per file (encrypts the data)
-//!   meta  = len u64 | flags u8 (bit0 = 7z archive, bit1 = folder) | name_len u8 | name[255]
-//! One slot holds the real wrapped DEK, the other random bytes. Changing the password writes the
-//! new wrapped DEK into the spare slot, verifies it, then overwrites the old slot 7 times.
-//! Data nonce = 0,0,0 | last_flag | counter(8, BE); safe because the DEK is unique per file.
-//! Memory use is constant (64 KiB chunks + Argon2 128 MiB); the 7z archive lives only in `SecTemp`.
-//!
-//! PIM: the KDF formula is unchanged since 1.0, so every existing file still opens. 1.0 defaulted
-//! to PIM 0 (3 passes); new files default to `DEFAULT_PIM`. When the default PIM fails, PIM 0 is
-//! tried as well, so files made with the old default keep working without the user knowing.
+//! High-level operations: encrypt (with full restore verification before any shredding), decrypt,
+//! password change (slot re-wrap) and full key replacement (re-encryption under a new DEK).
+//! File format: see format.rs. Low-level crypto: crypto.rs.
 
-use crate::archive::{archive_into, component_ok, extract_from, validate_archive};
-use crate::entropy::{fill_random, rand_hex};
-pub use crate::keyfile::{generate_keyfile, keyfile_opt};
+use crate::archive;
+use crate::compress::{self, Strength};
+use crate::crypto::{encrypt_stream, make_slot, open_slot, read_header, stream_body, ChunkReader, Cred, Header};
+use crate::entropy::rand_hex;
+use crate::format::*;
+use crate::manifest::{compare, shred_listed, Digests, Manifest};
+use std::collections::BTreeSet;
 use crate::progress::*;
 use crate::sectemp::SecTemp;
-use crate::wipe::{detect_disk, drive_letter, shred_bytes, shred_tree, trim_volume, wipe_free_space, Disk, PATTERNS};
-use argon2::{Algorithm, Argon2, Params, Version};
-use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Key, Nonce,
-};
+use crate::staging::Stage;
+use crate::sysinfo::{self, rename_noreplace, rename_replace};
+use crate::ui_fmt::human;
+use crate::wipe::{detect_disk, drive_letter, trim_volume, wipe_free_space, Disk, PATTERNS};
+use sha3::{Digest, Sha3_512};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufWriter, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
-use zeroize::Zeroizing;
 
-const SALT: usize = 16;
-const CHUNK: usize = 64 * 1024;
-const TAG: usize = 16;
-const SLOT: usize = SALT + 32 + TAG; // 64
-const SLOTS_LEN: usize = SLOT * 2;
-const NAME_MAX: usize = 255;
-const META_PT: usize = 8 + 1 + 1 + NAME_MAX;
-const META: usize = META_PT + TAG;
-const MEM_KIB: u32 = 128 * 1024;
-const BASE_T: u32 = 3;
-const LANES: u32 = 2;
-/// PIM range 0..=64 -> Argon2 passes 3..=67 at 128 MiB.
-pub const MAX_PIM: u32 = 64;
-/// Default for new files: 3+12 = 15 passes over 128 MiB (~1.9 GiB of memory-hard work per guess).
-pub const DEFAULT_PIM: u32 = 12;
-/// Default of Shield 1.0, still accepted on decryption.
-const LEGACY_PIM: u32 = 0;
-const WRAP_AAD: &[u8] = b"SHIELD-WRAP-v2";
-const BAD: &str = "실패: 비밀번호/PIM/키 파일이 틀렸거나 파일이 손상되었습니다.";
+pub use crate::format::DEFAULT_PIM;
 
 /// Minimum password length for new credentials. Below the default PIM the KDF is cheaper per guess,
 /// so a longer password is required (same idea as VeraCrypt's rule for small PIMs).
@@ -63,424 +34,394 @@ pub fn min_password_len(pim: u32, has_keyfile: bool) -> usize {
     }
 }
 
-// ------------------------------------------------------------ credentials
-
-pub struct Cred {
-    pub pw: Zeroizing<Vec<u8>>,
-    pub kf: Option<Zeroizing<[u8; 64]>>,
-    pub pim: u32,
-}
-
 pub struct Opts {
     pub shred_src: bool,
     pub force7: bool,
-    /// After shredding: TRIM the volume (skipped on HDDs).
     pub trim_after: bool,
-    /// After shredding: overwrite the free space of the volume (slow, optional).
     pub wipe_free_after: bool,
+    pub strength: Strength,
+    /// Key file paths (only for the overlap check; the digest is in `Cred`).
+    pub keyfiles: Vec<PathBuf>,
 }
 
-// ------------------------------------------------------------ key wrapping
-
-fn kek(c: &Cred, pim: u32, salt: &[u8]) -> R<ChaCha20Poly1305> {
-    if c.pw.is_empty() && c.kf.is_none() {
-        return Err("비밀번호 또는 키 파일이 필요합니다.".into());
+/// Removes a temporary output file unless `keep` was called (errors, cancel, panic).
+pub struct PartGuard {
+    pub path: PathBuf,
+    keep: bool,
+}
+impl PartGuard {
+    pub fn keep(mut self) {
+        self.keep = true;
     }
-    let _busy = KdfGuard::new();
-    let params = Params::new(MEM_KIB, BASE_T + pim, LANES, None).map_err(e)?;
-    let secret: &[u8] = match &c.kf {
-        Some(k) => &k[..],
-        None => &[],
+}
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+pub fn parent_dir(p: &Path) -> PathBuf {
+    p.parent().filter(|x| !x.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).to_path_buf()
+}
+
+fn comp_desc(m: &Meta) -> String {
+    let base = match m.comp_method {
+        COMP_LZMA2 => format!("LZMA2 레벨 {} · 사전 {}", m.comp_level, human(m.comp_dict as u64)),
+        COMP_ZSTD => format!("Zstandard 레벨 {}", m.comp_level),
+        _ => comp_name(m.comp_method).to_string(),
     };
-    let a = Argon2::new_with_secret(secret, Algorithm::Argon2id, Version::V0x13, params).map_err(e)?;
-    let mut out = Zeroizing::new([0u8; 32]);
-    a.hash_password_into(&c.pw, salt, &mut *out).map_err(e)?;
-    Ok(ChaCha20Poly1305::new(Key::from_slice(&*out)))
-}
-
-fn wrap_nonce() -> Nonce {
-    *Nonce::from_slice(&[0u8; 12]) // KEK is unique per random salt
-}
-
-fn make_slot(c: &Cred, dek: &[u8; 32]) -> R<[u8; SLOT]> {
-    let mut slot = [0u8; SLOT];
-    fill_random(&mut slot[..SALT]);
-    let k = kek(c, c.pim, &slot[..SALT])?;
-    let ct = k.encrypt(&wrap_nonce(), Payload { msg: dek, aad: WRAP_AAD }).map_err(e)?;
-    slot[SALT..].copy_from_slice(&ct);
-    Ok(slot)
-}
-
-fn open_slot(c: &Cred, pim: u32, slot: &[u8]) -> R<Zeroizing<[u8; 32]>> {
-    let k = kek(c, pim, &slot[..SALT])?;
-    let pt = Zeroizing::new(
-        k.decrypt(&wrap_nonce(), Payload { msg: &slot[SALT..], aad: WRAP_AAD })
-            .map_err(|_| BAD.to_string())?,
-    );
-    if pt.len() != 32 {
-        return Err(BAD.into());
-    }
-    let mut d = Zeroizing::new([0u8; 32]);
-    d.copy_from_slice(&pt);
-    Ok(d)
-}
-
-/// Tries both slots (and the 1.0 default PIM when the current default was given).
-/// Returns (slot index, DEK, PIM that worked).
-fn unlock(c: &Cred, slots: &[u8]) -> R<(usize, Zeroizing<[u8; 32]>, u32)> {
-    if c.pim > MAX_PIM {
-        return Err(format!("PIM은 0~{MAX_PIM} 범위여야 합니다."));
-    }
-    let mut pims = vec![c.pim];
-    if c.pim == DEFAULT_PIM {
-        pims.push(LEGACY_PIM);
-    }
-    for pim in pims {
-        for i in 0..2 {
-            check_cancel()?;
-            if let Ok(k) = open_slot(c, pim, &slots[i * SLOT..(i + 1) * SLOT]) {
-                return Ok((i, k, pim));
-            }
-        }
-    }
-    Err(BAD.into())
-}
-
-fn nonce(last: bool, ctr: u64) -> Nonce {
-    let mut n = [0u8; 12];
-    n[3] = last as u8;
-    n[4..].copy_from_slice(&ctr.to_be_bytes());
-    *Nonce::from_slice(&n)
-}
-
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y)) == 0
-}
-
-// ------------------------------------------------------------ metadata
-
-pub struct Meta {
-    pub len: u64,
-    pub flags: u8,
-    pub name: String,
-}
-
-fn meta_encode(m: &Meta) -> [u8; META_PT] {
-    let mut b = [0u8; META_PT];
-    b[..8].copy_from_slice(&m.len.to_le_bytes());
-    b[8] = m.flags;
-    let mut n = m.name.len().min(NAME_MAX);
-    while !m.name.is_char_boundary(n) {
-        n -= 1; // keep a valid UTF-8 prefix of overlong names
-    }
-    b[9] = n as u8;
-    b[10..10 + n].copy_from_slice(&m.name.as_bytes()[..n]);
-    b
-}
-
-fn meta_decode(b: &[u8]) -> R<Meta> {
-    if b.len() != META_PT {
-        return Err(BAD.into());
-    }
-    let n = b[9] as usize;
-    Ok(Meta {
-        len: u64::from_le_bytes(b[..8].try_into().unwrap()),
-        flags: b[8],
-        name: String::from_utf8(b[10..10 + n].to_vec()).unwrap_or_default(),
-    })
-}
-
-fn expected_size(len: u64) -> Option<u64> {
-    len.div_ceil(CHUNK as u64)
-        .checked_mul(TAG as u64)?
-        .checked_add(len)?
-        .checked_add((SLOTS_LEN + META) as u64)
-}
-
-/// Reads and authenticates the header; returns (file, slot index, DEK, meta, PIM used).
-fn open_header<F: Read>(f: &mut F, total: u64, c: &Cred) -> R<(usize, Zeroizing<[u8; 32]>, Meta, u32)> {
-    let mut head = vec![0u8; SLOTS_LEN + META];
-    f.read_exact(&mut head).map_err(|_| BAD.to_string())?;
-    let (idx, dek, pim) = unlock(c, &head[..SLOTS_LEN])?;
-    let ci = ChaCha20Poly1305::new(Key::from_slice(&*dek));
-    let mp = Zeroizing::new(ci.decrypt(&nonce(false, 0), &head[SLOTS_LEN..]).map_err(|_| BAD.to_string())?);
-    let m = meta_decode(&mp)?;
-    if expected_size(m.len) != Some(total) {
-        return Err(BAD.into()); // truncated or extended
-    }
-    Ok((idx, dek, m, pim))
-}
-
-// ------------------------------------------------------------ AEAD stream layer
-
-fn encrypt_stream<Rd: Read>(inf: &mut Rd, len: u64, dst: &Path, c: &Cred, flags: u8, name: &str) -> R<()> {
-    let mut dek = Zeroizing::new([0u8; 32]);
-    fill_random(&mut *dek);
-    let slot0 = make_slot(c, &dek)?;
-    let mut slot1 = [0u8; SLOT];
-    fill_random(&mut slot1);
-    let ci = ChaCha20Poly1305::new(Key::from_slice(&*dek));
-
-    progress_start(len);
-    let tmp = dst.with_file_name(format!(".shd_{}.part", rand_hex()));
-    let res = (|| -> R<()> {
-        let mut out =
-            BufWriter::with_capacity(1 << 20, OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(e)?);
-        out.write_all(&slot0).map_err(e)?;
-        out.write_all(&slot1).map_err(e)?;
-        let meta = Zeroizing::new(meta_encode(&Meta { len, flags, name: name.to_string() }));
-        out.write_all(&ci.encrypt(&nonce(false, 0), &meta[..]).map_err(e)?).map_err(e)?;
-        let n = len.div_ceil(CHUNK as u64);
-        let mut buf = Zeroizing::new(vec![0u8; CHUNK]);
-        for i in 0..n {
-            check_cancel()?;
-            let sz = (len - i * CHUNK as u64).min(CHUNK as u64) as usize;
-            inf.read_exact(&mut buf[..sz]).map_err(e)?;
-            let ct = ci.encrypt(&nonce(i == n - 1, i + 1), &buf[..sz]).map_err(e)?;
-            out.write_all(&ct).map_err(e)?;
-            progress_add(sz as u64);
-        }
-        out.flush().map_err(e)?;
-        out.get_ref().sync_all().map_err(e)
-    })();
-    if let Err(x) = res {
-        let _ = fs::remove_file(&tmp);
-        return Err(x);
-    }
-    fs::rename(&tmp, dst).map_err(e)
-}
-
-/// Authenticates chunk by chunk and writes plaintext into `out`. Returns (meta, PIM used).
-fn decrypt_stream<W: Write>(src: &Path, c: &Cred, out: &mut W) -> R<(Meta, u32)> {
-    let f = File::open(src).map_err(e)?;
-    let total = f.metadata().map_err(e)?.len();
-    let mut f = BufReader::with_capacity(1 << 20, f);
-    let (_, dek, m, pim) = open_header(&mut f, total, c)?;
-    let ci = ChaCha20Poly1305::new(Key::from_slice(&*dek));
-    progress_start(m.len);
-    let n = m.len.div_ceil(CHUNK as u64);
-    let mut buf = vec![0u8; CHUNK + TAG];
-    for i in 0..n {
-        check_cancel()?;
-        let sz = (m.len - i * CHUNK as u64).min(CHUNK as u64) as usize;
-        f.read_exact(&mut buf[..sz + TAG]).map_err(|_| BAD.to_string())?;
-        let pt = Zeroizing::new(ci.decrypt(&nonce(i == n - 1, i + 1), &buf[..sz + TAG]).map_err(|_| BAD.to_string())?);
-        out.write_all(&pt).map_err(e)?;
-        progress_add(sz as u64);
-    }
-    out.flush().map_err(e)?;
-    Ok((m, pim))
-}
-
-fn legacy_note(pim: u32, asked: u32) -> &'static str {
-    if pim != asked {
-        " · 구버전 기본값(PIM 0)으로 열렸습니다. '비밀번호 변경'으로 새 기본 PIM을 적용하는 것을 권장합니다."
+    if m.flags & FLAG_SOME_STORED != 0 {
+        base + " (이미 압축된 파일은 무압축 저장)"
     } else {
-        ""
+        base
     }
 }
 
-// ------------------------------------------------------------ password change
-
-/// Re-wraps the file key under new credentials; the data is not touched (instant for any size).
-/// 1) unwrap DEK with old creds  2) write new wrapped DEK into the spare slot, fsync
-/// 3) re-read, verify the new creds open it AND yield the same DEK  4) overwrite the old slot 7 times.
-/// A crash at any point leaves at least one valid slot.
-pub fn do_change_password(path: &Path, old: &Cred, new: &Cred) -> R<String> {
-    set_stage(ST_REWRAP);
-    if new.pim > MAX_PIM {
-        return Err(format!("PIM은 0~{MAX_PIM} 범위여야 합니다."));
+/// Records the compression choice in the meta block.
+pub fn set_comp(meta: &mut Meta, plan: &compress::Plan, stored: u64) {
+    meta.comp_method = plan.method;
+    meta.comp_level = plan.level as u8;
+    meta.comp_dict = plan.dict;
+    if stored > 0 {
+        meta.flags |= FLAG_SOME_STORED;
     }
-    let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(e)?;
-    let total = f.metadata().map_err(e)?.len();
-    let (idx, dek, _, _) = open_header(&mut f, total, old)?;
+}
 
-    let spare = 1 - idx;
-    let new_slot = make_slot(new, &dek)?;
-    f.seek(SeekFrom::Start((spare * SLOT) as u64)).map_err(e)?;
-    f.write_all(&new_slot).map_err(e)?;
-    f.flush().map_err(e)?;
+/// Encrypts a finished 7z archive held in SecTemp into a new `.part` file in `outdir`, then
+/// destroys the SecTemp. Returns the new header, the part guard and a SecTemp-deletion warning.
+pub fn seal_archive(mut st: SecTemp, outdir: &Path, c: &Cred, mut meta: Meta) -> R<(Header, PartGuard, Option<String>)> {
+    st.flush().map_err(e)?;
+    meta.real_len = st.len();
+    st.seek(SeekFrom::Start(0)).map_err(e)?;
+    set_stage(ST_ENCRYPT);
+    let part = PartGuard { path: outdir.join(format!(".shd_{}.part", rand_hex()?)), keep: false };
+    let f = OpenOptions::new().write(true).create_new(true).open(&part.path).map_err(e)?;
+    let mut w = BufWriter::with_capacity(1 << 20, f);
+    let h = encrypt_stream(&mut st, &mut w, c, &mut meta)?;
+    let f = w.into_inner().map_err(|x| e(x.into_error()))?;
     f.sync_all().map_err(e)?;
-
-    let mut head2 = vec![0u8; SLOTS_LEN];
-    f.seek(SeekFrom::Start(0)).map_err(e)?;
-    f.read_exact(&mut head2).map_err(e)?;
-    let fail = || "새 키 검증 실패: 기존 키 슬롯은 그대로 유지됩니다.".to_string();
-    let k2 = open_slot(new, new.pim, &head2[spare * SLOT..(spare + 1) * SLOT]).map_err(|_| fail())?;
-    if !ct_eq(&k2[..], &dek[..]) {
-        return Err(fail());
-    }
-
-    // point of no return: not cancellable
-    for p in PATTERNS {
-        let mut b = [0u8; SLOT];
-        match p {
-            Some(v) => b.fill(v),
-            None => fill_random(&mut b),
-        }
-        f.seek(SeekFrom::Start((idx * SLOT) as u64)).map_err(e)?;
-        f.write_all(&b).map_err(e)?;
-        f.flush().map_err(e)?;
-        f.sync_all().map_err(e)?;
-    }
-    Ok("비밀번호 변경 완료: 기존 키 슬롯을 7회 덮어써 파기했습니다.".into())
+    drop(f);
+    let warn = st.destroy().err().map(|x| x.to_string());
+    Ok((h, part, warn))
 }
 
-// ------------------------------------------------------------ high level
+/// Re-opens the new file with the credentials (proves the key slot works), authenticates every
+/// chunk, then decompresses everything and compares paths, sizes and SHA3-512 with `want`.
+pub fn verify_container(part: &Path, built: &Header, c: &Cred, want: &Digests, want_dirs: &BTreeSet<String>, total: u64) -> R<()> {
+    set_stage(ST_VERIFY);
+    let fail = |w: &str| format!("검증 실패: {w} — 결과 파일을 삭제했고 원본은 그대로입니다.");
+    let mut f = File::open(part).map_err(e)?;
+    let h = read_header(&mut f, c).map_err(|x| fail(&x))?;
+    if !crate::password::ct_eq(&h.dek[..], &built.dek[..]) || h.meta != built.meta {
+        return Err(fail("다시 연 키가 다릅니다"));
+    }
+    stream_body(&mut f, &h, &mut io::sink()).map_err(|x| fail(&x))?;
+    let mut cr = ChunkReader::new(f, &h);
+    archive::inspect(&mut cr, h.meta.real_len).map_err(|x| fail(&x))?;
+    progress_start(total);
+    let (files, dirs) = archive::digests(&mut cr).map_err(|x| fail(&x))?;
+    compare(want, want_dirs, &files, &dirs)
+}
 
-fn guard(src: &Path, dst: &Path) -> R<()> {
-    let s = fs::canonicalize(src).map_err(e)?;
-    let dp = dst.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
-    let d = fs::canonicalize(dp).map_err(e)?.join(dst.file_name().ok_or_else(|| "잘못된 출력 경로".to_string())?);
-    if d == s || d.starts_with(&s) {
+fn check_paths(src: &Path, dst: &Path, keyfiles: &[PathBuf]) -> R<()> {
+    if fs::symlink_metadata(dst).is_ok() {
+        return Err("출력 파일이 이미 있습니다. 덮어쓰지 않습니다.".into());
+    }
+    if sysinfo::is_within(dst, src) {
         return Err("출력 파일이 원본과 같거나 원본 폴더 안에 있습니다.".into());
     }
-    Ok(())
+    crate::keyfile::check_overlap(keyfiles, &[src, dst])
 }
 
-/// Compress (7z/LZMA2, inside an encrypted scratch file) -> encrypt (streamed) -> verify -> optional
-/// shred -> optional TRIM / free-space overwrite.
+/// Fix list -> compress -> encrypt -> verify -> rename -> optional shred -> optional TRIM/free space.
 pub fn do_encrypt(src: &Path, dst: &Path, c: &Cred, o: &Opts) -> R<String> {
-    guard(src, dst)?;
+    set_stage(ST_SCAN);
+    check_paths(src, dst, &o.keyfiles)?;
     if o.shred_src && fs::symlink_metadata(src).map_err(e)?.file_type().is_symlink() {
-        // the archive follows the link, but shredding would only remove the link itself
         return Err("바로가기/링크(정션)는 원본 파쇄와 함께 쓸 수 없습니다. 링크 대상 폴더를 직접 선택하세요.".into());
+    }
+    let mut m = Manifest::default();
+    Manifest::scan(src, "", &mut m)?;
+    if m.files.is_empty() && m.dirs.is_empty() {
+        return Err("암호화할 항목이 없습니다 (링크·특수 파일만 있음).".into());
     }
     let is_dir = fs::metadata(src).map_err(e)?.is_dir();
     let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let flags = 1 | if is_dir { 2 } else { 0 };
+    let outdir = parent_dir(dst);
+    sysinfo::require_space(&outdir, m.total.saturating_mul(2).saturating_add(m.total / 8).saturating_add(64 << 20), "임시 압축본 + 결과 파일")?;
     let disk = if o.shred_src { detect_disk(src) } else { Disk::Unknown };
-    let parent = src.parent().map(Path::to_path_buf);
-    let outdir = dst.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let plan = compress::plan(m.total, sysinfo::avail_mem(), sysinfo::cores(), o.strength);
+    let mut meta = Meta::new(&name, FLAG_ARCHIVE | if is_dir { FLAG_DIR } else { 0 });
 
     set_stage(ST_COMPRESS);
     let mut st = SecTemp::create(&outdir).map_err(e)?;
-    let skipped = archive_into(src, &mut st)?;
-    st.flush().map_err(e)?;
-    let len = st.len();
-    st.seek(SeekFrom::Start(0)).map_err(e)?;
+    let stored = archive::pack(&mut st, &mut m, &plan)?;
+    set_comp(&mut meta, &plan, stored);
+    meta.file_count = m.files.len() as u64;
+    meta.dir_count = m.dirs.len() as u64;
+    meta.total_unpacked = m.total;
+    let (h, part, warn) = seal_archive(st, &outdir, c, meta)?;
+    let (mut want, mut want_dirs) = (Digests::new(), BTreeSet::new());
+    m.expected(&mut want, &mut want_dirs)?;
+    verify_container(&part.path, &h, c, &want, &want_dirs, m.total)?;
+    rename_noreplace(&part.path, dst).map_err(|x| format!("결과 파일을 저장하지 못했습니다 (덮어쓰지 않음): {x}"))?;
+    part.keep();
 
-    set_stage(ST_ENCRYPT);
-    encrypt_stream(&mut st, len, dst, c, flags, &name)?;
-    drop(st); // crypto-erase of the scratch file
-
-    set_stage(ST_VERIFY);
-    if let Err(x) = decrypt_stream(dst, c, &mut io::sink()) {
-        let _ = fs::remove_file(dst);
-        return Err(format!("검증 실패: 결과 파일을 삭제했고 원본은 그대로입니다. ({x})"));
+    let mut msg = format!("암호화·복원 검증 완료 ({}, 파일 {}개)", comp_desc(&h.meta), m.files.len());
+    if m.skipped > 0 {
+        msg += &format!(" · 링크·특수 파일 {}개는 포함하지 않음", m.skipped);
     }
-
-    let mut msg = String::from("암호화·검증 완료");
-    if skipped > 0 {
-        msg += &format!(" · 바로가기/링크 {skipped}개는 포함하지 않음");
+    if let Some(w) = warn {
+        msg += &format!(" · {w}");
     }
     if !o.shred_src {
         return Ok(msg);
     }
     let passes = if o.force7 || disk != Disk::Ssd { 7 } else { 1 };
     set_stage(ST_SHRED); // from here on: no cancel
-    progress_start(shred_bytes(src, passes));
-    shred_tree(src, passes)?;
-    msg += &format!(" · 원본 {passes}회 덮어쓰기 파쇄");
-
-    let letter = parent.as_deref().and_then(drive_letter);
+    progress_start(m.total.saturating_mul(passes as u64));
+    let rep = shred_listed(&m, passes);
+    msg += &format!(" · {}", rep.summary(passes));
+    if disk != Disk::Hdd {
+        msg += " · SSD·스냅샷·클라우드 폴더에서는 물리적 삭제를 보장할 수 없음";
+    }
+    let parent = src.parent().map(Path::to_path_buf);
     if o.wipe_free_after {
         if let Some(p) = &parent {
             set_stage(ST_WIPE_FREE);
             match wipe_free_space(p) {
-                Ok(m) => msg += &format!(" · {m}"),
+                Ok(t) => msg += &format!(" · {t}"),
                 Err(x) if x == CANCELLED => msg += " · 여유 공간 덮어쓰기 취소됨",
                 Err(x) => msg += &format!(" · 여유 공간 덮어쓰기 실패({x})"),
             }
         }
     }
     if o.trim_after && disk != Disk::Hdd {
-        if let Some(l) = letter {
+        if let Some(l) = parent.as_deref().and_then(drive_letter) {
             set_stage(ST_TRIM);
             match trim_volume(l) {
-                Ok(m) => msg += &format!(" · {m}"),
+                Ok(t) => msg += &format!(" · {t}"),
                 Err(x) => msg += &format!(" · {x}"),
             }
         }
     }
-    if disk == Disk::Unknown {
-        msg += " · 디스크 종류를 확인하지 못해 7회 덮어썼습니다";
-    }
     Ok(msg)
 }
 
-fn safe_name(n: &str) -> Option<String> {
-    (component_ok(n) && Path::new(n).file_name().and_then(|f| f.to_str()) == Some(n)).then(|| n.to_string())
+pub fn safe_name(n: &str) -> Option<String> {
+    (archive::component_ok(n) && Path::new(n).file_name().and_then(|f| f.to_str()) == Some(n)).then(|| n.to_string())
 }
 
-/// `name` if nothing with that name exists in `dir`, otherwise "stem (decrypted).ext",
-/// "stem (decrypted 2).ext", ... Folders get the suffix at the end of the whole name.
-fn free_name(dir: &Path, name: &str, is_dir: bool) -> (PathBuf, bool) {
-    let p = dir.join(name);
-    if fs::symlink_metadata(&p).is_err() {
-        return (p, false);
+/// `name` if free in `dir`, otherwise "stem (decrypted).ext", "stem (decrypted 2).ext", ...
+pub fn free_name(dir: &Path, name: &str, is_dir: bool, i: u32) -> PathBuf {
+    if i == 0 {
+        return dir.join(name);
     }
     let path = Path::new(name);
     let (stem, ext) = match (is_dir, path.file_stem(), path.extension()) {
         (false, Some(s), Some(x)) => (s.to_string_lossy().into_owned(), format!(".{}", x.to_string_lossy())),
         _ => (name.to_string(), String::new()),
     };
-    let mut i = 1u32;
-    loop {
-        let n = if i == 1 { format!("{stem} (decrypted){ext}") } else { format!("{stem} (decrypted {i}){ext}") };
-        let q = dir.join(n);
-        if fs::symlink_metadata(&q).is_err() {
-            return (q, true);
-        }
-        i += 1;
-    }
+    dir.join(if i == 1 { format!("{stem} (decrypted){ext}") } else { format!("{stem} (decrypted {i}){ext}") })
 }
 
+/// Moves `item` to `dir/name` without overwriting (adds "(decrypted N)" when taken).
+pub fn move_out(item: &Path, dir: &Path, name: &str, is_dir: bool) -> R<(PathBuf, bool)> {
+    for i in 0..10_000 {
+        let dest = free_name(dir, name, is_dir, i);
+        if fs::symlink_metadata(&dest).is_ok() {
+            continue;
+        }
+        match rename_noreplace(item, &dest) {
+            Ok(()) => return Ok((dest, i > 0)),
+            Err(x) if x.kind() == io::ErrorKind::AlreadyExists || fs::symlink_metadata(&dest).is_ok() => continue,
+            Err(x) => return Err(format!("결과를 옮기지 못했습니다: {x}")),
+        }
+    }
+    Err("사용할 수 있는 이름이 없습니다.".into())
+}
+
+/// Opens + fully authenticates into SecTemp, checks the 7z structure and limits, extracts into a
+/// private staging folder, then moves the result next to the .shd (never overwriting).
 pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred) -> R<String> {
     let fname = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let fallback = safe_name(fname.strip_suffix(".shd").unwrap_or(fname)).unwrap_or_else(|| "decrypted".to_string());
-
     set_stage(ST_DECRYPT);
-    let mut st = SecTemp::create(outdir).map_err(e)?;
-    let (meta, pim) = decrypt_stream(src, c, &mut st)?;
-    if meta.flags & 1 == 0 {
-        return Err(BAD.into());
+    let mut f = File::open(src).map_err(e)?;
+    let h = read_header(&mut f, c)?;
+    if h.meta.comp_method == COMP_LZMA2 && h.meta.comp_dict as u64 > sysinfo::avail_mem() / 2 {
+        return Err(format!("가용 메모리가 부족합니다 (LZMA2 사전 {}).", human(h.meta.comp_dict as u64)));
     }
+    sysinfo::require_space(outdir, h.meta.real_len.saturating_add(h.meta.total_unpacked).saturating_add(64 << 20), "임시 압축본 + 복원 결과")?;
+    let mut st = SecTemp::create(outdir).map_err(e)?;
+    stream_body(&mut f, &h, &mut st)?; // every chunk authenticated before extraction starts
+    drop(f);
     st.flush().map_err(e)?;
-    let len = st.len();
-    st.seek(SeekFrom::Start(0)).map_err(e)?;
 
     set_stage(ST_EXTRACT);
-    let total = validate_archive(&mut st, len)?;
-    let stage = outdir.join(format!(".shd_{}_x", rand_hex()));
-    let r = fs::create_dir(&stage).map_err(e).and_then(|_| extract_from(&mut st, &stage, total));
-    drop(st); // crypto-erase of the scratch file
+    let len = st.len();
+    let listing = archive::inspect(&mut st, len)?;
+    let stage = Stage::create(outdir)?;
+    let r = archive::extract(&mut st, &stage.path, listing.total, &|n| Some(n.to_string()));
+    let warn = st.destroy().err().map(|x| x.to_string());
     if let Err(x) = r {
-        let _ = shred_tree(&stage, 1); // partial plaintext
-        return Err(x);
+        return Err(match stage.abort() {
+            Some(w) => format!("{x} · {w}"),
+            None => x,
+        });
     }
-
-    // Restore the original name when the destination has nothing with that name.
-    let want = safe_name(&meta.name).unwrap_or(fallback);
-    let is_dir = meta.flags & 2 != 0;
-    let mut items: Vec<PathBuf> = fs::read_dir(&stage).map_err(e)?.flatten().map(|d| d.path()).collect();
-    let single_ok = items.len() == 1
+    let want = safe_name(&h.meta.name).unwrap_or(fallback);
+    let is_dir = h.meta.flags & FLAG_DIR != 0;
+    let mut items: Vec<PathBuf> = fs::read_dir(&stage.path).map_err(e)?.flatten().map(|d| d.path()).collect();
+    let single = items.len() == 1
         && items[0].is_dir() == is_dir
-        && (!is_dir || items[0].file_name().and_then(|n| n.to_str()) == Some(want.as_str()));
-    let (item, is_stage) = if single_ok { (items.remove(0), false) } else { (stage.clone(), true) };
-    let (dest, renamed) = free_name(outdir, &want, is_dir || is_stage);
-    fs::rename(&item, &dest).map_err(e)?;
-    if !is_stage {
-        let _ = fs::remove_dir(&stage);
-    }
-    Ok(format!(
-        "복호화 완료: {}{}{}",
+        && items[0].file_name().and_then(|n| n.to_str()) == Some(want.as_str());
+    let (dest, renamed) = if single {
+        let it = items.remove(0);
+        let r = move_out(&it, outdir, &want, is_dir)?;
+        stage.finish()?;
+        r
+    } else {
+        // several top-level items (e.g. a whole drive was encrypted): keep them together
+        let p = stage.path.clone();
+        let r = move_out(&p, outdir, &want, true)?;
+        stage.finish()?;
+        r
+    };
+    let mut msg = format!(
+        "복호화 완료: {}{}",
         dest.display(),
-        if renamed { " (같은 이름이 이미 있어 '(decrypted)'를 붙임)" } else { "" },
-        legacy_note(pim, c.pim)
-    ))
+        if renamed { " (같은 이름이 이미 있어 '(decrypted)'를 붙임)" } else { "" }
+    );
+    if let Some(w) = warn {
+        msg += &format!(" · {w}");
+    }
+    Ok(msg)
+}
+
+/// Re-wraps the file key under new credentials; the data is not touched (instant for any size).
+/// 1) unwrap DEK with old creds  2) write the new wrapped DEK into the spare slot, fsync
+/// 3) re-read, verify the new creds open it AND yield the same DEK  4) overwrite the old slot 7x.
+///
+/// A crash at any point leaves at least one valid slot.
+pub fn do_change_password(path: &Path, old: &Cred, new: &Cred) -> R<String> {
+    set_stage(ST_REWRAP);
+    crate::crypto::kdf_params(new.pim)?;
+    if new.is_empty() {
+        return Err("새 비밀번호 또는 새 키 파일이 필요합니다.".into());
+    }
+    let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(e)?;
+    let h = read_header(&mut f, old)?;
+    let spare = 1 - h.slot_idx;
+    let new_slot = make_slot(new, &h.dek)?;
+    f.seek(SeekFrom::Start((spare * SLOT) as u64)).map_err(e)?;
+    f.write_all(&new_slot).map_err(e)?;
+    f.sync_all().map_err(e)?;
+
+    let mut head2 = [0u8; SLOTS];
+    f.seek(SeekFrom::Start(0)).map_err(e)?;
+    io::Read::read_exact(&mut f, &mut head2).map_err(e)?;
+    let fail = || "새 키 검증 실패: 기존 키 슬롯은 그대로 유지됩니다.".to_string();
+    let k2 = open_slot(new, &head2[spare * SLOT..(spare + 1) * SLOT])?.ok_or_else(fail)?;
+    if !crate::password::ct_eq(&k2[..], &h.dek[..]) {
+        return Err(fail());
+    }
+    // point of no return: not cancellable
+    let mut rng = crate::entropy::bulk_rng()?;
+    for p in PATTERNS {
+        let mut b = [0u8; SLOT];
+        match p {
+            Some(v) => b.fill(v),
+            None => rand::RngCore::fill_bytes(&mut rng, &mut b),
+        }
+        f.seek(SeekFrom::Start((h.slot_idx * SLOT) as u64)).map_err(e)?;
+        f.write_all(&b).map_err(e)?;
+        f.sync_all().map_err(e)?;
+    }
+    Ok("비밀번호 변경 완료: 기존 키 슬롯을 7회 덮어써 파기했습니다. 백업본·클라우드 버전 기록은 이전 비밀번호로 계속 열릴 수 있습니다.".into())
+}
+
+/// Writer that hashes everything going through it (SHA3-512).
+struct HashWriter<W> {
+    w: W,
+    h: Sha3_512,
+}
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        let n = self.w.write(b)?;
+        self.h.update(&b[..n]);
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+fn stamp(p: &Path) -> R<(u64, Option<std::time::SystemTime>)> {
+    let m = fs::metadata(p).map_err(e)?;
+    Ok((m.len(), m.modified().ok()))
+}
+
+/// Full key replacement: a new DEK, salts, nonce prefix and padding; the whole body is re-encrypted
+/// (optionally under new credentials) and verified before the original is atomically replaced.
+pub fn do_full_rekey(path: &Path, old: &Cred, new: &Cred) -> R<String> {
+    if new.is_empty() {
+        return Err("새 비밀번호 또는 새 키 파일이 필요합니다.".into());
+    }
+    let before = stamp(path)?;
+    let dir = parent_dir(path);
+    set_stage(ST_DECRYPT);
+    let mut f = File::open(path).map_err(e)?;
+    let h = read_header(&mut f, old)?;
+    sysinfo::require_space(&dir, h.meta.real_len.saturating_mul(2).saturating_add(64 << 20), "임시 압축본 + 새 파일")?;
+    let st = SecTemp::create(&dir).map_err(e)?;
+    let mut hw = HashWriter { w: st, h: Sha3_512::new() };
+    stream_body(&mut f, &h, &mut hw)?;
+    drop(f);
+    let want: [u8; 64] = hw.h.finalize().into();
+    let mut st = hw.w;
+    st.flush().map_err(e)?;
+    let len = st.len();
+    archive::inspect(&mut st, len)?;
+    st.seek(SeekFrom::Start(0)).map_err(e)?;
+
+    set_stage(ST_ENCRYPT);
+    let part = PartGuard { path: dir.join(format!(".shd_{}.part", rand_hex()?)), keep: false };
+    let out = OpenOptions::new().write(true).create_new(true).open(&part.path).map_err(e)?;
+    let mut w = BufWriter::with_capacity(1 << 20, out);
+    let mut meta = h.meta.clone();
+    let nh = encrypt_stream(&mut st, &mut w, new, &mut meta)?;
+    w.into_inner().map_err(|x| e(x.into_error()))?.sync_all().map_err(e)?;
+    let warn = st.destroy().err().map(|x| x.to_string());
+
+    set_stage(ST_VERIFY);
+    let mut g = File::open(&part.path).map_err(e)?;
+    let vh = read_header(&mut g, new).map_err(|x| format!("검증 실패: {x} — 원본은 그대로입니다."))?;
+    if !crate::password::ct_eq(&vh.dek[..], &nh.dek[..]) {
+        return Err("검증 실패: 다시 연 키가 다릅니다 — 원본은 그대로입니다.".into());
+    }
+    let mut hw2 = HashWriter { w: io::sink(), h: Sha3_512::new() };
+    stream_body(&mut g, &vh, &mut hw2)?;
+    let got: [u8; 64] = hw2.h.finalize().into();
+    if !crate::password::ct_eq(&got, &want) {
+        return Err("검증 실패: 다시 암호화한 내용이 원본과 다릅니다 — 원본은 그대로입니다.".into());
+    }
+    drop(g);
+    if stamp(path)? != before {
+        return Err("작업 중에 원본 .shd 파일이 바뀌어 교체하지 않았습니다.".into());
+    }
+    set_stage(ST_REPLACE);
+    rename_replace(&part.path, path).map_err(|x| format!("교체 실패 (원본 유지): {x}"))?;
+    part.keep();
+    let mut msg = "전체 키 교체 완료: 새 DEK·솔트·nonce·패딩으로 전체를 다시 암호화하고 검증했습니다. 이전 파일의 백업본은 이전 키로 계속 열릴 수 있습니다.".to_string();
+    if let Some(w) = warn {
+        msg += &format!(" · {w}");
+    }
+    Ok(msg)
 }
 
 #[cfg(test)]
 #[path = "engine_tests.rs"]
-mod tests;
+pub mod tests_support;
