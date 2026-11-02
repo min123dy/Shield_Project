@@ -22,6 +22,8 @@ ab_glyph = "0.2"
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
+serde = { version = "1", features = ["derive"] }
+wmi = "0.18.4"
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",
   "Win32_Globalization",
@@ -31,6 +33,7 @@ windows-sys = { version = "0.52", features = [
   "Win32_Storage_FileSystem",
   "Win32_System_DataExchange",
   "Win32_System_IO",
+  "Win32_System_Ioctl",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
   "Win32_System_Registry",
@@ -38,6 +41,7 @@ windows-sys = { version = "0.52", features = [
   "Win32_System_Threading",
   "Win32_System_Time",
   "Win32_System_Diagnostics_Debug",
+  "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

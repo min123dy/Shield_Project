@@ -42,82 +42,177 @@ fn sys32(rel: &str) -> PathBuf {
     crate::sysinfo::system_dir().join(rel)
 }
 
-#[cfg(windows)]
-fn powershell(script: &str) -> Option<(i32, String)> {
-    use std::os::windows::process::CommandExt;
-    let o = std::process::Command::new(sys32(r"WindowsPowerShell\v1.0\powershell.exe"))
-        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &encode_ps(script)])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .ok()?;
-    let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
-    text.push_str(&String::from_utf8_lossy(&o.stderr));
-    Some((o.status.code().unwrap_or(-1), text))
-}
-
-/// PowerShell -EncodedCommand payload: base64 of UTF-16LE (no quoting/injection issues).
-#[cfg(windows)]
-fn encode_ps(s: &str) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let b: Vec<u8> = s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    let mut out = String::new();
-    for c in b.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-        for i in 0..4 {
-            if i <= c.len() {
-                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
-/// Media type of the disk that holds `p` (Windows: via the Storage cmdlets).
+/// Media type of the disk that holds `p`. Windows: asks the storage stack whether the device incurs
+/// a seek penalty (IOCTL_STORAGE_QUERY_PROPERTY, the same source as Get-PhysicalDisk's MediaType).
 pub fn detect_disk(p: &Path) -> Disk {
     #[cfg(windows)]
-    {
-        if let Some(l) = drive_letter(p) {
-            let cmd = format!("(Get-Partition -DriveLetter {l} | Get-Disk | Get-PhysicalDisk).MediaType");
-            if let Some((0, out)) = powershell(&cmd) {
-                let o = out.to_uppercase();
-                if o.contains("SSD") {
-                    return Disk::Ssd;
-                }
-                if o.contains("HDD") {
-                    return Disk::Hdd;
-                }
-            }
-        }
+    if let Some(l) = drive_letter(p) {
+        return match seek_penalty(l) {
+            Some(true) => Disk::Hdd,
+            Some(false) => Disk::Ssd,
+            None => Disk::Unknown,
+        };
     }
     let _ = p;
     Disk::Unknown
 }
 
-/// Asks the volume to TRIM all free space (Optimize-Volume -ReTrim). Needs administrator rights:
-/// tries directly first, then once through a UAC prompt. Not cancellable once started.
+/// StorageDeviceSeekPenaltyProperty of volume `l:`. None when the device does not report it
+/// (virtual disks, some USB bridges, volumes spanning several disks).
+#[cfg(windows)]
+fn seek_penalty(l: char) -> Option<bool> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::Ioctl::{
+        PropertyStandardQuery, StorageDeviceSeekPenaltyProperty, DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
+        STORAGE_PROPERTY_QUERY,
+    };
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+    if !l.is_ascii_alphabetic() {
+        return None;
+    }
+    let dev: Vec<u16> = format!(r"\\.\{l}:").encode_utf16().chain(Some(0)).collect();
+    unsafe {
+        // access 0: a property query needs no read/write access, hence no administrator rights
+        let h = CreateFileW(dev.as_ptr(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE, core::ptr::null(), OPEN_EXISTING, 0, 0);
+        if h == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let q = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceSeekPenaltyProperty,
+            QueryType: PropertyStandardQuery,
+            AdditionalParameters: [0],
+        };
+        let mut d: DEVICE_SEEK_PENALTY_DESCRIPTOR = core::mem::zeroed();
+        let mut n = 0u32;
+        let ok = DeviceIoControl(
+            h,
+            IOCTL_STORAGE_QUERY_PROPERTY,
+            &q as *const _ as _,
+            core::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            &mut d as *mut _ as _,
+            core::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut n,
+            core::ptr::null_mut(),
+        );
+        CloseHandle(h);
+        let need = core::mem::offset_of!(DEVICE_SEEK_PENALTY_DESCRIPTOR, IncursSeekPenalty) + 1;
+        (ok != 0 && n as usize >= need).then_some(d.IncursSeekPenalty != 0)
+    }
+}
+
+/// Hidden command line of the elevated TRIM helper: `shield.exe --retrim <letter>`.
+#[cfg(windows)]
+pub const RETRIM_ARG: &str = "--retrim";
+
+/// Asks the volume to TRIM all free space through the Storage Management API (WMI
+/// MSFT_Volume.Optimize with ReTrim, what Optimize-Volume -ReTrim calls). Needs administrator
+/// rights: tries directly first, then once through a UAC prompt that runs this executable as
+/// `--retrim <letter>`. Not cancellable once started.
 #[cfg(windows)]
 pub fn trim_volume(l: char) -> R<String> {
     if !l.is_ascii_alphabetic() {
         return Err(t("wipe.bad_drive").into());
     }
-    let inner = format!("try {{ Optimize-Volume -DriveLetter {l} -ReTrim -ErrorAction Stop | Out-Null; exit 0 }} catch {{ exit 3 }}");
-    if let Some((0, _)) = powershell(&inner) {
+    let l = l.to_ascii_uppercase();
+    if retrim_wmi(l).is_ok() {
         return Ok(tf("wipe.trim_done", &[&l]));
     }
-    let exe = sys32(r"WindowsPowerShell\v1.0\powershell.exe");
-    let elevate = format!(
-        "try {{ $p = Start-Process -FilePath '{}' -Verb RunAs -Wait -PassThru -WindowStyle Hidden \
-         -ArgumentList '-NoProfile','-NonInteractive','-EncodedCommand','{}' -ErrorAction Stop; exit $p.ExitCode }} \
-         catch {{ exit 2 }}",
-        exe.display().to_string().replace('\'', "''"),
-        encode_ps(&inner)
-    );
-    match powershell(&elevate) {
-        Some((0, _)) => Ok(tf("wipe.trim_done_admin", &[&l])),
-        Some((2, _)) => Err(t("wipe.trim_denied").into()),
+    const ERROR_CANCELLED: i32 = 1223; // the user declined the UAC prompt
+    match run_elevated(&format!("{RETRIM_ARG} {l}")) {
+        Ok(0) => Ok(tf("wipe.trim_done_admin", &[&l])),
+        Err(x) if x.raw_os_error() == Some(ERROR_CANCELLED) => Err(t("wipe.trim_denied").into()),
         _ => Err(tf("wipe.trim_failed", &[&l])),
+    }
+}
+
+/// Entry point of the elevated helper. Accepts exactly one drive letter; exit code 0 on success,
+/// 2 on a bad argument, 3 when the TRIM request failed.
+#[cfg(windows)]
+pub fn retrim_main(arg: Option<&str>) -> i32 {
+    let mut c = arg.unwrap_or("").chars();
+    match (c.next(), c.next()) {
+        (Some(l), None) if l.is_ascii_alphabetic() => match retrim_wmi(l.to_ascii_uppercase()) {
+            Ok(()) => 0,
+            Err(_) => 3,
+        },
+        _ => 2,
+    }
+}
+
+/// `__Path` of the MSFT_Volume mounted at `l:` (ROOT\Microsoft\Windows\Storage).
+#[cfg(windows)]
+fn volume_path(con: &wmi::WMIConnection, l: char) -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    #[allow(non_snake_case)]
+    struct Vol {
+        __Path: String,
+    }
+    if !l.is_ascii_alphabetic() {
+        return Err(t("wipe.bad_drive").into()); // also keeps the WQL literal injection-free
+    }
+    let v: Vec<Vol> = con
+        .raw_query(format!("SELECT __Path FROM MSFT_Volume WHERE DriveLetter = '{l}'"))
+        .map_err(|x| x.to_string())?;
+    v.into_iter().next().map(|v| v.__Path).ok_or_else(|| t("wipe.no_drive").to_string())
+}
+
+#[cfg(windows)]
+fn retrim_wmi(l: char) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    #[allow(non_camel_case_types)]
+    struct MSFT_Volume;
+    #[derive(serde::Serialize)]
+    #[allow(non_snake_case)]
+    struct OptimizeIn {
+        ReTrim: bool,
+    }
+    #[derive(serde::Deserialize)]
+    #[allow(non_snake_case)]
+    struct OptimizeOut {
+        ReturnValue: u32,
+    }
+    let con = wmi::WMIConnection::with_namespace_path(r"ROOT\Microsoft\Windows\Storage").map_err(|x| x.to_string())?;
+    let path = volume_path(&con, l)?;
+    let out: OptimizeOut = con
+        .exec_instance_method::<MSFT_Volume, _>(&path, "Optimize", OptimizeIn { ReTrim: true })
+        .map_err(|x| x.to_string())?;
+    match out.ReturnValue {
+        0 => Ok(()),
+        n => Err(format!("MSFT_Volume.Optimize: {n}")),
+    }
+}
+
+/// Runs this executable elevated (UAC "runas", hidden window) with `params` and waits for it.
+/// Returns its exit code; the error carries ERROR_CANCELLED when the prompt was declined.
+#[cfg(windows)]
+fn run_elevated(params: &str) -> std::io::Result<u32> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    let exe = crate::sysinfo::wide(&std::env::current_exe()?);
+    let w = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let (verb, params) = (w("runas"), w(params));
+    unsafe {
+        let mut i: SHELLEXECUTEINFOW = core::mem::zeroed();
+        i.cbSize = core::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        i.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        i.lpVerb = verb.as_ptr();
+        i.lpFile = exe.as_ptr();
+        i.lpParameters = params.as_ptr();
+        i.nShow = SW_HIDE;
+        if ShellExecuteExW(&mut i) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if i.hProcess == 0 {
+            return Err(std::io::Error::other("no process handle"));
+        }
+        WaitForSingleObject(i.hProcess, INFINITE);
+        let mut code = 1u32;
+        let r = if GetExitCodeProcess(i.hProcess, &mut code) == 0 { Err(std::io::Error::last_os_error()) } else { Ok(code) };
+        CloseHandle(i.hProcess);
+        r
     }
 }
 
@@ -368,9 +463,25 @@ pub fn shred_own_tree(p: &Path) -> R<()> {
 #[cfg(all(test, windows))]
 mod tests {
     #[test]
-    fn base64_utf16() {
-        assert_eq!(super::encode_ps("ab"), "YQBiAA==");
-        assert_eq!(super::encode_ps("abc"), "YQBiAGMA");
+    fn disk_type_from_ioctl() {
+        // the system drive always reports a seek penalty on real hardware; VMs may not
+        let d = super::detect_disk(&std::env::temp_dir());
+        assert!(matches!(d, super::Disk::Ssd | super::Disk::Hdd | super::Disk::Unknown));
+        assert_eq!(super::seek_penalty('1'), None);
+    }
+    #[test]
+    fn retrim_helper_rejects_bad_arguments() {
+        for a in [None, Some(""), Some("CD"), Some("C:"), Some("1"), Some("C' OR 1=1")] {
+            assert_eq!(super::retrim_main(a), 2, "{a:?}");
+        }
+    }
+    #[test]
+    fn msft_volume_of_the_system_drive() {
+        let con = wmi::WMIConnection::with_namespace_path(r"ROOT\Microsoft\Windows\Storage").unwrap();
+        let l = super::drive_letter(&crate::sysinfo::system_dir()).unwrap();
+        let p = super::volume_path(&con, l).unwrap();
+        assert!(p.contains("MSFT_Volume"), "{p}");
+        assert!(super::volume_path(&con, '1').is_err());
     }
     #[test]
     fn own_tree_reports_and_clears_read_only() {
