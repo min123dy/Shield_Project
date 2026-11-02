@@ -3,6 +3,8 @@
 //! be extracted without decoding the rest.
 
 use crate::compress::{self, Plan};
+use crate::format::Meta;
+use crate::i18n::{t, tf};
 use crate::manifest::{FileRec, HashingReader, Manifest};
 use crate::progress::*;
 use sevenz_rust2::{ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderMethod, Error as ZErr, NtTime, Password};
@@ -15,15 +17,18 @@ use std::{
     time::SystemTime,
 };
 
-/// Decompression limits (decrypt, open and verify alike).
+/// Decompression limits (decrypt, open and verify alike). Sizes come from format.rs so that
+/// encryption refuses the same inputs up front.
 pub const MAX_FILES: usize = crate::format::MAX_FILES as usize;
 pub const MAX_DEPTH: usize = 64;
 pub const MAX_PATH_CHARS: usize = 1024;
 pub const MAX_COMPONENT_BYTES: usize = 255;
-pub const MAX_ENTRY: u64 = 4 << 40; // 4 TiB
-pub const MAX_TOTAL: u64 = 16 << 40; // 16 TiB
-/// Unpacked / packed ratio limit, applied once the unpacked total exceeds 1 GiB.
+pub use crate::format::{MAX_ENTRY, MAX_TOTAL};
+/// Unpacked / packed ratio limit.
 pub const MAX_RATIO: u64 = 10_000;
+/// The ratio limit applies from this unpacked total on (smaller inputs can't hurt and tiny
+/// archives of zeros legitimately reach high ratios).
+pub const RATIO_FROM: u64 = 64 << 20;
 
 fn zerr(m: String) -> ZErr {
     ZErr::Other(Cow::Owned(m))
@@ -32,11 +37,11 @@ fn zerr(m: String) -> ZErr {
 /// Maps a library error, keeping "cancelled" and our own messages readable.
 fn from_z(x: ZErr) -> String {
     if cancelled() {
-        return CANCELLED.to_string();
+        return cancelled_msg();
     }
     match x {
         ZErr::Other(m) => m.into_owned(),
-        o => format!("7z 처리 오류: {o}"),
+        o => tf("arc.7z_error", &[&o]),
     }
 }
 
@@ -45,7 +50,7 @@ fn is_reserved(n: &str) -> bool {
     matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" | "CLOCK$")
         || (base.chars().count() == 4
             && (base.starts_with("COM") || base.starts_with("LPT"))
-            && base.chars().nth(3).is_some_and(|c| c.is_ascii_digit() || matches!(c, '¹' | '²' | '³')))
+            && base.chars().nth(3).is_some_and(|c| c.is_ascii_digit() || matches!(c, '\u{B9}' | '\u{B2}' | '\u{B3}')))
 }
 
 /// One path component that is safe to create on Windows (and elsewhere).
@@ -60,12 +65,19 @@ pub fn component_ok(n: &str) -> bool {
 }
 
 /// Relative entry path whose every component is safe (no "..", drive, UNC, ADS, device names),
-/// within the depth and length limits.
+/// within the depth and length limits. '/' is the only separator: a '\' anywhere is refused, so
+/// depth, duplicates and the created path all see the same components.
 pub fn entry_ok(n: &str) -> bool {
     !n.is_empty()
+        && !n.contains('\\')
         && n.chars().count() <= MAX_PATH_CHARS
         && n.split('/').count() <= MAX_DEPTH
-        && n.split(['/', '\\']).all(component_ok)
+        && n.split('/').all(component_ok)
+}
+
+/// Key used for duplicate detection: Windows file names are case-insensitive.
+pub fn dup_key(n: &str) -> String {
+    n.to_lowercase()
 }
 
 pub struct EntryInfo {
@@ -80,6 +92,18 @@ pub struct Listing {
     pub total: u64,
     pub files: u64,
     pub dirs: u64,
+}
+
+/// The authenticated metadata promised these counts and this unpacked size; the 7z headers (which
+/// only the chunk tags protect, not their meaning) must say exactly the same.
+pub fn check_against_meta(l: &Listing, m: &Meta) -> R<()> {
+    if l.total != m.total_unpacked || l.files != m.file_count || l.dirs != m.dir_count {
+        return Err(tf(
+            "arc.meta_mismatch",
+            &[&l.files, &l.dirs, &crate::ui_fmt::human(l.total), &m.file_count, &m.dir_count, &crate::ui_fmt::human(m.total_unpacked)],
+        ));
+    }
+    Ok(())
 }
 
 fn entry_is_link(f: &ArchiveEntry) -> bool {
@@ -98,28 +122,33 @@ fn lzma2_dict(prop: u8) -> Option<u64> {
     }
 }
 
+/// True when `total` bytes unpacked from `packed` bytes is a suspicious ratio.
+pub fn ratio_bad(total: u64, packed: u64) -> bool {
+    total > RATIO_FROM && total / packed.max(1) > MAX_RATIO
+}
+
 /// Reads the 7z headers only and checks every entry and coder against the limits.
 pub fn inspect<Rd: Read + Seek>(r: &mut Rd, packed_len: u64) -> R<Listing> {
     r.seek(SeekFrom::Start(0)).map_err(e)?;
-    let rd = ArchiveReader::new(&mut *r, Password::empty()).map_err(|x| format!("7z 헤더 구조 오류: {}", from_z(x)))?;
+    let rd = ArchiveReader::new(&mut *r, Password::empty()).map_err(|x| tf("arc.header", &[&from_z(x)]))?;
     let a = rd.archive();
     if a.files.len() > MAX_FILES {
-        return Err(format!("항목이 너무 많습니다 ({}개 > {MAX_FILES}).", a.files.len()));
+        return Err(tf("arc.too_many", &[&a.files.len(), &MAX_FILES]));
     }
     let avail = crate::sysinfo::avail_mem();
     for b in &a.blocks {
         for c in &b.coders {
             let id = c.encoder_method_id();
             if id == EncoderMethod::ID_LZMA2 {
-                let d = c.properties().first().and_then(|p| lzma2_dict(*p)).ok_or("잘못된 LZMA2 속성")?;
+                let d = c.properties().first().and_then(|p| lzma2_dict(*p)).ok_or_else(|| t("arc.bad_lzma2").to_string())?;
                 if d > crate::format::MAX_LZMA_DICT as u64 {
-                    return Err(format!("LZMA2 사전이 너무 큽니다 ({}): Shield가 만든 압축이 아닙니다.", crate::ui_fmt::human(d)));
+                    return Err(tf("arc.dict_too_big", &[&crate::ui_fmt::human(d)]));
                 }
                 if d > avail / 2 {
-                    return Err(format!("가용 메모리가 부족해 해제할 수 없습니다 (사전 {}).", crate::ui_fmt::human(d)));
+                    return Err(tf("arc.no_mem", &[&crate::ui_fmt::human(d)]));
                 }
             } else if id != EncoderMethod::ID_ZSTD && id != EncoderMethod::ID_COPY {
-                return Err("지원하지 않는 압축 방식이 들어 있습니다 (Shield는 LZMA2·Zstandard·무압축만 해제).".into());
+                return Err(t("arc.method").into());
             }
         }
     }
@@ -128,22 +157,22 @@ pub fn inspect<Rd: Read + Seek>(r: &mut Rd, packed_len: u64) -> R<Listing> {
     for f in &a.files {
         let n = f.name();
         if f.is_anti_item() || entry_is_link(f) {
-            return Err(format!("보안 위반: 링크 또는 삭제 표시 항목 ({n})"));
+            return Err(tf("arc.link", &[&n]));
         }
         if !entry_ok(n) {
-            return Err(format!("보안 위반: 안전하지 않은 압축 항목 경로 ({n})"));
+            return Err(tf("arc.unsafe_path", &[&n]));
         }
-        if !seen.insert(n.to_lowercase()) {
-            return Err(format!("보안 위반: 대소문자만 다른 중복 항목 ({n})"));
+        if !seen.insert(dup_key(n)) {
+            return Err(tf("arc.dup", &[&n]));
         }
         if f.is_directory() {
             out.dirs += 1;
         } else {
             if f.size() > MAX_ENTRY {
-                return Err(format!("항목이 너무 큽니다 ({n})"));
+                return Err(tf("arc.entry_big", &[&n]));
             }
             out.files += 1;
-            out.total = out.total.checked_add(f.size()).filter(|t| *t <= MAX_TOTAL).ok_or("해제 총용량 제한 초과")?;
+            out.total = out.total.checked_add(f.size()).filter(|t| *t <= MAX_TOTAL).ok_or_else(|| t("arc.total_big").to_string())?;
         }
         out.entries.push(EntryInfo {
             name: zeroize::Zeroizing::new(n.to_string()),
@@ -152,8 +181,8 @@ pub fn inspect<Rd: Read + Seek>(r: &mut Rd, packed_len: u64) -> R<Listing> {
             mtime: f.has_last_modified_date.then(|| f.last_modified_date().into()),
         });
     }
-    if out.total > (1 << 30) && out.total / packed_len.max(1) > MAX_RATIO {
-        return Err("압축률이 비정상적으로 높습니다 (압축 폭탄 의심).".into());
+    if ratio_bad(out.total, packed_len) {
+        return Err(t("arc.bomb").into());
     }
     drop(rd);
     r.seek(SeekFrom::Start(0)).map_err(e)?;
@@ -177,7 +206,7 @@ fn push_file<W: Write + Seek>(z: &mut ArchiveWriter<W>, rec: &mut FileRec, main:
     let mut hr = HashingReader::new(BufReader::with_capacity(1 << 20, f));
     z.push_archive_entry(entry_for(&rec.rel, false, rec.mtime), Some(&mut hr)).map_err(from_z)?;
     if hr.n != rec.size {
-        return Err(format!("암호화 도중 파일 크기가 바뀌었습니다: {} — 원본은 그대로 두고 중단했습니다.", rec.path.display()));
+        return Err(tf("arc.size_changed", &[&rec.path.display()]));
     }
     rec.hash = Some(hr.digest());
     Ok(stored)
@@ -233,7 +262,7 @@ pub fn copy_entries<Rd: Read + Seek, W: Write + Seek>(
             return Ok(true);
         }
         if !entry_ok(name) {
-            return Err(format!("보안 위반: 안전하지 않은 항목 ({name})"));
+            return Err(tf("arc.unsafe_path", &[&name]));
         }
         let mt: Option<SystemTime> = en.has_last_modified_date.then(|| en.last_modified_date().into());
         if en.is_directory() {
@@ -244,7 +273,7 @@ pub fn copy_entries<Rd: Read + Seek, W: Write + Seek>(
         let mut hr = HashingReader::new(Bounded { inner: rdr, left: en.size() });
         z.push_archive_entry(entry_for(name, false, mt), Some(&mut hr)).map_err(from_z)?;
         if hr.n != en.size() {
-            return Err(format!("압축 해제 크기 불일치: {name}"));
+            return Err(tf("arc.unpack_size", &[&name]));
         }
         files.insert(name.to_string(), (hr.n, hr.digest()));
         Ok(true)
@@ -268,10 +297,10 @@ pub fn digests<Rd: Read + Seek>(r: &mut Rd) -> R<(crate::manifest::Digests, BTre
             dirs.insert(en.name().to_string());
             return Ok(true);
         }
-        let mut hr = HashingReader::new(rdr);
-        io::copy(&mut hr, &mut io::sink()).map_err(|x| if cancelled() { CANCELLED.to_string() } else { format!("압축 해제 실패: {x}") })?;
+        let mut hr = HashingReader::new(Bounded { inner: rdr, left: en.size() });
+        io::copy(&mut hr, &mut io::sink()).map_err(|x| if cancelled() { cancelled_msg() } else { tf("arc.unpack_failed", &[&x]) })?;
         if hr.n != en.size() {
-            return Err(format!("압축 해제 크기 불일치: {}", en.name()));
+            return Err(tf("arc.unpack_size", &[&en.name()]));
         }
         files.insert(en.name().to_string(), (hr.n, hr.digest()));
         Ok(true)
@@ -286,14 +315,14 @@ fn make_dirs(dest: &Path, rel: &str) -> R<PathBuf> {
         p.push(c);
         match fs::symlink_metadata(&p) {
             Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-            Ok(_) => return Err(format!("보안 위반: 경로 충돌 또는 링크 ({rel})")),
+            Ok(_) => return Err(tf("arc.path_clash", &[&rel])),
             Err(_) => fs::create_dir(&p).map_err(e)?,
         }
     }
     Ok(p)
 }
 
-/// Bounded copy: never writes more than the size declared in the header.
+/// Bounded copy: never yields more than the size declared in the header.
 struct Bounded<'a> {
     inner: &'a mut dyn Read,
     left: u64,
@@ -301,11 +330,11 @@ struct Bounded<'a> {
 impl Read for Bounded<'_> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         if cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, CANCELLED));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, cancelled_msg()));
         }
         let n = self.inner.read(b)?;
         if n as u64 > self.left {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "선언된 크기보다 큰 데이터 (압축 폭탄 의심)"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, t("arc.bigger_than_declared")));
         }
         self.left -= n as u64;
         progress_add(n as u64);
@@ -315,19 +344,23 @@ impl Read for Bounded<'_> {
 
 /// Extracts entries into `dest` (a fresh private staging folder). `map` gives the output relative
 /// name of an entry (None = skip it). Files are created with `create_new` and never overwrite.
-pub fn extract<Rd: Read + Seek>(r: &mut Rd, dest: &Path, total: u64, map: &dyn Fn(&str) -> Option<String>) -> R<u64> {
-    progress_start(total);
+/// `limit` is the number of bytes the caller verified against the authenticated metadata; the
+/// running total of written bytes may never exceed it.
+pub fn extract<Rd: Read + Seek>(r: &mut Rd, dest: &Path, limit: u64, map: &dyn Fn(&str) -> Option<String>) -> R<u64> {
+    progress_start(limit);
     let mut seen = HashSet::new();
     let mut count = 0u64;
+    let mut written = 0u64;
     for_each(r, |en, rdr| {
         let Some(out) = map(en.name()) else { return Ok(true) };
-        if !entry_ok(&out) || !seen.insert(out.to_lowercase()) {
-            return Err(format!("보안 위반: 안전하지 않은 항목 ({out})"));
+        if !entry_ok(&out) || !seen.insert(dup_key(&out)) {
+            return Err(tf("arc.unsafe_path", &[&out]));
         }
         if en.is_directory() {
             make_dirs(dest, &out)?;
             return Ok(true);
         }
+        written = written.checked_add(en.size()).filter(|w| *w <= limit).ok_or_else(|| t("arc.over_declared_total").to_string())?;
         let (parent, file) = match out.rsplit_once('/') {
             Some((p, f)) => (make_dirs(dest, p)?, f),
             None => (dest.to_path_buf(), out.as_str()),
@@ -336,9 +369,9 @@ pub fn extract<Rd: Read + Seek>(r: &mut Rd, dest: &Path, total: u64, map: &dyn F
         let fh = OpenOptions::new().write(true).create_new(true).open(&path).map_err(|x| format!("{out}: {x}"))?;
         let mut w = BufWriter::with_capacity(1 << 20, fh);
         let mut b = Bounded { inner: rdr, left: en.size() };
-        let n = io::copy(&mut b, &mut w).map_err(|x| if cancelled() { CANCELLED.to_string() } else { format!("{out}: {x}") })?;
+        let n = io::copy(&mut b, &mut w).map_err(|x| if cancelled() { cancelled_msg() } else { format!("{out}: {x}") })?;
         if n != en.size() {
-            return Err(format!("압축 해제 크기 불일치: {out}"));
+            return Err(tf("arc.unpack_size", &[&out]));
         }
         let fh = w.into_inner().map_err(|x| e(x.into_error()))?;
         if en.has_last_modified_date {
@@ -358,12 +391,40 @@ mod tests {
         assert!(entry_ok("dir/file.txt") && entry_ok("a") && entry_ok("한글/파일.txt"));
         for bad in [
             "", "../x", "a/../b", "C:/x", "/abs", "a//b", "a/NUL", "con.txt", "x:ads", "a/b. ", "COM1", "LPT9.log",
-            "COM¹", "\\\\server\\share", "a\\..\\b", "file.txt:stream", "a/aux",
+            "COM\u{B9}", "\\\\server\\share", "a\\..\\b", "file.txt:stream", "a/aux",
         ] {
             assert!(!entry_ok(bad), "{bad}");
         }
         assert!(!entry_ok(&"x/".repeat(70)));
         assert!(!entry_ok(&"a".repeat(300)));
+    }
+    #[test]
+    fn backslash_is_never_a_separator() {
+        // 300 levels written with '\' used to pass the 64-level depth limit
+        assert!(!entry_ok(&vec!["d"; 300].join("\\")));
+        assert!(!entry_ok("a\\b"), "a\\b and a/b would otherwise be different entries");
+        assert!(!entry_ok("dir/sub\\file"));
+        assert!(entry_ok(&vec!["d"; MAX_DEPTH].join("/")));
+        assert!(!entry_ok(&vec!["d"; MAX_DEPTH + 1].join("/")));
+        assert_eq!(dup_key("Dir/A.TXT"), dup_key("dir/a.txt"));
+    }
+    #[test]
+    fn ratio_limit_applies_below_one_gib() {
+        assert!(ratio_bad(256 << 20, 1000), "256 MiB from 1000 bytes");
+        assert!(!ratio_bad(256 << 20, 1 << 20));
+        assert!(!ratio_bad(1 << 20, 10), "small totals are never refused");
+    }
+    #[test]
+    fn listing_must_match_meta() {
+        let l = Listing { entries: vec![], total: 256 << 20, files: 1, dirs: 0 };
+        let mut m = Meta::new("x", crate::format::FLAG_ARCHIVE);
+        m.file_count = 1;
+        m.total_unpacked = 1; // the reported attack: 1 byte in the meta, 256 MiB in the 7z list
+        assert!(check_against_meta(&l, &m).is_err());
+        m.total_unpacked = 256 << 20;
+        assert!(check_against_meta(&l, &m).is_ok());
+        m.dir_count = 1;
+        assert!(check_against_meta(&l, &m).is_err());
     }
     #[test]
     fn lzma2_dict_props() {

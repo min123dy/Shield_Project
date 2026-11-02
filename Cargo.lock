@@ -2246,8 +2246,9 @@ dependencies = [
 
 [[package]]
 name = "shield"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
+ "ab_glyph",
  "argon2",
  "chacha20poly1305",
  "eframe",

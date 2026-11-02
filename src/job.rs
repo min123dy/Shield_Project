@@ -11,7 +11,10 @@ use std::{
     time::Instant,
 };
 
-pub const PANIC_MSG: &str = "내부 오류(패닉)로 작업을 중단했습니다. 원본은 지우지 않았고 임시 자료는 정리했습니다. 결과를 성공으로 보지 마세요.";
+pub const C_PANIC: &str = "E_PANIC";
+pub fn panic_msg() -> String {
+    crate::i18n::coded(C_PANIC, "err.panic")
+}
 
 pub struct Job<T> {
     pub title: &'static str,
@@ -27,7 +30,7 @@ impl<T: Send + 'static> Job<T> {
         set_stage(0);
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let r = catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(PANIC_MSG.to_string()));
+            let r = catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(panic_msg()));
             set_stage(0);
             let _ = tx.send(r);
         });
@@ -39,19 +42,19 @@ impl<T: Send + 'static> Job<T> {
         match self.rx.try_recv() {
             Ok(r) => Some(r),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(PANIC_MSG.to_string())),
+            Err(TryRecvError::Disconnected) => Some(Err(panic_msg())),
         }
     }
 
     pub fn secs(&self) -> String {
-        format!(" ({}초)", self.started.elapsed().as_secs())
+        crate::i18n::tf("job.secs", &[&self.started.elapsed().as_secs()])
     }
 }
 
 /// Starts the other Shield window (same executable) with the given arguments.
 pub fn launch(args: &[&std::ffi::OsStr]) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|x| x.to_string())?;
-    std::process::Command::new(exe).args(args).spawn().map(|_| ()).map_err(|x| format!("창을 열지 못했습니다: {x}"))
+    std::process::Command::new(exe).args(args).spawn().map(|_| ()).map_err(|x| crate::i18n::tf("job.launch_failed", &[&x]))
 }
 
 #[cfg(test)]
@@ -66,6 +69,6 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
-        assert_eq!(r.unwrap_err(), PANIC_MSG);
+        assert!(crate::i18n::has_code(&r.unwrap_err(), C_PANIC));
     }
 }

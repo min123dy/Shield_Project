@@ -1,5 +1,6 @@
 use super::*;
 use crate::crypto::{encrypt_stream, read_header, Cred};
+use crate::i18n::has_code;
 use crate::password::normalize;
 use std::io::Read;
 
@@ -21,7 +22,13 @@ pub fn opts() -> Opts {
         wipe_free_after: false,
         strength: Strength::Auto,
         keyfiles: vec![],
+        streams: StreamPolicy::Ask,
     }
+}
+
+/// Decryption with the default options.
+pub fn dec(src: &Path, out: &Path, c: &Cred) -> R<String> {
+    do_decrypt(src, out, c, DecOpts::default())
 }
 
 fn sha3(p: &Path) -> [u8; 64] {
@@ -47,11 +54,11 @@ fn file_folder_empty_and_hangul_roundtrip() {
     let c = cred("folder password 123", 0);
     let dst = dir.join("문서 폴더.shd");
     let m = do_encrypt(&src, &dst, &c, &opts()).unwrap();
-    assert!(m.contains("복원 검증 완료"), "{m}");
+    assert!(m.contains("LZMA2") || m.contains("Zstandard"), "{m}");
 
     let out = dir.join("out");
     fs::create_dir_all(&out).unwrap();
-    do_decrypt(&dst, &out, &c).unwrap();
+    dec(&dst, &out, &c).unwrap();
     let r = out.join("문서 폴더");
     assert_eq!(sha3(&r.join("한글 이름.txt")), sha3(&src.join("한글 이름.txt")));
     assert_eq!(sha3(&r.join("하위").join("big.bin")), sha3(&src.join("하위").join("big.bin")));
@@ -59,7 +66,7 @@ fn file_folder_empty_and_hangul_roundtrip() {
     assert!(r.join("하위").join("빈 폴더").is_dir());
     assert_eq!(listing(&out), vec!["문서 폴더".to_string()]);
     // second time: the name exists, so the folder gets a suffix
-    do_decrypt(&dst, &out, &c).unwrap();
+    dec(&dst, &out, &c).unwrap();
     assert!(out.join("문서 폴더 (decrypted)").join("한글 이름.txt").is_file());
 
     // single empty file
@@ -67,7 +74,7 @@ fn file_folder_empty_and_hangul_roundtrip() {
     fs::write(&f, b"").unwrap();
     let fd = dir.join("빈.txt.shd");
     do_encrypt(&f, &fd, &c, &opts()).unwrap();
-    do_decrypt(&fd, &out, &c).unwrap();
+    dec(&fd, &out, &c).unwrap();
     assert_eq!(fs::read(out.join("빈.txt")).unwrap().len(), 0);
     let _ = fs::remove_dir_all(dir);
 }
@@ -103,7 +110,7 @@ fn wrong_credentials_give_one_error_and_no_plaintext() {
     let wrong_pim = Cred { pw: normalize("right password!!"), kf: c.kf.clone(), pim: 2 };
     let no_kf = cred("right password!!", 1);
     for w in [wrong_pw, wrong_pim, no_kf] {
-        assert_eq!(do_decrypt(&dst, &out, &w).unwrap_err(), BAD);
+        assert!(has_code(&dec(&dst, &out, &w).unwrap_err(), C_BAD));
     }
     assert!(listing(&out).is_empty());
     assert!(crate::crypto::kdf_params(MAX_PIM + 1).is_err());
@@ -121,7 +128,7 @@ fn keyfile_inside_target_is_blocked() {
     let mut o = opts();
     o.keyfiles = vec![src.join("k.key")];
     let err = do_encrypt(&src, &dir.join("data.shd"), &cred("long enough password", 0), &o).unwrap_err();
-    assert!(err.contains("키 파일"), "{err}");
+    assert!(err.contains(&src.join("k.key").display().to_string()), "{err}");
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -188,8 +195,8 @@ fn unknown_version_is_reported_only_after_authentication() {
     m.version = 3;
     m.real_len = 10;
     encrypt_stream(&mut io::Cursor::new(vec![1u8; 10]), &mut fs::File::create(&p).unwrap(), &c, &mut m).unwrap();
-    assert_eq!(body(&p, &c).unwrap_err(), UNSUPPORTED);
-    assert_eq!(body(&p, &cred("wrong", 0)).unwrap_err(), BAD);
+    assert!(has_code(&body(&p, &c).unwrap_err(), C_UNSUPPORTED));
+    assert!(has_code(&body(&p, &cred("wrong", 0)).unwrap_err(), C_BAD));
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -223,18 +230,18 @@ fn password_change_and_full_rekey() {
 
     let b = cred("second password 456", 1);
     do_change_password(&dst, &a, &b).unwrap();
-    assert_eq!(read_header(&mut File::open(&dst).unwrap(), &a).err().unwrap(), BAD);
+    assert!(has_code(&read_header(&mut File::open(&dst).unwrap(), &a).err().unwrap(), C_BAD));
     let dek1 = read_header(&mut File::open(&dst).unwrap(), &b).unwrap().dek;
     assert_eq!(*dek0, *dek1, "password change keeps the DEK");
 
     let c3 = cred("third password 789", 0);
     do_full_rekey(&dst, &b, &c3).unwrap();
-    assert_eq!(read_header(&mut File::open(&dst).unwrap(), &b).err().unwrap(), BAD);
+    assert!(has_code(&read_header(&mut File::open(&dst).unwrap(), &b).err().unwrap(), C_BAD));
     let dek2 = read_header(&mut File::open(&dst).unwrap(), &c3).unwrap().dek;
     assert_ne!(*dek1, *dek2, "full rekey makes a new DEK");
     let out = dir.join("out");
     fs::create_dir_all(&out).unwrap();
-    do_decrypt(&dst, &out, &c3).unwrap();
+    dec(&dst, &out, &c3).unwrap();
     assert_eq!(fs::read(out.join("doc.txt")).unwrap(), b"rekey me");
     assert_eq!(listing(&dir), vec!["doc.shd", "doc.txt", "out"]);
     let _ = fs::remove_dir_all(dir);
@@ -262,7 +269,7 @@ fn encrypt_with_shred_removes_only_listed_files() {
     let m = do_encrypt(&src, &dir.join("secret.shd"), &c, &o).unwrap();
     assert!(m.contains("파쇄"), "{m}");
     assert!(!src.exists());
-    do_decrypt(&dir.join("secret.shd"), &dir, &c).unwrap();
+    dec(&dir.join("secret.shd"), &dir, &c).unwrap();
     assert_eq!(fs::read(&src).unwrap(), vec![9u8; 10_000]);
     let _ = fs::remove_dir_all(dir);
 }
@@ -280,7 +287,7 @@ fn shred_protects_changed_new_and_hardlinked_files() {
     fs::write(src.join("b"), b"changed after the list was fixed").unwrap();
     fs::write(src.join("new"), b"not in the list").unwrap();
     fs::hard_link(src.join("c"), dir.join("c-link")).unwrap();
-    let rep = shred_listed(&m, 1);
+    let rep = shred_listed(&m, 1, false);
     assert_eq!(rep.shredded, 1, "{rep:?}");
     assert!(!src.join("a").exists());
     assert!(src.join("b").exists() && src.join("new").exists() && src.join("c").exists());
@@ -327,29 +334,77 @@ fn fast_strength_records_zstd_in_meta() {
     assert_eq!((h.meta.file_count, h.meta.total_unpacked), (1, 50_000));
     let out = dir.join("o");
     fs::create_dir_all(&out).unwrap();
-    do_decrypt(&dir.join("z.shd"), &out, &c).unwrap();
+    dec(&dir.join("z.shd"), &out, &c).unwrap();
     assert_eq!(fs::read(out.join("z.txt")).unwrap(), "zstd ".repeat(10_000).as_bytes());
     let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
 fn leftover_staging_is_detected_after_a_crash() {
+    use crate::staging::{leftovers, register_as, remove_leftovers, Stage};
     let dir = tmpdir();
-    let st = crate::staging::Stage::create(&dir).unwrap();
+    let st = Stage::create(&dir).unwrap();
     let live = st.path.clone();
-    assert!(!crate::staging::leftovers().contains(&live), "own active stage is not a leftover");
+    assert!(!leftovers().unwrap().iter().any(|en| en.path() == live), "own active stage is not a leftover");
     // a stage written by a process that no longer exists (killed while extracting)
     let dead = dir.join(format!(".shd_{}_x", rand_hex().unwrap()));
     fs::create_dir(&dead).unwrap();
     fs::write(dead.join("plain.txt"), b"left behind").unwrap();
-    crate::staging::register_as(u32::MAX - 7, &dead);
-    assert!(crate::staging::leftovers().contains(&dead));
-    let (ok, bad) = crate::staging::remove_leftovers(std::slice::from_ref(&dead));
+    register_as(u32::MAX - 7, 1, &dead).unwrap();
+    let found: Vec<_> = leftovers().unwrap().into_iter().filter(|en| en.path() == dead).collect();
+    assert_eq!(found.len(), 1);
+    let (ok, bad) = remove_leftovers(&found);
     assert_eq!((ok, bad.len()), (1, 0));
     assert!(!dead.exists());
-    assert!(!crate::staging::leftovers().contains(&dead));
+    assert!(!leftovers().unwrap().iter().any(|en| en.path() == dead));
     drop(st);
     assert!(!live.exists());
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// B-2: a writer holding the container makes decryption wait and then fail with E_BUSY, before
+/// any key derivation and without output.
+#[test]
+fn decrypt_reports_busy_while_another_task_writes() {
+    let dir = tmpdir();
+    let f = dir.join("l.txt");
+    fs::write(&f, b"locked").unwrap();
+    let dst = dir.join("l.shd");
+    let c = cred("lock test password", 0);
+    do_encrypt(&f, &dst, &c, &opts()).unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let held = crate::lock::lock_container(&dst, crate::lock::Mode::Exclusive).unwrap();
+    let err = dec(&dst, &out, &c).unwrap_err();
+    assert!(crate::lock::is_busy(&err), "{err}");
+    assert!(listing(&out).is_empty());
+    let err = do_change_password(&dst, &c, &cred("another password 1", 0)).unwrap_err();
+    assert!(crate::lock::is_busy(&err), "{err}");
+    drop(held);
+    dec(&dst, &out, &c).unwrap();
+    assert_eq!(fs::read(out.join("l.txt")).unwrap(), b"locked");
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// B-9: a file with a hidden stream stops the shredding encryption before any work (Ask); with
+/// Include the streams are overwritten together with the file.
+#[cfg(windows)]
+#[test]
+fn hidden_streams_stop_or_are_shredded() {
+    let dir = tmpdir();
+    let src = dir.join("s.txt");
+    fs::write(&src, b"main").unwrap();
+    fs::write(format!("{}:hidden", src.display()), b"secret stream").unwrap();
+    let c = cred("stream test password", 0);
+    let mut o = opts();
+    o.shred_src = true;
+    let dst = dir.join("s.shd");
+    let err = do_encrypt(&src, &dst, &c, &o).unwrap_err();
+    assert!(has_code(&err, C_ADS), "{err}");
+    assert!(src.exists() && !dst.exists(), "nothing done before the question");
+    o.streams = StreamPolicy::Include;
+    let m = do_encrypt(&src, &dst, &c, &o).unwrap();
+    assert!(!src.exists(), "{m}");
     let _ = fs::remove_dir_all(dir);
 }
 

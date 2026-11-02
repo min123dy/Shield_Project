@@ -3,6 +3,7 @@
 //! with snapshots (VSS) or in cloud-synced folders (the provider keeps versions).
 
 use crate::entropy::{bulk_rng, rand_hex};
+use crate::i18n::{t, tf};
 use crate::manifest::FileRec;
 use crate::progress::*;
 use crate::sysinfo::{file_id, open_no_follow};
@@ -99,11 +100,11 @@ pub fn detect_disk(p: &Path) -> Disk {
 #[cfg(windows)]
 pub fn trim_volume(l: char) -> R<String> {
     if !l.is_ascii_alphabetic() {
-        return Err("잘못된 드라이브 문자".into());
+        return Err(t("wipe.bad_drive").into());
     }
     let inner = format!("try {{ Optimize-Volume -DriveLetter {l} -ReTrim -ErrorAction Stop | Out-Null; exit 0 }} catch {{ exit 3 }}");
     if let Some((0, _)) = powershell(&inner) {
-        return Ok(format!("{l}: TRIM 요청 완료"));
+        return Ok(tf("wipe.trim_done", &[&l]));
     }
     let exe = sys32(r"WindowsPowerShell\v1.0\powershell.exe");
     let elevate = format!(
@@ -114,15 +115,15 @@ pub fn trim_volume(l: char) -> R<String> {
         encode_ps(&inner)
     );
     match powershell(&elevate) {
-        Some((0, _)) => Ok(format!("{l}: TRIM 요청 완료 (관리자 권한)")),
-        Some((2, _)) => Err("관리자 권한 요청이 거부되어 TRIM을 실행하지 못했습니다.".into()),
-        _ => Err(format!("{l}: TRIM 실패 (SSD가 아니거나 TRIM을 지원하지 않는 드라이브일 수 있습니다)")),
+        Some((0, _)) => Ok(tf("wipe.trim_done_admin", &[&l])),
+        Some((2, _)) => Err(t("wipe.trim_denied").into()),
+        _ => Err(tf("wipe.trim_failed", &[&l])),
     }
 }
 
 #[cfg(not(windows))]
 pub fn trim_volume(_l: char) -> R<String> {
-    Err("TRIM은 Windows에서만 지원됩니다.".into())
+    Err(t("wipe.windows_only").into())
 }
 
 /// Overwrites the free space of the volume that holds `dir` (cipher /w: 0x00, 0xFF, random).
@@ -130,7 +131,7 @@ pub fn trim_volume(_l: char) -> R<String> {
 pub fn wipe_free_space(dir: &Path) -> R<String> {
     use std::os::windows::process::CommandExt;
     use std::process::Stdio;
-    let l = drive_letter(dir).ok_or_else(|| "드라이브를 확인할 수 없습니다.".to_string())?;
+    let l = drive_letter(dir).ok_or_else(|| t("wipe.no_drive").to_string())?;
     let mut child = std::process::Command::new(sys32("cipher.exe"))
         .arg(format!("/w:{}", plain_path(dir)))
         .creation_flags(0x0800_0000)
@@ -145,7 +146,7 @@ pub fn wipe_free_space(dir: &Path) -> R<String> {
                 if cancelled() {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(CANCELLED.into());
+                    return Err(cancelled_msg());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(300));
             }
@@ -153,15 +154,15 @@ pub fn wipe_free_space(dir: &Path) -> R<String> {
         }
     };
     if ok {
-        Ok(format!("{l}: 여유 공간 덮어쓰기 완료"))
+        Ok(tf("wipe.free_done", &[&l]))
     } else {
-        Err("cipher /w 실패".into())
+        Err(t("wipe.cipher_failed").into())
     }
 }
 
 #[cfg(not(windows))]
 pub fn wipe_free_space(_dir: &Path) -> R<String> {
-    Err("여유 공간 덮어쓰기는 Windows에서만 지원됩니다.".into())
+    Err(t("wipe.windows_only").into())
 }
 
 pub enum ShredSkip {
@@ -173,7 +174,9 @@ pub enum ShredSkip {
 /// Overwrites through one checked handle, truncates, renames randomly and deletes.
 /// Refuses: anything that is no longer the listed object (ID, size, time), hard links (other names
 /// would keep the data), links/reparse points (handled as the link itself, never the target).
-pub fn shred_checked(r: &FileRec, passes: usize) -> Result<(), ShredSkip> {
+/// `streams`: also overwrite the alternate data streams (B-9). This happens after the identity
+/// check, because writing a stream changes the file's modification time. Returns their number.
+pub fn shred_checked(r: &FileRec, passes: usize, streams: bool) -> Result<u64, ShredSkip> {
     let fail = |x: String| ShredSkip::Failed(x);
     let open = || open_no_follow(&r.path, true);
     let mut f = match open() {
@@ -202,6 +205,7 @@ pub fn shred_checked(r: &FileRec, passes: usize) -> Result<(), ShredSkip> {
     if id.nlink > 1 {
         return Err(ShredSkip::HardLink);
     }
+    let n_streams = if streams { crate::ads::overwrite_streams(&r.path, passes).map_err(fail)? } else { 0 };
     let len = md.len();
     let mut rng = bulk_rng().map_err(fail)?;
     let mut buf = vec![0u8; 1 << 20];
@@ -238,57 +242,164 @@ pub fn shred_checked(r: &FileRec, passes: usize) -> Result<(), ShredSkip> {
     {
         crate::sysinfo::delete_by_handle(&g).map_err(|x| fail(x.to_string()))?;
         drop(g);
-        Ok(())
+        Ok(n_streams)
     }
     #[cfg(not(windows))]
     {
         drop(g);
-        fs::remove_file(&np).map_err(|x| fail(x.to_string()))
+        fs::remove_file(&np).map_err(|x| fail(x.to_string())).map(|_| n_streams)
+    }
+}
+
+/// Result of removing a Shield-created tree: overwrite and delete failures are reported apart, so
+/// "deleted but not overwritten" is never shown as a clean removal.
+#[derive(Default, Debug)]
+pub struct TreeReport {
+    pub overwrite_failed: Vec<String>,
+    pub delete_failed: Vec<String>,
+}
+
+impl TreeReport {
+    pub fn ok(&self) -> bool {
+        self.overwrite_failed.is_empty() && self.delete_failed.is_empty()
+    }
+    pub fn message(&self) -> String {
+        let mut m = Vec::new();
+        if !self.overwrite_failed.is_empty() {
+            m.push(tf("wipe.tree_overwrite_failed", &[&self.overwrite_failed.len(), &self.overwrite_failed.join(", ")]));
+        }
+        if !self.delete_failed.is_empty() {
+            m.push(tf("wipe.tree_delete_failed", &[&self.delete_failed.len(), &self.delete_failed.join(", ")]));
+        }
+        m.join(" / ")
+    }
+}
+
+/// Opens for writing; a read-only attribute (set by an extracted file's own attributes) is cleared
+/// once and the open retried.
+fn open_for_overwrite(p: &Path) -> std::io::Result<fs::File> {
+    match fs::OpenOptions::new().write(true).open(p) {
+        Err(x) if x.kind() == std::io::ErrorKind::PermissionDenied => {
+            let mut perm = fs::symlink_metadata(p)?.permissions();
+            if !perm.readonly() {
+                return Err(x);
+            }
+            #[allow(clippy::permissions_set_readonly_false)]
+            perm.set_readonly(false);
+            fs::set_permissions(p, perm)?;
+            fs::OpenOptions::new().write(true).open(p)
+        }
+        r => r,
+    }
+}
+
+/// Overwrites one file with zeros and truncates it. Every error is returned.
+fn overwrite_once(p: &Path, len: u64) -> std::io::Result<()> {
+    let mut f = open_for_overwrite(p)?;
+    let buf = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(buf.len() as u64) as usize;
+        f.write_all(&buf[..n])?;
+        left -= n as u64;
+    }
+    f.flush()?;
+    f.sync_all()?;
+    f.set_len(0)?;
+    f.sync_all()
+}
+
+fn shred_tree_into(p: &Path, rep: &mut TreeReport) {
+    let name = || p.display().to_string();
+    let m = match fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => return,
+        Err(x) => return rep.delete_failed.push(format!("{} ({x})", name())),
+    };
+    if m.file_type().is_symlink() {
+        // a link is removed as a link, never followed
+        if let Err(x) = fs::remove_file(p).or_else(|_| fs::remove_dir(p)) {
+            rep.delete_failed.push(format!("{} ({x})", name()));
+        }
+        return;
+    }
+    if m.is_dir() {
+        match fs::read_dir(p) {
+            Ok(rd) => {
+                for en in rd {
+                    match en {
+                        Ok(en) => shred_tree_into(&en.path(), rep),
+                        Err(x) => rep.delete_failed.push(format!("{} ({x})", name())),
+                    }
+                }
+            }
+            Err(x) => return rep.delete_failed.push(format!("{} ({x})", name())),
+        }
+        if let Err(x) = fs::remove_dir(p) {
+            rep.delete_failed.push(format!("{} ({x})", name()));
+        }
+        return;
+    }
+    if let Err(x) = overwrite_once(p, m.len()) {
+        rep.overwrite_failed.push(format!("{} ({x})", name()));
+    }
+    if let Err(x) = fs::remove_file(p) {
+        rep.delete_failed.push(format!("{} ({x})", name()));
     }
 }
 
 /// Removes a folder tree that Shield itself created (staging): files are overwritten once and
-/// deleted; links are removed, never followed.
-pub fn shred_own_tree(p: &Path) -> R<()> {
-    let m = fs::symlink_metadata(p).map_err(e)?;
-    if m.file_type().is_symlink() {
-        return fs::remove_file(p).or_else(|_| fs::remove_dir(p)).map_err(e);
-    }
-    if m.is_dir() {
-        let mut first_err = None;
-        for en in fs::read_dir(p).map_err(e)? {
-            if let Err(x) = en.map_err(e).and_then(|en| shred_own_tree(&en.path())) {
-                first_err.get_or_insert(x);
-            }
-        }
-        if let Some(x) = first_err {
-            return Err(x);
-        }
-        return fs::remove_dir(p).map_err(e);
-    }
-    let len = m.len();
-    if let Ok(mut f) = fs::OpenOptions::new().write(true).open(p) {
-        let buf = vec![0u8; 1 << 20];
-        let mut left = len;
-        while left > 0 {
-            let n = left.min(buf.len() as u64) as usize;
-            if f.write_all(&buf[..n]).is_err() {
-                break;
-            }
-            left -= n as u64;
-        }
-        let _ = f.set_len(0);
-        let _ = f.sync_all();
-    }
-    fs::remove_file(p).map_err(e)
+/// deleted; links are removed, never followed. Ok only when every file was overwritten and every
+/// object deleted.
+pub fn shred_own_tree_report(p: &Path) -> TreeReport {
+    let mut rep = TreeReport::default();
+    shred_tree_into(p, &mut rep);
+    rep
 }
 
+pub fn shred_own_tree(p: &Path) -> R<()> {
+    let rep = shred_own_tree_report(p);
+    if rep.ok() {
+        Ok(())
+    } else {
+        Err(rep.message())
+    }
+}
 #[cfg(all(test, windows))]
 mod tests {
     #[test]
     fn base64_utf16() {
         assert_eq!(super::encode_ps("ab"), "YQBiAA==");
         assert_eq!(super::encode_ps("abc"), "YQBiAGMA");
+    }
+    #[test]
+    fn own_tree_reports_and_clears_read_only() {
+        let d = std::env::temp_dir().join(format!("shield_tree_{}", crate::entropy::rand_hex().unwrap()));
+        std::fs::create_dir_all(d.join("sub")).unwrap();
+        let f = d.join("sub").join("ro.txt");
+        std::fs::write(&f, b"secret").unwrap();
+        let mut perm = std::fs::metadata(&f).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&f, perm).unwrap();
+        let rep = super::shred_own_tree_report(&d);
+        assert!(rep.ok(), "{}", rep.message());
+        assert!(!d.exists());
+    }
+    #[test]
+    fn own_tree_reports_an_undeletable_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = std::env::temp_dir().join(format!("shield_tree_{}", crate::entropy::rand_hex().unwrap()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("busy.bin");
+        std::fs::write(&f, b"secret").unwrap();
+        // another handle without FILE_SHARE_WRITE|DELETE: overwrite and delete must both fail
+        let h = std::fs::OpenOptions::new().read(true).share_mode(1).open(&f).unwrap();
+        let rep = super::shred_own_tree_report(&d);
+        assert!(!rep.ok());
+        assert!(!rep.overwrite_failed.is_empty() && !rep.delete_failed.is_empty(), "{rep:?}");
+        assert!(super::shred_own_tree(&d).is_err());
+        drop(h);
+        assert!(super::shred_own_tree(&d).is_ok());
     }
     #[test]
     fn system_dir_from_api() {

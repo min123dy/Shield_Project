@@ -1,35 +1,37 @@
-//! File manager window (7-Zip style): browse folders, open .shd containers, list / extract / add.
-//! Encryption, decryption and key changes are done in the encryption window (enc_app.rs), which
-//! this window starts with the selected path.
+//! File manager window (7-Zip style): browse folders, open .shd containers, list / extract / add /
+//! remove. Encryption, decryption and key changes are done in the encryption window (enc_app.rs).
+//!
+//! A-4: an open container holds no key. Every operation on it (integrity check, extract, add,
+//! remove) first asks for the password, PIM and key files again (`Op` + the credential dialog),
+//! and the typed secret is consumed by that one operation.
 
 use crate::archive::EntryInfo;
 use crate::compress::Strength;
 use crate::container::{self, AddOpts, BodyCheck, Opened};
 use crate::crypto::Cred;
+use crate::engine::DecOpts;
 use crate::harden::SecretBuf;
+use crate::i18n::{t, tf};
 use crate::job::{launch, Job};
 use crate::keyfile::keyfile_opt;
 use crate::progress::*;
-use crate::sysinfo::{is_shd, roots};
-use crate::{entropy, format::DEFAULT_PIM};
+use crate::settings::{Settings, SortBy, StartFolder};
+use crate::shell::Shell;
+use crate::sysinfo::{home_dir, is_hidden, is_shd, roots};
 use eframe::egui;
 use std::{
     collections::{BTreeMap, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 use zeroize::Zeroizing;
-
-/// Typed secrets are wiped after this long without input.
-pub const IDLE_SECRETS: Duration = Duration::from_secs(120);
-/// An open container (key + listing) is closed after this long without input.
-pub const IDLE_CONTAINER: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MTab {
     Files,
     Info,
+    Settings,
     Help,
 }
 
@@ -56,25 +58,37 @@ pub struct Out {
     pub res: Result<String, String>,
 }
 
-/// Add request waiting for the user's confirmation (overwrite / shred originals).
-pub struct PendingAdd {
-    pub paths: Vec<PathBuf>,
-    pub clash: Vec<String>,
+/// An operation on the open container that waits for the credentials (A-4).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Op {
+    Check,
+    ExtractSelected { sel: HashSet<String>, base: String, dir: PathBuf },
+    ExtractAll { dir: PathBuf },
+    Add { paths: Vec<PathBuf>, overwrite: bool },
+    Remove { sel: HashSet<String> },
+}
+
+/// A question shown before an operation (overwrite / shred originals / delete entries).
+pub enum Confirm {
+    Add { paths: Vec<PathBuf>, clash: Vec<String> },
+    Remove { sel: HashSet<String> },
 }
 
 pub struct MgrApp {
+    pub sh: Shell,
     pub tab: MTab,
     pub cwd: Option<PathBuf>, // None = drive list
     pub addr: String,
     pub entries: Vec<Entry>,
     pub filter: String,
     pub sel: HashSet<PathBuf>,
-    // unlock
+    // credentials (open and every later operation; consumed by each)
     pub pending: Option<PathBuf>,
     pub pw: SecretBuf,
     pub custom_pim: bool,
     pub pim: u32,
     pub keyfiles: Vec<PathBuf>,
+    pub op: Option<Op>,
     // open container
     pub open: Option<Opened>,
     pub inner: String,
@@ -82,24 +96,23 @@ pub struct MgrApp {
     pub csel: HashSet<String>,
     pub strength: Strength,
     pub shred_added: bool,
-    pub confirm: Option<PendingAdd>,
-    // common
-    pub status: String,
-    pub ok: bool,
+    pub confirm: Option<Confirm>,
     pub job: Option<Job<Out>>,
-    pub last_act: Instant,
-    pub leftovers: Vec<PathBuf>,
 }
 
-fn home() -> Option<PathBuf> {
-    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
+fn start_dir(s: StartFolder) -> Option<PathBuf> {
+    match s {
+        StartFolder::Drives => None,
+        StartFolder::Home => home_dir(),
+        StartFolder::Documents => home_dir().map(|h| h.join("Documents")).filter(|d| d.is_dir()).or_else(home_dir),
+    }
 }
 
 impl MgrApp {
-    pub fn new(start: Option<PathBuf>) -> Self {
+    pub fn new(set: Settings, start: Option<PathBuf>) -> Self {
         let mut a = MgrApp {
             tab: MTab::Files,
-            cwd: home(),
+            cwd: start_dir(set.start_folder),
             addr: String::new(),
             entries: vec![],
             filter: String::new(),
@@ -107,20 +120,18 @@ impl MgrApp {
             pending: None,
             pw: SecretBuf::new(),
             custom_pim: false,
-            pim: DEFAULT_PIM,
+            pim: set.default_pim,
             keyfiles: vec![],
+            op: None,
             open: None,
             inner: String::new(),
             children: vec![],
             csel: HashSet::new(),
-            strength: Strength::Auto,
+            strength: set.strength,
             shred_added: false,
             confirm: None,
-            status: String::new(),
-            ok: true,
             job: None,
-            last_act: Instant::now(),
-            leftovers: crate::staging::leftovers(),
+            sh: Shell::new(set),
         };
         if let Some(p) = start {
             if is_shd(&p) {
@@ -137,23 +148,8 @@ impl MgrApp {
         a
     }
 
-    pub fn set(&mut self, ok: bool, m: impl Into<String>) {
-        self.ok = ok;
-        self.status = m.into();
-    }
-
-    pub fn apply_msg(&mut self, m: Option<(bool, String)>) {
-        if let Some((ok, s)) = m {
-            self.set(ok, s);
-        }
-    }
-
     pub fn busy(&self) -> bool {
         self.job.is_some()
-    }
-
-    pub fn pim_value(&self) -> u32 {
-        if self.custom_pim { self.pim.min(crate::format::MAX_PIM) } else { DEFAULT_PIM }
     }
 
     // -------------------------------------------------------------- browsing
@@ -170,6 +166,9 @@ impl MgrApp {
                             continue; // Shield scratch/staging names
                         }
                         let md = en.metadata().ok();
+                        if !self.sh.set.show_hidden && is_hidden(&name, md.as_ref()) {
+                            continue;
+                        }
                         self.entries.push(Entry {
                             name,
                             path: en.path(),
@@ -179,9 +178,9 @@ impl MgrApp {
                         });
                     }
                 } else {
-                    self.set(false, "폴더를 읽을 수 없습니다 (권한 또는 경로 확인).");
+                    self.sh.msg(false, t("m.cant_read"));
                 }
-                self.entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+                self.sort();
             }
             None => {
                 for r in roots() {
@@ -190,6 +189,19 @@ impl MgrApp {
             }
         }
         self.sel.retain(|p| p.exists());
+    }
+
+    fn sort(&mut self) {
+        let by = self.sh.set.sort;
+        self.entries.sort_by(|a, b| {
+            let k = match by {
+                SortBy::Name => std::cmp::Ordering::Equal,
+                SortBy::Size => b.size.cmp(&a.size),
+                SortBy::Date => b.mtime.cmp(&a.mtime),
+                SortBy::Kind => a.path.extension().cmp(&b.path.extension()),
+            };
+            b.is_dir.cmp(&a.is_dir).then(k).then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
     }
 
     pub fn go(&mut self, p: Option<PathBuf>) {
@@ -217,13 +229,13 @@ impl MgrApp {
 
     pub fn launch_enc(&mut self, flag: &str, p: &Path) {
         if let Err(x) = launch(&[OsStr::new(flag), p.as_os_str()]) {
-            self.set(false, x);
+            self.sh.msg(false, x);
         }
     }
 
     pub fn launch_enc_window(&mut self) {
         if let Err(x) = launch(&[]) {
-            self.set(false, x);
+            self.sh.msg(false, x);
         }
     }
 
@@ -248,9 +260,7 @@ impl MgrApp {
                         d.0 += en.size;
                     }
                 }
-                None if en.is_dir => {
-                    dirs.entry(rest.to_string()).or_insert((0, None)).1 = en.mtime;
-                }
+                None if en.is_dir => dirs.entry(rest.to_string()).or_insert((0, None)).1 = en.mtime,
                 None => files.push(en),
             }
         }
@@ -260,13 +270,7 @@ impl MgrApp {
         }
         let mut fs: Vec<Child> = files
             .into_iter()
-            .map(|en| Child {
-                name: Zeroizing::new(en.name[base.len()..].to_string()),
-                full: en.name.clone(),
-                is_dir: false,
-                size: en.size,
-                mtime: en.mtime,
-            })
+            .map(|en| Child { name: Zeroizing::new(en.name[base.len()..].to_string()), full: en.name.clone(), is_dir: false, size: en.size, mtime: en.mtime })
             .collect();
         fs.sort_by_key(|a| a.name.to_lowercase());
         self.children.extend(fs);
@@ -283,47 +287,54 @@ impl MgrApp {
         self.enter(&up);
     }
 
-    /// Wipes the key and the listing (close button, idle timeout, window close).
+    pub fn clear_credentials(&mut self) {
+        self.pw.clear();
+        self.keyfiles.clear();
+        self.custom_pim = false;
+    }
+
+    /// Wipes the listing and any typed secret (close button, lock, window close).
     pub fn close_container(&mut self) {
         self.open = None;
         self.children.clear();
         self.csel.clear();
         self.inner.clear();
         self.confirm = None;
-        self.pw.clear();
+        self.op = None;
+        self.clear_credentials();
         if self.tab == MTab::Info {
             self.tab = MTab::Files;
         }
-        entropy::clear_pool();
+        crate::entropy::clear_pool();
     }
 
     fn spawn(&mut self, title: &'static str, stages: Vec<u8>, f: impl FnOnce() -> R<Out> + Send + 'static) {
         self.job = Some(Job::spawn(title, stages, f));
-        self.set(true, "");
+        self.sh.msg(true, "");
     }
 
-    fn poll_job(&mut self) {
+    pub fn poll_job(&mut self) {
         let Some(job) = &self.job else { return };
         let Some(r) = job.poll() else { return };
         let secs = job.secs();
         self.job = None;
         match r {
             Ok(out) => {
-                let had = self.open.is_none() && out.opened.is_some();
+                let fresh = self.open.is_none() && out.opened.is_some();
                 self.open = out.opened;
-                if had {
+                if fresh {
                     self.pending = None;
                     self.inner.clear();
                     self.tab = MTab::Files;
                 }
                 match out.res {
-                    Ok(m) => self.set(true, m + &secs),
-                    Err(m) => self.set(false, m),
+                    Ok(m) => self.sh.msg(true, m + &secs),
+                    Err(m) => self.sh.msg(false, m),
                 }
             }
             Err(m) => {
                 self.open = None; // the worker panicked with the container: start over
-                self.set(false, m);
+                self.sh.msg(false, m);
             }
         }
         self.csel.clear();
@@ -334,59 +345,81 @@ impl MgrApp {
         self.refresh();
     }
 
+    /// Builds the credentials from the typed fields and clears them (one use only).
+    fn take_cred(&mut self) -> R<(Zeroizing<Vec<u8>>, Vec<PathBuf>, u32)> {
+        if self.pw.is_empty() && self.keyfiles.is_empty() {
+            return Err(t("p.need_pw").into());
+        }
+        let pim = if self.custom_pim { self.pim } else { self.sh.set.default_pim }.min(crate::format::MAX_PIM);
+        let kfs = std::mem::take(&mut self.keyfiles);
+        let pw = self.pw.take();
+        self.custom_pim = false;
+        Ok((pw?, kfs, pim))
+    }
+
     pub fn start_open(&mut self) {
         let Some(p) = self.pending.clone() else { return };
-        if self.pw.is_empty() && self.keyfiles.is_empty() {
-            self.set(false, "비밀번호 또는 키 파일을 입력하세요.");
-            return;
-        }
-        let pw = self.pw.take();
-        let kfs = self.keyfiles.clone();
-        let pim = self.pim_value();
-        self.spawn("열기", vec![ST_OPEN], move || {
+        let (pw, kfs, pim) = match self.take_cred() {
+            Ok(c) => c,
+            Err(x) => return self.sh.msg(false, x),
+        };
+        self.spawn(t("job.open"), vec![ST_OPEN], move || {
             let c = Cred { pw, kf: keyfile_opt(&kfs)?, pim };
-            Ok(match container::open(&p, c, kfs) {
+            Ok(match container::open(&p, c) {
                 Ok(o) => {
-                    let n = o.hdr.meta.file_count;
-                    Out { opened: Some(o), res: Ok(format!("열었습니다: 파일 {n}개 (본문 전체는 아직 미검사)")) }
+                    let n = o.meta.file_count;
+                    Out { opened: Some(o), res: Ok(tf("m.opened", &[&n])) }
                 }
                 Err(x) => Out { opened: None, res: Err(x) },
             })
         });
     }
 
-    /// Runs `f` on the open container in a worker; the container comes back with the result.
-    fn with_open(&mut self, title: &'static str, stages: Vec<u8>, f: impl FnOnce(&mut Opened) -> R<String> + Send + 'static) {
-        let Some(mut o) = self.open.take() else { return };
-        self.spawn(title, stages, move || {
-            let res = f(&mut o);
-            Ok(Out { opened: Some(o), res })
-        });
-    }
-
-    pub fn start_check(&mut self) {
-        self.with_open("본문 전체 검사", vec![ST_CHECK], |o| {
-            let r = container::verify_body(o);
-            o.body = if r.is_ok() { BodyCheck::Ok } else { BodyCheck::Failed };
-            r
-        });
-    }
-
-    pub fn start_extract_selected(&mut self) {
-        if self.csel.is_empty() {
-            self.set(false, "추출할 항목을 선택하세요.");
-            return;
+    /// Asks for the credentials, then runs `op` (A-4).
+    pub fn request(&mut self, op: Op) {
+        if self.open.is_some() {
+            self.clear_credentials();
+            self.op = Some(op);
         }
-        let Some(dir) = rfd::FileDialog::new().set_title("추출할 폴더").pick_folder() else { return };
-        let (sel, base) = (self.csel.clone(), self.inner.clone());
-        self.with_open("선택 항목 추출", vec![ST_EXTRACT], move |o| container::extract_selected(o, &sel, &base, &dir));
     }
 
-    pub fn start_extract_all(&mut self) {
-        let Some(dir) = rfd::FileDialog::new().set_title("전체를 풀 폴더").pick_folder() else { return };
-        self.with_open("전체 추출", vec![ST_DECRYPT, ST_EXTRACT], move |o| {
-            let c = o.cred.duplicate();
-            crate::engine::do_decrypt(&o.path, &dir, &c)
+    /// Runs the operation that was waiting for the credentials.
+    pub fn run_op(&mut self) {
+        let Some(op) = self.op.take() else { return };
+        let Some(mut o) = self.open.take() else { return };
+        let (pw, kfs, pim) = match self.take_cred() {
+            Ok(c) => c,
+            Err(x) => {
+                self.open = Some(o);
+                self.op = Some(op);
+                return self.sh.msg(false, x);
+            }
+        };
+        let strict = self.sh.set.strict_motw;
+        let (title, stages) = match &op {
+            Op::Check => (t("job.check"), vec![ST_CHECK]),
+            Op::ExtractSelected { .. } => (t("job.extract_sel"), vec![ST_EXTRACT]),
+            Op::ExtractAll { .. } => (t("job.extract_all"), vec![ST_DECRYPT, ST_EXTRACT]),
+            Op::Add { .. } => (t("job.add"), vec![ST_SCAN, ST_DECRYPT, ST_REBUILD, ST_ENCRYPT, ST_VERIFY, ST_REPLACE]),
+            Op::Remove { .. } => (t("job.remove"), vec![ST_DECRYPT, ST_REBUILD, ST_ENCRYPT, ST_VERIFY, ST_REPLACE]),
+        };
+        let ao = AddOpts { overwrite: false, shred_src: self.shred_added, strength: self.strength, keyfiles: kfs.clone() };
+        let prefix = self.inner.clone();
+        self.shred_added = false;
+        self.spawn(title, stages, move || {
+            let c = Cred { pw, kf: keyfile_opt(&kfs)?, pim };
+            let res = match op {
+                Op::Check => {
+                    let r = container::verify_body(&o, c);
+                    o.body = if r.is_ok() { BodyCheck::Ok } else { BodyCheck::Failed };
+                    r
+                }
+                Op::ExtractSelected { sel, base, dir } => container::extract_selected(&o, c, &sel, &base, &dir, DecOpts { strict_motw: strict }),
+                Op::ExtractAll { dir } => crate::engine::do_decrypt(&o.path, &dir, &c, DecOpts { strict_motw: strict }),
+                Op::Add { paths, overwrite } => container::add_files(&mut o, c, &paths, &prefix, &AddOpts { overwrite, ..ao }),
+                Op::Remove { sel } => container::remove_entries(&mut o, c, &sel, ao.strength),
+            };
+            Ok(Out { opened: Some(o), res })
         });
     }
 
@@ -398,38 +431,38 @@ impl MgrApp {
         }
         let clash = container::conflicts(o, &paths, &self.inner);
         if clash.is_empty() && !self.shred_added {
-            self.start_add(paths, false);
+            self.request(Op::Add { paths, overwrite: false });
         } else {
-            self.confirm = Some(PendingAdd { paths, clash });
+            self.confirm = Some(Confirm::Add { paths, clash });
         }
     }
 
-    pub fn start_add(&mut self, paths: Vec<PathBuf>, overwrite: bool) {
-        let ao = AddOpts { overwrite, shred_src: self.shred_added, strength: self.strength };
-        let prefix = self.inner.clone();
-        let mut stages = vec![ST_SCAN, ST_DECRYPT, ST_REBUILD, ST_ENCRYPT, ST_VERIFY, ST_REPLACE];
-        if ao.shred_src {
-            stages.push(ST_SHRED);
+    pub fn request_remove(&mut self) {
+        if self.csel.is_empty() {
+            return self.sh.msg(false, t("m.pick_entries"));
         }
-        self.shred_added = false;
-        self.with_open("파일 추가", stages, move |o| container::add_files(o, &paths, &prefix, &ao));
+        let sel = self.csel.clone();
+        if self.sh.set.confirm_delete {
+            self.confirm = Some(Confirm::Remove { sel });
+        } else {
+            self.request(Op::Remove { sel });
+        }
     }
 
-    /// Mouse entropy, idle wipes, dropped files and "don't close while working".
+    /// Dropped files, auto-lock and "don't close while working".
     pub fn housekeeping(&mut self, ctx: &egui::Context) {
-        let (active, close, dropped) = ctx.input(|i| {
-            for ev in &i.events {
-                if let egui::Event::PointerMoved(p) = ev {
-                    entropy::mix_mouse(p.x, p.y, i.time);
-                }
+        let has = !self.pw.is_empty() || self.open.is_some();
+        let ev = self.sh.frame(ctx, has);
+        if let Some(r) = ev.lock {
+            if has && !self.busy() {
+                self.close_container();
+                self.sh.lock_message(r);
             }
-            let d: Vec<PathBuf> = i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect();
-            (!i.events.is_empty() || i.pointer.delta() != egui::Vec2::ZERO, i.viewport().close_requested(), d)
-        });
-        if !dropped.is_empty() && !self.busy() {
+        }
+        if !ev.dropped.is_empty() && !self.busy() {
             if self.open.is_some() {
-                self.request_add(dropped);
-            } else if let Some(p) = dropped.into_iter().next() {
+                self.request_add(ev.dropped);
+            } else if let Some(p) = ev.dropped.into_iter().next() {
                 if is_shd(&p) {
                     self.cwd = p.parent().map(Path::to_path_buf);
                     self.refresh();
@@ -442,28 +475,18 @@ impl MgrApp {
                 }
             }
         }
-        if active || self.busy() {
-            self.last_act = Instant::now();
-        } else {
-            let idle = self.last_act.elapsed();
-            if idle > IDLE_CONTAINER && self.open.is_some() {
-                self.close_container();
-                self.set(true, "5분 동안 조작이 없어 열린 컨테이너의 키와 목록을 지우고 닫았습니다.");
-            } else if idle > IDLE_SECRETS && !self.pw.is_empty() {
-                self.pw.clear();
-                entropy::clear_pool();
-                self.set(true, "2분 동안 입력이 없어 입력된 비밀번호를 지웠습니다.");
-            }
-        }
-        if close {
+        if ev.close_requested {
             if self.busy() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.set(false, "작업 중에는 창을 닫을 수 없습니다. 먼저 [취소]를 누르세요.");
+                self.sh.msg(false, t("shell.busy_close"));
             } else {
                 self.close_container();
             }
         }
-        ctx.request_repaint_after(Duration::from_secs(5));
+        self.sh.clipboard_after_paste(&mut [&mut self.pw]);
+        if self.busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
         self.poll_job();
     }
 }

@@ -5,6 +5,13 @@
 #   .\build.ps1 -NoSign                          no signing (everything else identical)
 #   .\build.ps1 -Sign -PublicKeyPath key.asc     sign with the key whose public part is key.asc
 #   -GpgHome <dir>                               keyring holding the secret key (default: gpg's own)
+# Optional UPX portable build (UPX-packed single exe, no installer needed):
+#   .\build.ps1                                  also asks "UPX 경로" (Enter = no portable exe)
+#   .\build.ps1 -UpxPath "C:\tools\upx.exe"     create Shield_v{ver}_portable.exe in dist\
+#   .\build.ps1 -UpxPath "C:\tools\upx-5.0"     a folder holding upx.exe works too
+#   .\build.ps1 -UpxPath upx                     same, when upx.exe is on PATH
+#   .\build.ps1 -NoUpx                           never ask, no portable exe
+#   -UpxPath can be combined with -Sign / -NoSign; the portable exe is also signed when signing.
 # The passphrase is never passed as an argument or logged: gpg-agent / pinentry asks for it.
 # Saved as UTF-8 with BOM for Windows PowerShell 5.1 compatibility.
 [CmdletBinding()]
@@ -12,7 +19,11 @@ param(
     [switch]$Sign,
     [switch]$NoSign,
     [string]$PublicKeyPath,
-    [string]$GpgHome
+    [string]$GpgHome,
+    # UPX packer path. When supplied, Shield_v<version>_portable.exe is also created in dist\.
+    [string]$UpxPath,
+    # Skip the UPX question (no portable exe).
+    [switch]$NoUpx
 )
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -76,6 +87,32 @@ function Invoke-Gpg([string[]]$gpgArgs, [switch]$AllowFail) {
         throw "gpg 실행 실패 (종료 코드 $LASTEXITCODE): $($out -join ' | ')"
     }
     return $out
+}
+
+# Runs upx; returns output lines. Local 'Continue' so upx's stderr is not a PS 5.1 terminating error.
+function Invoke-Upx([string[]]$upxArgs) {
+    $ErrorActionPreference = 'Continue'
+    $out = @(& $script:upxExe @upxArgs 2>&1 | ForEach-Object { "$_" })
+    if ($LASTEXITCODE -ne 0) {
+        throw "UPX 실행 실패 (종료 코드 $LASTEXITCODE): $($out -join ' | ')"
+    }
+    return $out
+}
+
+# DllCharacteristics of a PE image (ASLR / high-entropy ASLR / DEP flags).
+function Get-PeDllCharacteristics([string]$path) {
+    $b = [System.IO.File]::ReadAllBytes($path)
+    $pe = [BitConverter]::ToInt32($b, 0x3C)
+    if ($pe -le 0 -or $pe + 24 + 0x48 -gt $b.Length -or [BitConverter]::ToUInt32($b, $pe) -ne 0x4550) {
+        throw "PE 헤더를 읽을 수 없습니다: $path"
+    }
+    return [BitConverter]::ToUInt16($b, $pe + 24 + 0x46)
+}
+
+$script:step = 0
+function Write-Step([string]$msg) {
+    $script:step++
+    Write-Host "[$script:step/$script:totalSteps] $msg"
 }
 
 # ------------------------------------------------------------------ 0. signing decision + key checks
@@ -158,19 +195,79 @@ try {
     if (-not $versionLine) { throw "Cargo.toml에서 version을 찾을 수 없습니다." }
     $version = $versionLine.Matches[0].Groups[1].Value
 
+    # Resolve UPX before touching anything, so a wrong path fails immediately.
+    if ($NoUpx -and $UpxPath) { throw "-UpxPath와 -NoUpx는 함께 쓸 수 없습니다." }
+    if (-not $UpxPath -and -not $NoUpx -and [Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        Write-Host ""
+        Write-Host "포터블 버전(UPX로 압축한 단일 exe)도 만들려면 upx.exe 경로를 입력하세요." -ForegroundColor Cyan
+        Write-Host "  예: C:\tools\upx-5.0.0-win64\upx.exe  (파일을 이 창으로 끌어 놓아도 됩니다)"
+        $UpxPath = Read-Host "UPX 경로 (만들지 않으려면 그냥 Enter)"
+    }
+    $script:upxExe = $null
+    if ($UpxPath) {
+        # Drag-and-drop into a console adds quotes, and PowerShell may add "& " in front.
+        $UpxPath = ($UpxPath.Trim() -replace '^&\s*', '').Trim().Trim('"').Trim("'")
+        if (Test-Path -LiteralPath $UpxPath -PathType Container) {
+            $inDir = Join-Path $UpxPath "upx.exe"
+            if (-not (Test-Path -LiteralPath $inDir -PathType Leaf)) { throw "이 폴더에 upx.exe가 없습니다: $UpxPath" }
+            $UpxPath = $inDir
+        }
+        if (Test-Path -LiteralPath $UpxPath -PathType Leaf) {
+            $script:upxExe = (Resolve-Path -LiteralPath $UpxPath).Path
+        } else {
+            $resolved = Get-Command $UpxPath -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $resolved) { throw "UPX 실행 파일을 찾을 수 없습니다: $UpxPath" }
+            $script:upxExe = $resolved.Source
+        }
+        $upxVer = @(Invoke-Upx @('--version'))[0]
+        Write-Host "UPX: $script:upxExe ($upxVer)"
+    }
+
+    $script:totalSteps = if ($script:upxExe) { 6 } else { 5 }
+
     # Prevent an old MSI from being mistaken for the result of this build.
     if (Test-Path -LiteralPath $msiPath) { Remove-Item -LiteralPath $msiPath -Force }
 
-    Write-Host "[1/5] Rust release 빌드 중 (v$version)..."
+    Write-Step "Rust release 빌드 중 (v$version)..."
     & cargo build --release --manifest-path $manifestPath
     Assert-ExitCode "Cargo 빌드"
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "빌드 후 실행 파일을 찾을 수 없습니다: $exePath" }
 
-    Write-Host "[2/5] 테스트 실행 중..."
+    # Portable build: a UPX-packed copy. The MSI keeps the unpacked shield.exe.
+    $portableName = $null
+    $portablePath = $null
+    if ($script:upxExe) {
+        $portableName = "Shield_v${version}_portable.exe"
+        $portablePath = Join-Path $PSScriptRoot "target\release\$portableName"
+        Write-Step "UPX 포터블 exe 생성 중 ($portableName)..."
+        if (Test-Path -LiteralPath $portablePath) { Remove-Item -LiteralPath $portablePath -Force }
+        Copy-Item -LiteralPath $exePath -Destination $portablePath
+        try {
+            # --strip-relocs=0 keeps the relocation table, so ASLR still works on the packed exe.
+            Invoke-Upx @('--best', '--lzma', '--strip-relocs=0', '--no-progress', $portablePath) | ForEach-Object { Write-Host "  $_" }
+            $null = Invoke-Upx @('-t', $portablePath)
+            # ASLR(0x40), high-entropy ASLR(0x20), DEP(0x100) must survive packing.
+            $need = 0x40 -bor 0x20 -bor 0x100
+            $before = (Get-PeDllCharacteristics $exePath) -band $need
+            $after = (Get-PeDllCharacteristics $portablePath) -band $need
+            if ($after -ne $before) {
+                throw ("UPX 압축 후 보안 플래그가 사라졌습니다 (DllCharacteristics 0x{0:X} -> 0x{1:X}). 다른 UPX 버전을 사용하세요." -f $before, $after)
+            }
+        }
+        catch {
+            if (Test-Path -LiteralPath $portablePath) { Remove-Item -LiteralPath $portablePath -Force }
+            throw
+        }
+        $orig = (Get-Item -LiteralPath $exePath).Length
+        $packed = (Get-Item -LiteralPath $portablePath).Length
+        Write-Host ("  압축 결과: {0:N0} -> {1:N0} bytes ({2:F1}%), 무결성 검사(upx -t)와 ASLR/DEP 플래그 확인 완료" -f $orig, $packed, (100.0 * $packed / $orig))
+    }
+
+    Write-Step "테스트 실행 중..."
     & cargo test --release --manifest-path $manifestPath
     Assert-ExitCode "Cargo 테스트"
 
-    Write-Host "[3/5] 프로젝트에 고정된 WiX $wixVersion 도구와 확장 복원 중..."
+    Write-Step "프로젝트에 고정된 WiX $wixVersion 도구와 확장 복원 중..."
     & dotnet tool restore
     Assert-ExitCode ".NET local tool 복원"
     # WiX 5.0.2 targets .NET 6; allow it to run on a newer installed .NET runtime if needed.
@@ -182,7 +279,7 @@ try {
             Assert-ExitCode "WiX 확장 $ext 설치"
         }
 
-        Write-Host "[4/5] 설치 안내(주의사항/사용법) 화면 생성 중..."
+        Write-Step "설치 안내(주의사항/사용법) 화면 생성 중..."
         # RTF for the installer's notice page. The MSI dialog's RichEdit ignores \uN escapes, so
         # non-ASCII text is written WordPad-style as code page 949 bytes (\'hh), matching the MSI.
         $text = [System.IO.File]::ReadAllText($noticePath, [System.Text.Encoding]::UTF8)
@@ -205,7 +302,7 @@ try {
         New-Item -ItemType Directory -Force -Path $rtfDir | Out-Null
         [System.IO.File]::WriteAllText($rtfPath, $sb.ToString(), [System.Text.Encoding]::ASCII)
 
-        Write-Host "[5/5] x64 MSI 생성 중..."
+        Write-Step "x64 MSI 생성 중..."
         & dotnet tool run wix -- build -arch x64 -culture ko-KR `
             -ext "WixToolset.UI.wixext/$wixVersion" -ext "WixToolset.Util.wixext/$wixVersion" `
             -d "Version=$version" -d "NoticeRtf=$rtfPath" `
@@ -251,9 +348,17 @@ try {
     Write-Host "  소스 zip: $zipName ($($files.Count)개 파일)"
     Copy-Item -LiteralPath $msiPath -Destination (Join-Path $distDir "Shield.msi")
 
+    # Portable exe (UPX-compressed) — only present when -UpxPath was given.
+    if ($portablePath -and (Test-Path -LiteralPath $portablePath -PathType Leaf)) {
+        $distPortable = Join-Path $distDir $portableName
+        Copy-Item -LiteralPath $portablePath -Destination $distPortable -Force
+        Write-Host "  포터블 exe: $portableName ($([int]((Get-Item $distPortable).Length / 1KB)) KB, UPX 압축)" -ForegroundColor Cyan
+    }
+
     if ($doSign) {
         Write-Host "[서명] GPG 분리 서명 생성 중 (비밀번호는 gpg-agent/pinentry 창에 입력)..."
         $targets = @($zipPath, (Join-Path $distDir "Shield.msi"))
+        if ($portableName) { $targets += Join-Path $distDir $portableName }
         $sigs = @()
         try {
             foreach ($t in $targets) {
@@ -274,6 +379,7 @@ try {
             throw
         }
         Copy-Item -LiteralPath $PublicKeyPath -Destination (Join-Path $distDir $keyCopyName)
+        $portableVerify = if ($portableName) { "`r`n     gpg --verify $portableName.sig $portableName" } else { "" }
         $verify = @"
 Shield $version 배포 파일 검증 방법
 ==================================
@@ -288,7 +394,7 @@ Shield $version 배포 파일 검증 방법
      gpg --fingerprint $fpr
 4) 서명을 검증합니다. "Good signature(올바른 서명)"와 위 지문이 나와야 합니다.
      gpg --verify Shield.msi.sig Shield.msi
-     gpg --verify $zipName.sig $zipName
+     gpg --verify $zipName.sig $zipName$portableVerify
    "이 키는 신뢰할 수 있는 서명으로 인증되지 않았습니다" 경고는 키를 직접 인증하지 않았다는 뜻이며,
    3)에서 지문을 확인했다면 무시해도 됩니다. "BAD signature"가 나오면 절대 설치하지 마세요.
 5) SHA256SUMS.txt의 해시와도 비교할 수 있습니다 (PowerShell):

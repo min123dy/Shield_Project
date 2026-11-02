@@ -1,12 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Shield 2.0 — one executable, two windows (like 7-Zip's compressor dialog and file manager):
+//! Shield 2.1 - one executable, two windows (like 7-Zip's compressor dialog and file manager):
 //!   shield.exe                       encryption window
 //!   shield.exe --encrypt <path>      encryption window, target selected
 //!   shield.exe --decrypt <file.shd>  encryption window, decryption tab
 //!   shield.exe --manager [<path>]    file manager window
 //!   shield.exe --open <file.shd>     file manager window, container unlock screen
 
+mod ads;
 mod archive;
+mod capture;
 mod compress;
 mod container;
 mod crypto;
@@ -17,21 +19,31 @@ mod entropy;
 mod format;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod glyphs;
 mod harden;
 mod help;
+mod i18n;
 mod icon;
 mod job;
 mod keyfile;
+mod lang;
+mod lock;
 mod manifest;
 mod mgr_app;
 mod mgr_views;
 mod password;
 mod progress;
 mod sectemp;
+mod settings;
+mod settings_view;
+mod shell;
 mod staging;
 mod sysinfo;
+mod theme;
 mod ui;
 mod ui_fmt;
+mod ui_table;
 mod wipe;
 
 use eframe::egui;
@@ -42,9 +54,10 @@ enum Start {
     Mgr(Option<PathBuf>),
 }
 
-fn parse_args(args: &[String]) -> Start {
+fn parse_args(args: &[String], start: settings::StartScreen) -> Start {
     let path = args.get(1).map(PathBuf::from);
     match args.first().map(String::as_str) {
+        None if start == settings::StartScreen::Manager => Start::Mgr(None),
         Some("--encrypt") => Start::Enc(path.map(|p| (enc_app::Tab::Encrypt, p))),
         Some("--decrypt") => Start::Enc(path.map(|p| (enc_app::Tab::Decrypt, p))),
         Some("--manager") | Some("--open") => Start::Mgr(path),
@@ -56,11 +69,16 @@ fn parse_args(args: &[String]) -> Start {
 
 fn main() {
     harden::harden_process();
+    // E-5: settings are read once, here; changes are saved atomically and applied live
+    let set = settings::Settings::load();
+    i18n::set_lang(set.effective_lang());
+    ui_fmt::set_date_style(set.date_fmt, set.date_seconds);
+    entropy::set_mouse_enabled(set.mouse_entropy);
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let start = parse_args(&args);
-    let (title, size) = match &start {
-        Start::Enc(_) => ("Shield", [1000.0, 760.0]),
-        Start::Mgr(_) => ("Shield 파일 관리자", [1080.0, 700.0]),
+    let start = parse_args(&args, set.start_screen);
+    let title = match &start {
+        Start::Enc(_) => "Shield",
+        Start::Mgr(_) => i18n::t("m.window_title"),
     };
     let icon = egui::IconData { rgba: icon::shield_rgba(64), width: 64, height: 64 };
     let opts = eframe::NativeOptions {
@@ -68,8 +86,8 @@ fn main() {
             .with_title(title)
             .with_app_id(title)
             .with_icon(icon)
-            .with_inner_size(size)
-            .with_min_inner_size([820.0, 560.0])
+            .with_inner_size([1040.0, 700.0])
+            .with_min_inner_size([800.0, 560.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -77,11 +95,11 @@ fn main() {
         title,
         opts,
         Box::new(move |cc| {
-            ui::load_korean_font(&cc.egui_ctx);
-            ui::style(&cc.egui_ctx);
+            theme::load_fonts(&cc.egui_ctx);
+            theme::apply(&cc.egui_ctx, &set);
             match start {
-                Start::Enc(s) => Box::new(enc_app::EncApp::new(s)) as Box<dyn eframe::App>,
-                Start::Mgr(p) => Box::new(mgr_app::MgrApp::new(p)),
+                Start::Enc(s) => Box::new(enc_app::EncApp::new(set, s)) as Box<dyn eframe::App>,
+                Start::Mgr(p) => Box::new(mgr_app::MgrApp::new(set, p)),
             }
         }),
     );
@@ -93,12 +111,14 @@ mod tests {
     use super::*;
     #[test]
     fn argument_dispatch() {
-        let s = |v: &[&str]| parse_args(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>());
+        let s = |v: &[&str]| parse_args(&v.iter().map(|x| x.to_string()).collect::<Vec<_>>(), settings::StartScreen::Encrypt);
         assert!(matches!(s(&[]), Start::Enc(None)));
         assert!(matches!(s(&["--encrypt", "a.txt"]), Start::Enc(Some((enc_app::Tab::Encrypt, _)))));
         assert!(matches!(s(&["--decrypt", "a.shd"]), Start::Enc(Some((enc_app::Tab::Decrypt, _)))));
         assert!(matches!(s(&["--open", "a.shd"]), Start::Mgr(Some(_))));
         assert!(matches!(s(&["--manager"]), Start::Mgr(None)));
         assert!(matches!(s(&["--bogus"]), Start::Enc(None)));
+        let m = parse_args(&[], settings::StartScreen::Manager);
+        assert!(matches!(m, Start::Mgr(None)), "start screen from Settings");
     }
 }

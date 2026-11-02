@@ -167,6 +167,7 @@ pub fn harden_process() {}
 // ---------------------------------------------------------------- secret input buffer
 
 pub const SECRET_CAP: usize = 256;
+pub const C_TOO_LONG: &str = "E_PW_TOO_LONG";
 
 /// Fixed, heap-pinned, page-locked (best effort) password buffer. It never reallocates, so no
 /// stale copies are left behind, and it is zeroized on clear/drop. Bytes are stored as typed
@@ -174,7 +175,8 @@ pub const SECRET_CAP: usize = 256;
 pub struct SecretBuf {
     buf: Box<[u8; SECRET_CAP]>,
     len: usize,
-    /// Input was cut at SECRET_CAP bytes.
+    /// More than SECRET_CAP bytes were typed/pasted. Sticky until `clear`: a cut password is never
+    /// used (`take` refuses it), and deleting characters does not turn it into the intended one.
     pub overflow: bool,
     /// Text arrived through a paste (the clipboard may still hold it).
     pub pasted: bool,
@@ -223,7 +225,6 @@ impl SecretBuf {
             let st = self.len - n;
             self.buf[st..self.len].zeroize();
             self.len = st;
-            self.overflow = false;
         }
     }
     pub fn clear(&mut self) {
@@ -236,11 +237,16 @@ impl SecretBuf {
     pub fn normalized(&self) -> Zeroizing<Vec<u8>> {
         crate::password::normalize(self.as_str())
     }
-    /// Moves the secret out (NFC-normalized, zeroizing) and clears this buffer.
-    pub fn take(&mut self) -> Zeroizing<Vec<u8>> {
+    /// Moves the secret out (NFC-normalized, zeroizing) and clears this buffer. Input longer than
+    /// SECRET_CAP bytes (before or after normalization) is refused, never truncated (B-14).
+    pub fn take(&mut self) -> Result<Zeroizing<Vec<u8>>, String> {
         let v = self.normalized();
+        let too_long = self.overflow || v.len() > SECRET_CAP;
         self.clear();
-        v
+        if too_long {
+            return Err(crate::i18n::coded(C_TOO_LONG, "err.pw_too_long"));
+        }
+        Ok(v)
     }
     /// Constant-time comparison of the normalized forms.
     pub fn ct_eq(&self, o: &Self) -> bool {
@@ -252,5 +258,31 @@ impl Drop for SecretBuf {
     fn drop(&mut self) {
         self.clear();
         unlock_mem(self.buf.as_ptr(), SECRET_CAP);
+    }
+}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::*;
+    #[test]
+    fn long_password_is_refused_not_truncated() {
+        let mut b = SecretBuf::new();
+        b.push_str(&"a".repeat(SECRET_CAP));
+        assert!(!b.overflow);
+        assert_eq!(b.clone_for_test(), "a".repeat(SECRET_CAP));
+        b.push_str("b");
+        assert!(b.overflow);
+        b.pop();
+        assert!(b.overflow, "deleting a character does not undo the cut");
+        let err = b.take().unwrap_err();
+        assert!(crate::i18n::has_code(&err, C_TOO_LONG), "{err}");
+        assert!(b.is_empty() && !b.overflow, "buffer cleared");
+        b.push_str("ok password");
+        assert_eq!(&b.take().unwrap()[..], b"ok password");
+    }
+    impl SecretBuf {
+        fn clone_for_test(&self) -> String {
+            self.as_str().to_string()
+        }
     }
 }

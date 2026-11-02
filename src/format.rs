@@ -59,14 +59,26 @@ pub const NONCE_DATA: u8 = 0;
 pub const NONCE_LAST: u8 = 1;
 pub const NONCE_META: u8 = 2;
 
-/// Limits applied to authenticated metadata (PCC-002 / PCC-005).
+/// Limits shared by encryption (from the first scan on) and decryption (PCC-002 / PCC-005).
 pub const MAX_FILES: u64 = 1_000_000;
+pub const MAX_ENTRY: u64 = 4 << 40; // 4 TiB per file
+pub const MAX_TOTAL: u64 = 16 << 40; // 16 TiB unpacked in total
 pub const MAX_LZMA_DICT: u32 = 64 << 20;
 
-pub const BAD: &str = "실패: 비밀번호/PIM/키 파일이 틀렸거나 파일이 손상되었습니다(또는 Shield 2 파일이 아님).";
-pub const UNSUPPORTED: &str =
-    "지원하지 않는 형식입니다: 인증은 성공했지만 이 Shield가 모르는 버전·알고리즘·설정입니다. 더 새로운 Shield가 필요할 수 있습니다.";
-pub const SIZE_MISMATCH: &str = "파일 크기가 헤더와 맞지 않습니다: 잘렸거나 뒤에 데이터가 덧붙었습니다. 복호화를 중단했습니다.";
+pub const C_BAD: &str = "E_BAD";
+pub const C_UNSUPPORTED: &str = "E_UNSUPPORTED";
+pub const C_SIZE: &str = "E_SIZE";
+
+/// Wrong password/PIM/key file, damaged, or not a Shield file (deliberately one message).
+pub fn bad() -> String {
+    crate::i18n::coded(C_BAD, "err.bad")
+}
+pub fn unsupported() -> String {
+    crate::i18n::coded(C_UNSUPPORTED, "err.unsupported")
+}
+pub fn size_mismatch() -> String {
+    crate::i18n::coded(C_SIZE, "err.size_mismatch")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Meta {
@@ -166,10 +178,9 @@ fn u64le(b: &[u8], o: usize) -> u64 {
 /// understood" and is reported as an unsupported format, never as a wrong password.
 pub fn decode_meta(b: &[u8]) -> Result<Meta, String> {
     if b.len() != META_PT {
-        return Err(UNSUPPORTED.into());
+        return Err(unsupported());
     }
     let nl = b[76] as usize;
-    let unsupported = || UNSUPPORTED.to_string();
     if b[5] != 0 || nl > NAME_MAX || b[77 + nl..].iter().any(|&x| x != 0) {
         return Err(unsupported());
     }
@@ -214,7 +225,8 @@ pub fn decode_meta(b: &[u8]) -> Result<Meta, String> {
         && m.real_len <= m.padded_len
         && m.padded_len - m.real_len <= pad_max(m.real_len)
         && m.file_count <= MAX_FILES
-        && m.dir_count <= MAX_FILES;
+        && m.dir_count <= MAX_FILES
+        && m.total_unpacked <= MAX_TOTAL;
     if ok {
         Ok(m)
     } else {
@@ -254,10 +266,10 @@ pub fn pad_max(real_len: u64) -> u64 {
 
 pub fn comp_name(method: u8) -> &'static str {
     match method {
-        COMP_COPY => "무압축 저장 (Copy)",
+        COMP_COPY => crate::i18n::t("fmt.comp_copy"),
         COMP_LZMA2 => "LZMA2",
         COMP_ZSTD => "Zstandard",
-        _ => "알 수 없음",
+        _ => crate::i18n::t("fmt.comp_unknown"),
     }
 }
 
@@ -288,8 +300,11 @@ mod tests {
         ] {
             let mut x = sample();
             f(&mut x);
-            assert_eq!(decode_meta(&encode_meta(&x)[..]).unwrap_err(), UNSUPPORTED);
+            assert_eq!(decode_meta(&encode_meta(&x)[..]).unwrap_err(), unsupported());
         }
+        let mut huge = sample();
+        huge.total_unpacked = MAX_TOTAL + 1;
+        assert!(decode_meta(&encode_meta(&huge)[..]).is_err(), "unpacked total above the shared limit");
         let mut raw = encode_meta(&m);
         raw[500] = 1; // reserved area must be zero
         assert!(decode_meta(&raw[..]).is_err());

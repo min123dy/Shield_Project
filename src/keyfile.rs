@@ -4,10 +4,11 @@
 //! (sha3 "zeroize" feature) and read buffers are zeroized.
 
 use crate::entropy::fill_random;
+use crate::i18n::{t, tf};
 use crate::progress::{e, R};
 use sha3::{Digest, Sha3_512};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
 };
@@ -18,9 +19,9 @@ pub const KF_MAX_KIB: u32 = 1024;
 
 /// Hashes one key file; rejects empty files and files made of one repeated byte.
 fn hash_one(p: &Path) -> R<Zeroizing<[u8; 64]>> {
-    let m = fs::metadata(p).map_err(|x| format!("키 파일을 열 수 없습니다: {} ({x})", p.display()))?;
+    let m = fs::metadata(p).map_err(|x| tf("kf.open", &[&p.display(), &x]))?;
     if !m.is_file() || m.len() == 0 {
-        return Err(format!("키 파일을 사용할 수 없습니다 (빈 파일이거나 일반 파일이 아님): {}", p.display()));
+        return Err(tf("kf.unusable", &[&p.display()]));
     }
     let mut f = File::open(p).map_err(e)?;
     let mut h = Sha3_512::new();
@@ -37,7 +38,7 @@ fn hash_one(p: &Path) -> R<Zeroizing<[u8; 64]>> {
         h.update(&buf[..n]);
     }
     if uniform {
-        return Err(format!("키 파일 품질 검사 실패 (모든 바이트가 같음): {}", p.display()));
+        return Err(tf("kf.uniform", &[&p.display()]));
     }
     let mut out = Zeroizing::new([0u8; 64]);
     out.copy_from_slice(&h.finalize());
@@ -54,7 +55,7 @@ pub fn keyfile_material(files: &[PathBuf]) -> R<Zeroizing<[u8; 64]>> {
     hs.sort();
     hs.dedup();
     if hs.len() != n {
-        return Err("내용이 같은 키 파일이 중복되었습니다.".into());
+        return Err(t("kf.duplicate").into());
     }
     let mut h = Sha3_512::new();
     h.update(b"SHIELD-KF-v2");
@@ -81,42 +82,38 @@ pub fn check_overlap(keyfiles: &[PathBuf], targets: &[&Path]) -> R<()> {
     for k in keyfiles {
         for t in targets {
             if crate::sysinfo::is_within(k, t) {
-                return Err(format!(
-                    "키 파일이 작업 대상과 겹칩니다: {} — 키 파일을 대상 밖으로 옮긴 뒤 다시 시도하세요.",
-                    k.display()
-                ));
+                return Err(tf("kf.overlap", &[&k.display()]));
             }
         }
     }
     Ok(())
 }
 
-/// Generates a random key file of `kib` KiB (1..=1024). Never overwrites an existing file; access
-/// is restricted to the current user. Random data is drawn 32 bytes per call so every call mixes
-/// fresh OS entropy.
+/// Generates a random key file of `kib` KiB (1..=1024). Never overwrites an existing file. The
+/// owner-only DACL is applied by the create call itself (the file never exists with inherited
+/// permissions); if writing fails the partial file is deleted. Random data is drawn 32 bytes per
+/// call so every call mixes fresh OS entropy; it never waits for mouse input.
 pub fn generate_keyfile(path: &Path, kib: u32) -> R<()> {
     if !(1..=KF_MAX_KIB).contains(&kib) {
-        return Err(format!("키 파일 크기는 1~{KF_MAX_KIB} KiB 범위여야 합니다 (입력: {kib})."));
+        return Err(tf("kf.size_range", &[&KF_MAX_KIB, &kib]));
     }
     let mut k = Zeroizing::new(vec![0u8; kib as usize * 1024]);
     for c in k.chunks_mut(32) {
         fill_random(c)?;
     }
     if k.iter().all(|&b| b == k[0]) {
-        return Err("난수 품질 검사 실패: 키 파일을 만들지 않았습니다.".into());
+        return Err(t("kf.rng_check").into());
     }
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|x| format!("키 파일을 만들 수 없습니다 (같은 이름이 있으면 덮어쓰지 않습니다): {x}"))?;
+    let mut f = crate::sysinfo::create_private_file(path).map_err(|x| tf("kf.create", &[&x]))?;
     let w = f.write_all(&k).and_then(|_| f.sync_all());
     drop(f);
     if let Err(x) = w {
-        let _ = fs::remove_file(path);
-        return Err(e(x));
+        return Err(match fs::remove_file(path) {
+            Ok(()) => tf("kf.write_failed", &[&x]),
+            Err(y) => tf("kf.write_failed_left", &[&x, &path.display(), &y]),
+        });
     }
-    crate::sysinfo::restrict_file(path).map_err(|x| format!("키 파일은 만들었지만 접근 권한 제한에 실패했습니다: {x}"))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -138,6 +135,19 @@ mod tests {
         assert!(generate_keyfile(&d.join("b"), KF_MAX_KIB + 1).is_err());
         generate_keyfile(&d.join("c"), KF_MAX_KIB).unwrap();
         assert_eq!(fs::metadata(d.join("c")).unwrap().len(), 1024 * 1024);
+        let _ = fs::remove_dir_all(d);
+    }
+    #[cfg(windows)]
+    #[test]
+    fn new_keyfile_has_owner_only_protected_dacl() {
+        let d = dir();
+        let p = d.join("k.key");
+        generate_keyfile(&p, 1).unwrap();
+        let out = std::process::Command::new(crate::sysinfo::system_dir().join("icacls.exe")).arg(&p).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let aces = text.lines().filter(|l| l.contains(":(")).count();
+        assert_eq!(aces, 1, "exactly one ACE (the current user): {text}");
+        assert!(!text.contains("(I)"), "nothing inherited: {text}");
         let _ = fs::remove_dir_all(d);
     }
     #[test]

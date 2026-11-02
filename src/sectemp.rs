@@ -26,6 +26,8 @@ use zeroize::{Zeroize, Zeroizing};
 const BLK: usize = 64 * 1024;
 const TAG: usize = 16;
 const SLOT: u64 = (8 + BLK + TAG) as u64;
+/// B-12: the block table may never grow past what the largest allowed archive needs.
+pub const MAX_BLOCKS: u64 = crate::format::MAX_TOTAL / BLK as u64 + 1;
 const LABEL: &[u8] = b"SHIELD-v2-SECTEMP";
 
 pub struct SecTemp {
@@ -43,8 +45,8 @@ pub struct SecTemp {
     destroyed: bool,
 }
 
-fn ioerr(m: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, format!("임시 저장소: {m}"))
+fn ioerr(m: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, crate::i18n::tf("st.prefix", &[&crate::i18n::t(m)]))
 }
 
 fn nonce(c: u64) -> XNonce {
@@ -94,7 +96,7 @@ impl SecTemp {
     }
 
     fn file(&mut self) -> io::Result<&mut File> {
-        self.f.as_mut().ok_or_else(|| ioerr("이미 파기됨"))
+        self.f.as_mut().ok_or_else(|| ioerr("st.destroyed"))
     }
 
     fn cipher(&self) -> XChaCha20Poly1305 {
@@ -105,17 +107,24 @@ impl SecTemp {
         if !self.dirty {
             return Ok(());
         }
-        let idx = self.cidx.ok_or_else(|| ioerr("블록 없음"))?;
-        self.ctr = self.ctr.checked_add(1).ok_or_else(|| ioerr("카운터 한계"))?;
+        let idx = self.cidx.ok_or_else(|| ioerr("st.no_block"))?;
+        if idx >= MAX_BLOCKS {
+            return Err(ioerr("st.too_big"));
+        }
+        let i = idx as usize;
+        if self.expect.len() <= i {
+            // B-12: grow the table fallibly; an allocation failure is an error, not an abort
+            self.expect.try_reserve(i + 1 - self.expect.len()).map_err(|_| ioerr("st.no_mem"))?;
+        }
+        self.ctr = self.ctr.checked_add(1).ok_or_else(|| ioerr("st.counter"))?;
         let c = self.ctr;
         let mut buf = Zeroizing::new(self.cache.to_vec());
-        let tag = self.cipher().encrypt_in_place_detached(&nonce(c), &aad(idx, c), &mut buf).map_err(|_| ioerr("암호화"))?;
+        let tag = self.cipher().encrypt_in_place_detached(&nonce(c), &aad(idx, c), &mut buf).map_err(|_| ioerr("st.encrypt"))?;
         let f = self.file()?;
         f.seek(SeekFrom::Start(idx * SLOT))?;
         f.write_all(&c.to_le_bytes())?;
         f.write_all(&buf)?;
         f.write_all(&tag)?;
-        let i = idx as usize;
         if self.expect.len() <= i {
             self.expect.resize(i + 1, 0);
         }
@@ -136,22 +145,22 @@ impl SecTemp {
             let off = idx * SLOT;
             let f = self.file()?;
             if f.metadata()?.len() < off + SLOT {
-                return Err(ioerr("임시 파일이 잘렸습니다"));
+                return Err(ioerr("st.truncated"));
             }
             let mut raw = Zeroizing::new(vec![0u8; SLOT as usize]);
             f.seek(SeekFrom::Start(off))?;
             f.read_exact(&mut raw)?;
             let c = u64::from_le_bytes(raw[..8].try_into().unwrap());
             if c != want {
-                return Err(ioerr("블록 카운터 불일치 (교체/재생 의심)"));
+                return Err(ioerr("st.ctr_mismatch"));
             }
             let (body, tag) = raw[8..].split_at_mut(BLK);
             self.cipher()
                 .decrypt_in_place_detached(&nonce(c), &aad(idx, c), body, &Tag::clone_from_slice(tag))
-                .map_err(|_| ioerr("블록 인증 실패"))?;
+                .map_err(|_| ioerr("st.auth"))?;
             self.cache.copy_from_slice(body);
         } else if !for_write && idx * (BLK as u64) < self.size {
-            return Err(ioerr("기록되지 않은 블록(구멍)을 읽으려 했습니다"));
+            return Err(ioerr("st.hole"));
         }
         self.cidx = Some(idx);
         self.dirty = false;
@@ -180,7 +189,7 @@ impl SecTemp {
             Err(x) if x.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(x) => Err(io::Error::new(
                 x.kind(),
-                format!("임시 파일 삭제 실패: {} ({x}) — 내용은 키가 파기되어 읽을 수 없지만 직접 삭제하세요.", self.path.display()),
+                crate::i18n::tf("st.delete_failed", &[&self.path.display(), &x]),
             )),
         }
     }
@@ -189,7 +198,7 @@ impl SecTemp {
 impl Write for SecTemp {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, crate::progress::CANCELLED));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, crate::progress::cancelled_msg()));
         }
         if buf.is_empty() {
             return Ok(0);
@@ -233,7 +242,7 @@ impl Seek for SecTemp {
             SeekFrom::End(d) => self.size as i128 + d as i128,
         };
         if !(0..=(1i128 << 60)).contains(&np) {
-            return Err(ioerr("잘못된 위치"));
+            return Err(ioerr("st.bad_pos"));
         }
         self.pos = np as u64;
         Ok(self.pos)
@@ -333,6 +342,14 @@ mod tests {
     }
 
     #[test]
+    fn block_table_is_bounded() {
+        let mut t = SecTemp::create(&std::env::temp_dir()).unwrap();
+        t.seek(SeekFrom::Start(MAX_BLOCKS * BLK as u64)).unwrap();
+        assert!(t.write_all(b"x").and_then(|_| t.flush()).is_err(), "a write past the bound is an error, not a huge allocation");
+        t.destroy().unwrap();
+    }
+
+    #[test]
     fn destroy_reports_and_removes() {
         let (t, _) = filled();
         let p = t.path.clone();
@@ -349,7 +366,7 @@ mod tests {
         let p = t.path.clone();
         let blocker = OpenOptions::new().read(true).share_mode(0x1 | 0x2).open(&p).unwrap(); // READ|WRITE, no DELETE
         let err = t.destroy().unwrap_err().to_string();
-        assert!(err.contains("임시 파일 삭제 실패"), "{err}");
+        assert!(err.contains(&p.display().to_string()), "the message names the file: {err}");
         assert_eq!(fs::metadata(&p).unwrap().len(), 0, "content truncated even when delete fails");
         drop(blocker);
         fs::remove_file(&p).unwrap();

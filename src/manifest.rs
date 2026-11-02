@@ -1,6 +1,7 @@
 //! The fixed target list of an encryption, its SHA3-512 fingerprints, the comparison with the
 //! restored archive and the shredding of exactly (and only) the listed, unchanged files.
 
+use crate::i18n::tf;
 use crate::progress::*;
 use crate::sysinfo::{file_id, open_no_follow, FileId};
 use sha3::{Digest, Sha3_512};
@@ -50,7 +51,7 @@ impl<Rd> HashingReader<Rd> {
 impl<Rd: Read> Read for HashingReader<Rd> {
     fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
         if cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, CANCELLED));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, cancelled_msg()));
         }
         let n = self.inner.read(b)?;
         self.h.update(&b[..n]);
@@ -84,7 +85,7 @@ impl Manifest {
         let id = file_id(&f).map_err(e)?;
         let md = f.metadata().map_err(e)?;
         if id.vol != r.id.vol || id.idx != r.id.idx || md.len() != r.size || md.modified().ok() != r.mtime {
-            return Err(format!("암호화 도중 파일이 바뀌었습니다: {} — 원본은 그대로 두고 중단했습니다.", r.path.display()));
+            return Err(tf("man.changed", &[&r.path.display()]));
         }
         Ok(f)
     }
@@ -93,7 +94,7 @@ impl Manifest {
     /// must have been hashed while packing.
     pub fn expected(&self, files: &mut Digests, dirs: &mut BTreeSet<String>) -> R<()> {
         for r in &self.files {
-            let h = r.hash.ok_or_else(|| format!("내부 오류: 지문 없음 ({})", r.rel))?;
+            let h = r.hash.ok_or_else(|| tf("man.no_hash", &[&r.rel]))?;
             files.insert(r.rel.clone(), (r.size, h));
         }
         dirs.extend(self.dirs.iter().map(|(d, _)| d.clone()));
@@ -105,18 +106,18 @@ pub type Digests = BTreeMap<String, (u64, [u8; 64])>;
 
 /// Compares the restored archive with the expected list: same paths, sizes and SHA3-512.
 pub fn compare(want: &Digests, want_dirs: &BTreeSet<String>, got: &Digests, got_dirs: &BTreeSet<String>) -> R<()> {
-    let fail = |w: String| Err(format!("복원 검증 실패: {w} — 결과 파일을 삭제했고 원본은 그대로입니다."));
+    let fail = |w: String| Err(tf("man.verify_failed", &[&w]));
     if got.len() != want.len() {
-        return fail(format!("파일 수 불일치 (원본 {}, 복원 {})", want.len(), got.len()));
+        return fail(tf("man.count_mismatch", &[&want.len(), &got.len()]));
     }
     for (name, (size, h)) in want {
         match got.get(name) {
             Some((sz, g)) if sz == size && crate::password::ct_eq(g, h) => {}
-            _ => return fail(format!("내용이 다릅니다: {name}")),
+            _ => return fail(tf("man.content_differs", &[&name])),
         }
     }
     if let Some(d) = want_dirs.iter().find(|d| !got_dirs.contains(*d)) {
-        return fail(format!("폴더가 없습니다: {d}"));
+        return fail(tf("man.dir_missing", &[&d]));
     }
     Ok(())
 }
@@ -129,7 +130,7 @@ fn walk(p: &Path, name: &str, m: &mut Manifest) -> R<()> {
         return Ok(());
     }
     if m.files.len() as u64 + m.dirs.len() as u64 >= crate::format::MAX_FILES {
-        return Err(format!("항목이 너무 많습니다 (최대 {}개).", crate::format::MAX_FILES));
+        return Err(tf("man.too_many", &[&crate::format::MAX_FILES]));
     }
     let name = name.to_string();
     if md.is_dir() {
@@ -150,7 +151,15 @@ fn walk(p: &Path, name: &str, m: &mut Manifest) -> R<()> {
             return Ok(());
         }
         let fm = f.metadata().map_err(e)?;
-        m.total = m.total.saturating_add(fm.len());
+        // B-11: the same limits decryption enforces, checked while the list is fixed
+        if fm.len() > crate::format::MAX_ENTRY {
+            return Err(tf("man.file_too_big", &[&p.display(), &crate::ui_fmt::human(crate::format::MAX_ENTRY)]));
+        }
+        m.total = m
+            .total
+            .checked_add(fm.len())
+            .filter(|t| *t <= crate::format::MAX_TOTAL)
+            .ok_or_else(|| tf("man.total_too_big", &[&crate::ui_fmt::human(crate::format::MAX_TOTAL)]))?;
         m.files.push(FileRec { rel: name, path: p.to_path_buf(), id, size: fm.len(), mtime: fm.modified().ok(), hash: None });
     } else {
         m.skipped += 1;
@@ -166,22 +175,27 @@ pub struct ShredReport {
     pub failed: Vec<(PathBuf, String)>,
     pub dirs_removed: u64,
     pub dirs_kept: Vec<PathBuf>,
+    /// Alternate data streams overwritten before their files were deleted (B-9).
+    pub streams: u64,
 }
 
 impl ShredReport {
     pub fn summary(&self, passes: usize) -> String {
-        let mut s = format!("원본 {}개 파일 {passes}회 덮어쓰기 파쇄", self.shredded);
+        let mut s = tf("man.shredded", &[&self.shredded, &passes]);
+        if self.streams > 0 {
+            s += &tf("man.streams_shredded", &[&self.streams]);
+        }
         if !self.changed.is_empty() {
-            s += &format!(" · 암호화 이후 바뀐 파일 {}개는 지우지 않음", self.changed.len());
+            s += &tf("man.changed_kept", &[&self.changed.len()]);
         }
         if !self.hardlinked.is_empty() {
-            s += &format!(" · 하드 링크 파일 {}개는 지우지 않음", self.hardlinked.len());
+            s += &tf("man.hardlinks_kept", &[&self.hardlinked.len()]);
         }
         if !self.failed.is_empty() {
-            s += &format!(" · 파쇄 실패 {}개 ({})", self.failed.len(), self.failed[0].1);
+            s += &tf("man.shred_failed", &[&self.failed.len(), &self.failed[0].1]);
         }
         if !self.dirs_kept.is_empty() {
-            s += &format!(" · 목록 밖 항목이 남아 폴더 {}개를 지우지 않음", self.dirs_kept.len());
+            s += &tf("man.dirs_kept", &[&self.dirs_kept.len()]);
         }
         s
     }
@@ -189,11 +203,16 @@ impl ShredReport {
 
 /// Overwrites + deletes exactly the listed files that are still unchanged, then removes listed
 /// folders that became empty. Hard links, links and changed files are left alone and reported.
-pub fn shred_listed(m: &Manifest, passes: usize) -> ShredReport {
+/// `with_streams`: the user chose to include alternate data streams; they are overwritten too
+/// (otherwise deleting the file frees them without overwriting).
+pub fn shred_listed(m: &Manifest, passes: usize, with_streams: bool) -> ShredReport {
     let mut rep = ShredReport::default();
     for r in &m.files {
-        match crate::wipe::shred_checked(r, passes) {
-            Ok(()) => rep.shredded += 1,
+        match crate::wipe::shred_checked(r, passes, with_streams) {
+            Ok(n) => {
+                rep.shredded += 1;
+                rep.streams += n;
+            }
             Err(crate::wipe::ShredSkip::Changed) => rep.changed.push(r.path.clone()),
             Err(crate::wipe::ShredSkip::HardLink) => rep.hardlinked.push(r.path.clone()),
             Err(crate::wipe::ShredSkip::Failed(x)) => rep.failed.push((r.path.clone(), x)),
@@ -214,4 +233,22 @@ pub fn shred_listed(m: &Manifest, passes: usize) -> ShredReport {
         }
     }
     rep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scan_counts_and_limits_share_the_constants() {
+        let d = std::env::temp_dir().join(format!("shield_man_{}", crate::entropy::rand_hex().unwrap()));
+        fs::create_dir_all(d.join("sub")).unwrap();
+        fs::write(d.join("sub").join("a.txt"), b"abc").unwrap();
+        let mut m = Manifest::default();
+        Manifest::scan(&d, "", &mut m).unwrap();
+        assert_eq!((m.files.len(), m.dirs.len(), m.total), (1, 2, 3));
+        // the running total is checked against MAX_TOTAL: start just below the limit
+        let mut near = Manifest { total: crate::format::MAX_TOTAL - 1, ..Default::default() };
+        assert!(Manifest::scan(&d, "", &mut near).is_err(), "total above MAX_TOTAL is refused at scan time");
+        let _ = fs::remove_dir_all(d);
+    }
 }

@@ -1,9 +1,10 @@
-//! Randomness. The OS CSPRNG is always the primary source; mouse movement is hashed into a pool
-//! on top of it, so the output is never weaker than the OS RNG even if the mouse input were
-//! predictable. The mouse pool is an auxiliary source, not a guarantee.
+//! Randomness. The OS CSPRNG is always the primary source; mouse movement (Settings > Security,
+//! on by default) is hashed into a pool on top of it, so the output is never weaker than the OS
+//! RNG even if the mouse input were predictable or absent. The pool is an auxiliary input only:
+//! nothing waits for it, and no key, salt or key file depends on how much was collected.
 //!
 //! Key-grade values (DEK, salts, nonces, SecTemp keys, key files) come from `fill_random`:
-//! SHAKE256(label ‖ 64 fresh OS bytes ‖ pool ‖ counter) is squeezed straight into the caller's
+//! SHAKE256(label | 64 fresh OS bytes | pool | counter) is squeezed straight into the caller's
 //! buffer; the sponge state is zeroized on drop (sha3 "zeroize" feature). OS RNG failures are
 //! returned as errors (no panic, nothing is generated). Bulk overwrite data for shredding uses a
 //! separate ChaCha20 stream (`bulk_rng`) for speed; that data is not secret.
@@ -19,15 +20,28 @@ use sha3::{
 };
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::Instant,
 };
 use zeroize::{Zeroize, Zeroizing};
 
-/// Score required before a key file can be generated.
-pub const TARGET_BITS: u64 = 1024;
+/// Score shown in Settings as "collected" (display only; nothing is gated on it).
+pub const DISPLAY_BITS: u64 = 1024;
+
+static MOUSE_ON: AtomicBool = AtomicBool::new(true);
+
+/// Settings > Security > mouse entropy. Turning it off also wipes what was collected.
+pub fn set_mouse_enabled(on: bool) {
+    MOUSE_ON.store(on, Ordering::Relaxed);
+    if !on {
+        clear_pool();
+    }
+}
+pub fn mouse_enabled() -> bool {
+    MOUSE_ON.load(Ordering::Relaxed)
+}
 
 struct Pool {
     h: [u8; 64],
@@ -43,7 +57,7 @@ pub static SAMPLES: AtomicU64 = AtomicU64::new(0);
 /// Conservative score (see module docs).
 pub static CREDIT: AtomicU64 = AtomicU64::new(0);
 
-pub const RNG_FAIL: &str = "운영체제 난수 생성기(OS RNG) 오류로 작업을 중단했습니다. 아무것도 생성하지 않았습니다.";
+
 
 fn mix_into(h: &mut [u8; 64], data: &[u8]) {
     let mut s = Sha3_512::new();
@@ -57,6 +71,9 @@ fn mix_into(h: &mut [u8; 64], data: &[u8]) {
 
 /// Hash one pointer position (+ high resolution timestamp) into the pool.
 pub fn mix_mouse(x: f32, y: f32, t: f64) {
+    if !mouse_enabled() {
+        return;
+    }
     let ns = T0.get_or_init(Instant::now).elapsed().as_nanos() as u64;
     let mut p = POOL.lock().unwrap_or_else(|x| x.into_inner());
     let credit = match p.last {
@@ -87,9 +104,7 @@ pub fn mix_mouse(x: f32, y: f32, t: f64) {
 pub fn credited_bits() -> u64 {
     CREDIT.load(Ordering::Relaxed)
 }
-pub fn entropy_ready() -> bool {
-    credited_bits() >= TARGET_BITS
-}
+
 
 /// Wipes the mouse pool (on exit and after the idle timeout). The score restarts from zero.
 pub fn clear_pool() {
@@ -103,7 +118,7 @@ pub fn clear_pool() {
 
 /// Fresh OS randomness; an error instead of a panic when the OS RNG fails.
 pub fn os_random(buf: &mut [u8]) -> Result<(), String> {
-    OsRng.try_fill_bytes(buf).map_err(|_| RNG_FAIL.to_string())
+    OsRng.try_fill_bytes(buf).map_err(|_| crate::i18n::t("err.rng").to_string())
 }
 
 /// Key-grade randomness (see module docs).
@@ -171,5 +186,16 @@ mod tests {
             assert!(rand_upto(10).unwrap() <= 10);
         }
         assert_eq!(rand_upto(0).unwrap(), 0);
+    }
+    #[test]
+    fn key_material_never_waits_for_the_mouse() {
+        // with the mouse source off and nothing collected, key-grade randomness still works
+        set_mouse_enabled(false);
+        mix_mouse(1.0, 2.0, 3.0);
+        assert_eq!(credited_bits(), 0);
+        let mut k = [0u8; 64];
+        fill_random(&mut k).unwrap();
+        assert!(k.iter().any(|&b| b != 0));
+        set_mouse_enabled(true);
     }
 }

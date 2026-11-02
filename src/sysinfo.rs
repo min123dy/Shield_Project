@@ -21,8 +21,27 @@ pub fn cores() -> u32 {
     std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1)
 }
 
+/// The user's profile folder.
+pub fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from)
+}
+
+/// Dot names, and on Windows the hidden attribute.
+pub fn is_hidden(name: &str, md: Option<&fs::Metadata>) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        name.starts_with('.') || md.is_some_and(|m| m.file_attributes() & 0x2 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = md;
+        name.starts_with('.')
+    }
+}
+
 #[cfg(windows)]
-fn wide(p: &Path) -> Vec<u16> {
+pub(crate) fn wide(p: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     p.as_os_str().encode_wide().chain(Some(0)).collect()
 }
@@ -81,11 +100,7 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 /// Fails early with a clear message when `dir` has less than `need` bytes free.
 pub fn require_space(dir: &Path, need: u64, what: &str) -> Result<(), String> {
     match free_space(dir) {
-        Some(f) if f < need => Err(format!(
-            "디스크 공간이 부족합니다 ({what}): 필요 약 {} / 남은 공간 {}. 작업을 시작하지 않았습니다.",
-            crate::ui_fmt::human(need),
-            crate::ui_fmt::human(f)
-        )),
+        Some(f) if f < need => Err(crate::i18n::tf("sys.no_space", &[&what, &crate::ui_fmt::human(need), &crate::ui_fmt::human(f)])),
         _ => Ok(()),
     }
 }
@@ -237,51 +252,54 @@ pub fn create_private_dir(p: &Path) -> io::Result<()> {
     fs::create_dir(p)?;
     let m = fs::symlink_metadata(p)?;
     if !m.is_dir() || m.file_type().is_symlink() {
-        return Err(io::Error::other("임시 폴더 검증 실패 (폴더가 아니거나 링크)"));
+        return Err(io::Error::other(crate::i18n::t("sys.private_dir_check")));
     }
     Ok(())
 }
 
-/// Restricts an existing file to the current user (key files).
-pub fn restrict_file(p: &Path) -> io::Result<()> {
+/// True for a reparse point (symlink, junction, mount point) on Windows; symlinks elsewhere.
+pub fn is_reparse(m: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::Security::Authorization::{SetNamedSecurityInfoW, SE_FILE_OBJECT};
-        use windows_sys::Win32::Security::{GetSecurityDescriptorDacl, ACL, DACL_SECURITY_INFORMATION};
-        const PROTECTED: u32 = 0x8000_0000;
+        use std::os::windows::fs::MetadataExt;
+        m.file_attributes() & 0x400 != 0
+    }
+    #[cfg(not(windows))]
+    m.file_type().is_symlink()
+}
+
+/// Creates a NEW file that only the current user can access: the protected DACL is part of the
+/// create call, so the file never exists with inherited permissions (key files, B-13).
+pub fn create_private_file(p: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL};
         let sid = current_user_sid()?;
         let w = wide(p);
-        let r = with_sd(&format!("D:P(A;;FA;;;{sid})"), |sd| unsafe {
-            let (mut present, mut def) = (0, 0);
-            let mut dacl: *mut ACL = core::ptr::null_mut();
-            if GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut def) == 0 || present == 0 {
-                return 1;
-            }
-            SetNamedSecurityInfoW(
-                w.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | PROTECTED,
-                core::ptr::null_mut(),
-                core::ptr::null_mut(),
-                dacl,
-                core::ptr::null(),
-            )
+        let h = with_sd(&format!("D:P(A;;FA;;;{sid})"), |sd| unsafe {
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            // GENERIC_READ | GENERIC_WRITE, no sharing while we write the key
+            CreateFileW(w.as_ptr(), 0x8000_0000 | 0x4000_0000, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, 0)
         })?;
-        if r != 0 {
-            return Err(io::Error::from_raw_os_error(r as i32));
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
         }
-        Ok(())
+        Ok(unsafe { File::from_raw_handle(h as _) })
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(p, fs::Permissions::from_mode(0o600))
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(p)
     }
     #[cfg(not(any(windows, unix)))]
-    {
-        let _ = p;
-        Ok(())
-    }
+    OpenOptions::new().read(true).write(true).create_new(true).open(p)
 }
 
 /// Rename that fails instead of replacing an existing destination.
@@ -297,7 +315,7 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     #[cfg(not(windows))]
     {
         if fs::symlink_metadata(to).is_ok() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "대상이 이미 있습니다"));
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, crate::i18n::t("sys.exists")));
         }
         if fs::metadata(from)?.is_dir() {
             return fs::rename(from, to); // small race accepted on non-Windows test hosts

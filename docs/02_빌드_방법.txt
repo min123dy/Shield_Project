@@ -1,20 +1,21 @@
-SHIELD 2.0 - 빌드 방법
-======================
+SHIELD 2.1.0 - 빌드 방법
+========================
 
 1. 프로젝트 폴더 구조
 ---------------------
   Shield_Project/
     Cargo.toml, Cargo.lock
     build.rs                (exe 아이콘/버전 리소스)
-    build.ps1               (빌드·테스트·MSI·dist·GPG 서명)
+    build.ps1               (빌드·테스트·MSI·dist·GPG 서명·UPX 포터블)
     installer.wxs           (WiX 5)
-    installer.ko-KR.wxl     (설치 화면 문구)
+    installer.ko-KR.wxl     (설치 화면 문구, 한국어)
     .config/dotnet-tools.json  (WiX 5.0.2 고정)
     src/                    (Rust 소스, 01_프로젝트_설명.txt 3절)
-    docs/01~04
+    docs/01~06
 
 installer.wxs는 target/release/shield.exe, docs/03_사용_방법.txt, 그리고 build.ps1이
 docs/04_설치_안내.txt로부터 만든 target/installer/notice.rtf를 사용합니다.
+MSI에는 UPX로 압축하지 않은 shield.exe가 들어갑니다. 포터블 exe는 별도 복사본입니다.
 
 2. 필요한 도구
 --------------
@@ -22,25 +23,51 @@ docs/04_설치_안내.txt로부터 만든 target/installer/notice.rtf를 사용�
 - .NET SDK 6 이상 (WiX 5.0.2는 로컬 .NET 도구로 복원, 전역 설치 불필요)
 - 서명할 때만: GnuPG (Gpg4win 권장, https://gpg4win.org). Git for Windows에 들어 있는 gpg도 동작하도록
   경로를 변환하지만, 둘 다 있으면 Gpg4win을 우선 사용합니다.
+- 포터블 exe를 만들 때만: UPX (upx.exe). 없으면 포터블 빌드는 건너뛰고 MSI만 만듭니다.
 - 최초 의존성 다운로드를 위한 인터넷 연결
 
 3. 빌드
 -------
   Set-ExecutionPolicy -Scope Process Bypass
-  .\build.ps1                               ("GPG 서명을 하시겠습니까? (y/N)"에 답함)
-  .\build.ps1 -NoSign                       (서명 없이)
+  .\build.ps1                               (아래 질문에 차례로 답함)
+  .\build.ps1 -NoSign                       (GPG 서명 없이)
   .\build.ps1 -Sign -PublicKeyPath my.asc   (비대화형 서명)
   .\build.ps1 -Sign -PublicKeyPath my.asc -GpgHome D:\keys\gnupg   (비밀키가 기본이 아닌 키링에 있을 때)
 
-단계 (어느 단계든 실패하면 즉시 중단):
+  UPX 포터블 (선택):
+  .\build.ps1 -UpxPath "C:\tools\upx.exe"   (파일 경로 또는 upx.exe가 든 폴더 경로, 묻지 않음)
+  .\build.ps1 -NoUpx                        (묻지 않고 포터블 빌드 건너뜀)
+  - 옵션 없이 .\build.ps1만 실행하면 "GPG 서명을 하시겠습니까? (y/N)"에 이어 "UPX 경로"를 묻습니다.
+    경로를 넣으면 포터블 exe도 만들고, 그냥 Enter를 치면 건너뜁니다.
+  - 창에 파일을 끌어 놓을 때 붙는 따옴표와 "& "는 알아서 지웁니다.
+  - 입력이 자동으로 들어오는 환경(입력 리디렉션)에서는 UPX 경로를 묻지 않습니다.
+  - -UpxPath는 -Sign, -NoSign과 함께 쓸 수 있습니다. 서명할 때는 포터블 exe도 함께 서명합니다.
+
+단계 (어느 단계든 실패하면 즉시 중단. UPX 포터블을 만들면 전체 6단계, 아니면 5단계):
   [서명 준비] (서명 시) gpg 찾기 → 공개키 파일 검사 → 임시 키링에 공개키만 가져오기 → 지문·사용자 ID 표시와 확인
               → 해당 지문의 비밀키가 로컬 키링에 있는지 확인
+  [UPX 확인]  (UPX 경로를 줄 때) 빌드 전에 upx.exe를 찾아 버전을 확인합니다. 경로가 틀리면 바로 중단합니다.
   [1/5] cargo build --release
-  [2/5] cargo test --release
+  [UPX]   (UPX 경로를 줄 때만, 이 단계가 들어가면 번호가 [n/6]으로 바뀜)
+          shield.exe를 Shield_v{버전}_portable.exe로 복사해 upx --best --lzma --strip-relocs=0으로 압축
+          → upx -t 무결성 검사 → ASLR(0x40)·고엔트로피 ASLR(0x20)·DEP(0x100) 플래그가
+          압축 전과 같은지 확인. 하나라도 어긋나면 포터블 exe를 지우고 중단합니다.
+  [2/5] cargo test --release          (아래 "테스트 시간과 출력" 참고)
   [3/5] WiX 5.0.2 로컬 도구·확장 복원
   [4/5] docs/04_설치_안내.txt → 설치 첫 화면 RTF(코드 페이지 949)
   [5/5] wix build → Shield.msi
   [배포] dist\ 구성, (서명 시) 서명과 검증, SHA256SUMS.txt
+
+테스트 시간과 출력
+  - 현재 자동 테스트는 105개이고, 모두 통과하는 데 약 5분이 걸립니다(Argon2id 등 비용이 큰 시험 포함).
+  - release 빌드의 실행 파일은 콘솔 없는 GUI 프로그램(main.rs 첫 줄의 windows_subsystem)이라, 테스트 실행 파일도
+    콘솔에 출력을 내지 않습니다. [2/5] 단계에서 "Running unittests ..." 줄만 나온 채 아무 출력이 없어도
+    테스트는 돌고 있을 수 있습니다. 5분 정도 기다려 보세요.
+  - 진행 상황을 보려면 파일로 리디렉션합니다.
+      cargo test --release -- --test-threads=1 --nocapture *> test_out.txt
+      Get-Content test_out.txt -Tail 30
+    마지막에 찍힌 "test 이름 ..."이 지금 도는(또는 멈춘) 테스트입니다. 파일이 계속 비어 있고 CPU 사용도 없으면
+    그때 멈춘 것으로 보고 작업 관리자에서 CPU·메모리를 확인하세요.
 
 4. 공개키 파일 검사 (서명 시)
 -----------------------------
@@ -57,27 +84,48 @@ docs/04_설치_안내.txt로부터 만든 target/installer/notice.rtf를 사용�
                                *.pem, *.pfx, *.p12, *.zip, *.shd, .env* 제외). System.IO.Compression으로 만들어
                                항목 경로 구분자가 '/'입니다 (Compress-Archive 사용 안 함).
   Shield.msi
-  SHA256SUMS.txt               dist의 모든 파일 SHA-256 (항상)
+  Shield_v{버전}_portable.exe  UPX로 압축한 단일 exe (UPX 경로를 준 경우에만). 설치 없이 실행하며
+                               설정을 실행 파일 옆 Shield_data 폴더에 저장합니다.
+  SHA256SUMS.txt               dist의 모든 파일 SHA-256 (항상, 포터블 exe 포함)
   서명 시 추가:
   Shield_Project_v{버전}.zip.sig, Shield.msi.sig   gpg --detach-sign (지정한 지문의 키, SHA-512)
+  Shield_v{버전}_portable.exe.sig                  (포터블 exe를 만든 경우)
   <입력한 공개키 파일 이름>.asc
-  VERIFY.txt                   검증 방법과 지문
-서명 직후 임시 키링(입력한 공개키만 있음)으로 두 서명을 gpg --verify하고 VALIDSIG의 지문까지 확인합니다.
+  VERIFY.txt                   검증 방법과 지문 (포터블 exe 검증 명령 포함)
+서명 직후 임시 키링(입력한 공개키만 있음)으로 모든 서명을 gpg --verify하고 VALIDSIG의 지문까지 확인합니다.
 실패하면 만들어진 .sig를 지우고 오류로 중단합니다. 빌드 때마다 dist\는 비우고 새로 만듭니다.
 
 6. 설치 구성 (installer.wxs)
 ----------------------------
-- UpgradeCode는 1.x와 같아 2.0.0 설치 시 이전 버전을 자동 제거(MajorUpgrade, 실패 시 MSI 롤백).
+- UpgradeCode는 1.x와 같아 2.x 설치 시 이전 버전을 자동 제거(MajorUpgrade, 실패 시 MSI 롤백).
 - 시작 메뉴: "Shield"(암호화 창), "Shield 파일 관리자"(--manager), "Shield 사용 설명서".
 - 우클릭: 모든 파일·폴더 "Shield로 암호화"(--encrypt), .shd "Shield로 복호화"(--decrypt),
   .shd "SHIELD에서 열기"(--open). 제품과 함께 등록·제거됩니다.
+- 설치 화면과 우클릭 메뉴 문구는 지금 한국어만 있습니다. (프로그램 안의 화면은 한국어·영어를 지원합니다.)
 - Authenticode 코드 서명은 하지 않습니다(GPG 서명으로 대체). SmartScreen 경고가 뜰 수 있습니다.
+- 포터블 exe는 설치 프로그램과 무관하며 우클릭 메뉴를 등록하지 않습니다.
 
 7. 설치 후 확인 목록
 --------------------
 - 두 시작 메뉴 바로가기가 각각 암호화 창과 파일 관리자 창을 여는가?
 - 우클릭 세 메뉴가 보이고(Windows 11은 "더 많은 옵션 표시"), 제거 후 사라지는가?
-- 파일 관리자에서 .shd를 열고 정보 탭·선택 추출·파일 추가·본문 검사가 동작하는가?
+- 파일 관리자에서 .shd를 열고 정보 탭·선택 추출·파일 추가·선택 항목 삭제·본문 검사가 동작하는가?
+  (열린 뒤 작업을 할 때마다 비밀번호를 다시 묻는가?)
 - 1.x에서 업그레이드했을 때 프로그램 목록에 Shield가 하나만 남는가?
+- 설정 탭(일반 / 보안 / 암호화 / 파일 관리자)에서 언어(한국어·영어), 어두운 모드, 화면 캡처 방지(기본 켜짐)가
+  바뀌고 다시 실행해도 유지되는가?
+- 기본 창(1040x700)과 최소 창(800x560)에서 주요 화면이 스크롤 없이 보이는가?
+- 마우스 엔트로피 막대가 100%에서 초록색이 되고, 수집된 샘플 수가 화면에 보이는가?
+- 포터블 exe를 만들었다면: 실행되는가, 설정이 exe 옆 Shield_data에 저장되는가, SmartScreen·백신이 막지 않는가?
+
+8. 직접 확인하지 못한 것 (06_2_1_0_수정_기록.txt 7절)
+------------------------------------------------------
+- UPX 포터블 빌드를 실제로 실행해 보기 (스크립트 문법과 경로 처리만 시험)
+- 서로 다른 프로세스가 비정상 종료했을 때 잠금이 풀리는지
+- 실제 창에서 화면 캡처 방지가 되는지
+- 125 / 150 / 200 % 배율 모니터에서의 배치, 다크 모드 제목 표시줄
+- MSI 우클릭 메뉴의 영어 표시
+- FAT32·USB 같은 NTFS가 아닌 드라이브 (숨은 스트림·파일 ID가 없음)
+- GUI 버튼을 직접 눌러 보는 수동 확인
 
 자동 테스트 통과가 GUI 동작, 설치, 외부 공격 내성의 독립 검증을 뜻하지는 않습니다.

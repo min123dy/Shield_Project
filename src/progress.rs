@@ -1,5 +1,6 @@
 //! Shared progress / cancel state between the worker thread and the UI.
 
+use crate::i18n::{coded, has_code, t};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 pub type R<T> = Result<T, String>;
@@ -28,15 +29,25 @@ pub const ST_CHECK: u8 = 11;
 pub const ST_REBUILD: u8 = 12;
 pub const ST_REPLACE: u8 = 13;
 pub const ST_SCAN: u8 = 14;
+pub const ST_LOCK: u8 = 15;
+pub const ST_ADS: u8 = 16;
 
-pub const CANCELLED: &str = "취소되었습니다.";
+pub const C_CANCELLED: &str = "E_CANCELLED";
+
+pub fn cancelled_msg() -> String {
+    coded(C_CANCELLED, "err.cancelled")
+}
+
+pub fn is_cancel(msg: &str) -> bool {
+    has_code(msg, C_CANCELLED)
+}
 
 pub fn cancelled() -> bool {
     CANCEL.load(Ordering::Relaxed)
 }
 pub fn check_cancel() -> R<()> {
     if cancelled() {
-        Err(CANCELLED.into())
+        Err(cancelled_msg())
     } else {
         Ok(())
     }
@@ -47,42 +58,46 @@ pub fn set_stage(n: u8) {
     PROG_TOTAL.store(0, Ordering::Relaxed);
 }
 pub fn stage_label(n: u8) -> &'static str {
-    match n {
-        ST_COMPRESS => "압축 중 (암호화된 임시 공간 사용, 원본 지문 SHA3-512 계산)",
-        ST_ENCRYPT => "암호화 중 (XChaCha20-Poly1305)",
-        ST_VERIFY => "검증 중 (전체 인증 → 복원 → 원본과 SHA3-512 비교)",
-        ST_DECRYPT => "복호화·전체 인증 중",
-        ST_EXTRACT => "압축 해제 중 (경로·자원 제한 검사)",
-        ST_SHRED => "원본 파쇄 중 (취소 불가)",
-        ST_WIPE_FREE => "여유 공간 덮어쓰기 중 (오래 걸릴 수 있음)",
-        ST_REWRAP => "키 재봉인 중",
-        ST_TRIM => "TRIM 실행 중 (취소 불가)",
-        ST_OPEN => "컨테이너 여는 중 (헤더·메타 인증, 7z 목록 읽기)",
-        ST_CHECK => "본문 전체 무결성 검사 중",
-        ST_REBUILD => "컨테이너 재구성 중 (기존 항목 + 추가 항목)",
-        ST_REPLACE => "원자적 교체 중 (취소 불가)",
-        ST_SCAN => "대상 목록 고정 중",
-        _ => "준비 중",
-    }
+    t(match n {
+        ST_COMPRESS => "stage.compress",
+        ST_ENCRYPT => "stage.encrypt",
+        ST_VERIFY => "stage.verify",
+        ST_DECRYPT => "stage.decrypt",
+        ST_EXTRACT => "stage.extract",
+        ST_SHRED => "stage.shred",
+        ST_WIPE_FREE => "stage.wipe_free",
+        ST_REWRAP => "stage.rewrap",
+        ST_TRIM => "stage.trim",
+        ST_OPEN => "stage.open",
+        ST_CHECK => "stage.check",
+        ST_REBUILD => "stage.rebuild",
+        ST_REPLACE => "stage.replace",
+        ST_SCAN => "stage.scan",
+        ST_LOCK => "stage.lock",
+        ST_ADS => "stage.ads",
+        _ => "stage.prepare",
+    })
 }
 pub fn stage_short(n: u8) -> &'static str {
-    match n {
-        ST_COMPRESS => "압축",
-        ST_ENCRYPT => "암호화",
-        ST_VERIFY => "검증",
-        ST_DECRYPT => "복호화",
-        ST_EXTRACT => "압축 해제",
-        ST_SHRED => "원본 파쇄",
-        ST_WIPE_FREE => "여유 공간 덮어쓰기",
-        ST_REWRAP => "키 재봉인",
-        ST_TRIM => "TRIM",
-        ST_OPEN => "열기",
-        ST_CHECK => "무결성 검사",
-        ST_REBUILD => "재구성",
-        ST_REPLACE => "교체",
-        ST_SCAN => "목록 고정",
-        _ => "",
-    }
+    t(match n {
+        ST_COMPRESS => "stage_s.compress",
+        ST_ENCRYPT => "stage_s.encrypt",
+        ST_VERIFY => "stage_s.verify",
+        ST_DECRYPT => "stage_s.decrypt",
+        ST_EXTRACT => "stage_s.extract",
+        ST_SHRED => "stage_s.shred",
+        ST_WIPE_FREE => "stage_s.wipe_free",
+        ST_REWRAP => "stage_s.rewrap",
+        ST_TRIM => "stage_s.trim",
+        ST_OPEN => "stage_s.open",
+        ST_CHECK => "stage_s.check",
+        ST_REBUILD => "stage_s.rebuild",
+        ST_REPLACE => "stage_s.replace",
+        ST_SCAN => "stage_s.scan",
+        ST_LOCK => "stage_s.lock",
+        ST_ADS => "stage_s.ads",
+        _ => "stage_s.none",
+    })
 }
 /// Shredding half-way would leave a half-destroyed original; an elevated TRIM can't be stopped;
 /// the final rename of a rebuilt container must not be interrupted.

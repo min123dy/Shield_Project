@@ -1,6 +1,7 @@
 //! Password policy: one normalization (Unicode NFC) for every operation, and a deliberately modest
 //! strength estimate. The estimate is a rough guess, never a guarantee.
 
+use crate::i18n::{t, tf};
 use unicode_normalization::UnicodeNormalization;
 use zeroize::Zeroizing;
 
@@ -39,6 +40,8 @@ const ROWS: &[&str] = &["qwertyuiop", "asdfghjkl", "zxcvbnm", "1234567890", "abc
 pub struct Assessment {
     /// Rough bits after penalties (a guess).
     pub bits: f64,
+    /// 0 none, 1 weak, 2 fair, 3 strong, 4 very strong.
+    pub level: u8,
     pub label: &'static str,
     pub warnings: Vec<&'static str>,
 }
@@ -95,47 +98,73 @@ fn repeat_unit(s: &str) -> usize {
     n
 }
 
+/// Reasons a new password needs the explicit "use it anyway" confirmation (B-10). Empty = fine.
+/// The confirmation dialog lists these and has Cancel as its default button.
+pub fn weak_reasons(pw: &str, has_keyfile: bool) -> Vec<String> {
+    let a = assess(pw);
+    let n = pw.chars().count();
+    let mut r = Vec::new();
+    if n == 0 {
+        if has_keyfile {
+            r.push(t("pw.r_empty_with_kf").to_string());
+        }
+        return r;
+    }
+    if n < 12 {
+        r.push(tf("pw.r_short", &[&n]));
+    }
+    r.extend(a.warnings.iter().map(|w| w.to_string()));
+    if a.level <= 2 && n >= 12 {
+        r.push(tf("pw.r_low_score", &[&(a.bits as u32)]));
+    }
+    if has_keyfile && a.level <= 1 && r.is_empty() {
+        r.push(tf("pw.r_low_score", &[&(a.bits as u32)]));
+    }
+    r
+}
+
 pub fn assess(pw: &str) -> Assessment {
     let mut w = Vec::new();
     let n = pw.chars().count();
     if n == 0 {
-        return Assessment { bits: 0.0, label: "없음", warnings: w };
+        return Assessment { bits: 0.0, level: 0, label: t("pw.none"), warnings: w };
     }
     let lower = Zeroizing::new(pw.to_lowercase());
     let per = charset_bits(pw);
     let unit = repeat_unit(pw);
     let mut effective = n as f64;
     if unit < n {
-        w.push("같은 문자열이 반복됩니다 (예: abcabc).");
+        w.push(t("pw.w_repeat"));
         effective = unit as f64 + 1.0;
     }
     let pred = predictable_chars(pw);
     if pred * 2 >= n && n >= 4 {
-        w.push("연속되거나 반복되는 문자·숫자·키보드 배열이 많습니다 (예: 1234, aaaa, qwer).");
+        w.push(t("pw.w_sequence"));
     }
     effective = (effective - pred as f64 * 0.75).max(1.0);
     let mut bits = effective * per;
     if COMMON.iter().any(|c| lower.as_str() == *c) {
-        w.push("매우 흔한 비밀번호입니다. 공격자가 가장 먼저 시도합니다.");
+        w.push(t("pw.w_common"));
         bits = bits.min(10.0);
     } else if COMMON.iter().any(|c| c.chars().count() >= 5 && lower.contains(c)) {
-        w.push("흔한 비밀번호나 단어를 포함합니다.");
+        w.push(t("pw.w_contains_common"));
         bits -= 15.0;
     }
     if pw.chars().all(|c| c.is_ascii_digit()) {
-        w.push("숫자만으로 이루어져 있습니다.");
+        w.push(t("pw.w_digits"));
     }
     let bits = bits.max(0.0);
-    let label = if bits < 40.0 {
-        "약함"
+    let level = if bits < 40.0 {
+        1
     } else if bits < 60.0 {
-        "보통"
+        2
     } else if bits < 80.0 {
-        "강함"
+        3
     } else {
-        "매우 강함"
+        4
     };
-    Assessment { bits, label, warnings: w }
+    let label = t(["pw.none", "pw.weak", "pw.fair", "pw.strong", "pw.very_strong"][level as usize]);
+    Assessment { bits, level, label, warnings: w }
 }
 
 #[cfg(test)]
@@ -151,12 +180,22 @@ mod tests {
     }
     #[test]
     fn weak_patterns_are_flagged() {
-        assert_eq!(assess("password").label, "약함");
-        assert_eq!(assess("12345678").label, "약함");
+        assert_eq!(assess("password").level, 1);
+        assert_eq!(assess("12345678").level, 1);
         assert!(!assess("abcabcabcabc").warnings.is_empty());
         assert!(!assess("aaaaaaaaaaaa").warnings.is_empty());
         assert!(!assess("qwertyuiop").warnings.is_empty());
         let good = assess("correct-Horse7-battery-staple");
         assert!(good.warnings.is_empty() && good.bits >= 80.0, "{}", good.bits);
+    }
+    #[test]
+    fn weak_password_reasons() {
+        assert!(!weak_reasons("short", false).is_empty(), "under 12 characters");
+        assert!(!weak_reasons("passwordpassword", false).is_empty(), "long but a weak pattern");
+        assert!(!weak_reasons("12345678901234", false).is_empty(), "long but digits in sequence");
+        assert!(!weak_reasons("", true).is_empty(), "key file with an empty password still asks");
+        assert!(!weak_reasons("abc", true).is_empty(), "key file with a very weak password still asks");
+        assert!(weak_reasons("correct-Horse7-battery-staple", false).is_empty());
+        assert!(weak_reasons("correct-Horse7-battery-staple", true).is_empty());
     }
 }

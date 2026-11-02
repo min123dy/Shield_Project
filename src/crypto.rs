@@ -5,6 +5,7 @@
 use crate::entropy::{fill_random, rand_upto};
 use crate::format::*;
 use crate::harden::{lock_large, lock_mem, unlock_large, unlock_mem};
+use crate::i18n::{t, tf};
 use crate::progress::*;
 use argon2::{Algorithm, Argon2, Block, Params, Version};
 use chacha20poly1305::{
@@ -25,6 +26,7 @@ pub struct Cred {
 }
 
 impl Cred {
+    #[cfg(test)]
     pub fn duplicate(&self) -> Cred {
         Cred { pw: self.pw.clone(), kf: self.kf.clone(), pim: self.pim }
     }
@@ -36,11 +38,11 @@ impl Cred {
 /// Validates the KDF parameters before any work (they are needed before authentication).
 pub fn kdf_params(pim: u32) -> R<Params> {
     if pim > MAX_PIM {
-        return Err(format!("PIM은 0~{MAX_PIM} 범위여야 합니다."));
+        return Err(tf("crypto.pim_range", &[&MAX_PIM]));
     }
     let p = Params::new(KDF_MEM_KIB, BASE_T + pim, KDF_LANES, Some(KEY)).map_err(e)?;
     if p.m_cost() != KDF_MEM_KIB || p.p_cost() != KDF_LANES || p.t_cost() != BASE_T + pim || p.output_len() != Some(KEY) {
-        return Err("KDF 매개변수 검증 실패".into());
+        return Err(t("crypto.kdf_params").into());
     }
     Ok(p)
 }
@@ -49,7 +51,7 @@ pub fn kdf_params(pim: u32) -> R<Params> {
 /// us so it can be locked in RAM (best effort) and is zeroized right after use.
 fn kek(c: &Cred, salt: &[u8]) -> R<XChaCha20Poly1305> {
     if c.is_empty() {
-        return Err("비밀번호 또는 키 파일이 필요합니다.".into());
+        return Err(t("crypto.need_cred").into());
     }
     let params = kdf_params(c.pim)?;
     let _busy = KdfGuard::new();
@@ -57,7 +59,7 @@ fn kek(c: &Cred, salt: &[u8]) -> R<XChaCha20Poly1305> {
     let a = Argon2::new_with_secret(secret, Algorithm::Argon2id, Version::V0x13, params.clone()).map_err(e)?;
     let mut mem: Zeroizing<Vec<Block>> = Zeroizing::new(Vec::new());
     mem.try_reserve_exact(params.block_count())
-        .map_err(|_| "메모리가 부족해 키를 유도할 수 없습니다 (Argon2id 256 MiB 필요).".to_string())?;
+        .map_err(|_| t("crypto.kdf_mem").to_string())?;
     mem.resize(params.block_count(), Block::default());
     let bytes = mem.len() * core::mem::size_of::<Block>();
     let locked = lock_large(mem.as_ptr() as *const u8, bytes);
@@ -108,7 +110,7 @@ fn unlock(c: &Cred, slots: &[u8]) -> R<(usize, Zeroizing<[u8; KEY]>)> {
             return Ok((i, k));
         }
     }
-    Err(BAD.into())
+    Err(bad())
 }
 
 /// Everything learned from an authenticated header.
@@ -134,11 +136,11 @@ impl Header {
 pub fn read_header(f: &mut File, c: &Cred) -> R<Header> {
     let file_len = f.metadata().map_err(e)?.len();
     if file_len < (HEADER + TAG + 1) as u64 {
-        return Err(BAD.into());
+        return Err(bad());
     }
     let mut head = Zeroizing::new(vec![0u8; HEADER]);
     f.seek(SeekFrom::Start(0)).map_err(e)?;
-    f.read_exact(&mut head).map_err(|_| BAD.to_string())?;
+    f.read_exact(&mut head).map_err(|_| bad())?;
     let (slot_idx, dek) = unlock(c, &head[..SLOTS])?;
     let mut prefix = [0u8; PREFIX];
     prefix.copy_from_slice(&head[SLOTS..SLOTS + PREFIX]);
@@ -154,10 +156,10 @@ pub fn read_header(f: &mut File, c: &Cred) -> R<Header> {
         &mut mp[..],
         &Tag::clone_from_slice(&meta_tag),
     )
-    .map_err(|_| BAD.to_string())?;
+    .map_err(|_| bad())?;
     let meta = decode_meta(&mp[..])?; // authentic from here on: errors are "unsupported"
     if expected_size(meta.padded_len) != Some(file_len) {
-        return Err(SIZE_MISMATCH.into());
+        return Err(size_mismatch());
     }
     Ok(Header { slot_idx, dek, prefix, meta_tag, meta, file_len })
 }
@@ -190,13 +192,13 @@ impl DataCipher {
     /// Verifies and decrypts in place; on failure the buffer is zeroed (no unauthenticated output).
     pub fn open(&self, i: u64, buf: &mut [u8], tag: &[u8]) -> R<()> {
         if i >= self.n || tag.len() != TAG {
-            return Err(BAD.into());
+            return Err(bad());
         }
         self.aead
             .decrypt_in_place_detached(&self.nonce(i), &self.aad, buf, &Tag::clone_from_slice(tag))
             .map_err(|_| {
                 buf.iter_mut().for_each(|b| *b = 0);
-                BAD.to_string()
+                bad()
             })
     }
 }
@@ -205,14 +207,14 @@ impl DataCipher {
 /// Fills in `meta.padded_len`. Returns the header values of the new file (no KDF needed to reopen).
 pub fn encrypt_stream<Rd: Read, W: Write>(inp: &mut Rd, out: &mut W, c: &Cred, meta: &mut Meta) -> R<Header> {
     if meta.real_len == 0 {
-        return Err("내부 오류: 빈 입력".into());
+        return Err(t("crypto.empty_input").into());
     }
     let mut dek = Zeroizing::new([0u8; KEY]);
     fill_random(&mut dek[..])?;
     let mut prefix = [0u8; PREFIX];
     fill_random(&mut prefix)?;
     let pad = rand_upto(pad_max(meta.real_len))?;
-    meta.padded_len = meta.real_len.checked_add(pad).ok_or("크기 오류")?;
+    meta.padded_len = meta.real_len.checked_add(pad).ok_or_else(|| t("crypto.size").to_string())?;
     let mut which = [0u8; 1];
     fill_random(&mut which)?;
     let real = (which[0] & 1) as usize;
@@ -242,7 +244,7 @@ pub fn encrypt_stream<Rd: Read, W: Write>(inp: &mut Rd, out: &mut W, c: &Cred, m
         check_cancel()?;
         let sz = (meta.padded_len - i * CHUNK as u64).min(CHUNK as u64) as usize;
         let take = left_real.min(sz as u64) as usize;
-        inp.read_exact(&mut buf[..take]).map_err(|x| format!("입력 읽기 실패: {x}"))?;
+        inp.read_exact(&mut buf[..take]).map_err(|x| tf("crypto.read_input", &[&x]))?;
         buf[take..sz].fill(0);
         left_real -= take as u64;
         let tag = dc.seal(i, &mut buf[..sz])?;
@@ -267,12 +269,12 @@ pub fn stream_body<W: Write>(f: &mut File, h: &Header, out: &mut W) -> R<()> {
     for i in 0..n {
         check_cancel()?;
         let sz = (h.meta.padded_len - i * CHUNK as u64).min(CHUNK as u64) as usize;
-        r.read_exact(&mut buf[..sz + TAG]).map_err(|_| BAD.to_string())?;
+        r.read_exact(&mut buf[..sz + TAG]).map_err(|_| bad())?;
         let (body, tag) = buf[..sz + TAG].split_at_mut(sz);
         dc.open(i, body, tag)?;
         let take = left.min(sz as u64) as usize;
         if body[take..].iter().any(|&b| b != 0) {
-            return Err(BAD.into()); // padding must be zeros
+            return Err(bad()); // padding must be zeros
         }
         out.write_all(&body[..take]).map_err(e)?;
         left -= take as u64;
@@ -280,7 +282,7 @@ pub fn stream_body<W: Write>(f: &mut File, h: &Header, out: &mut W) -> R<()> {
     }
     let mut extra = [0u8; 1];
     if r.read(&mut extra).map_err(e)? != 0 {
-        return Err(SIZE_MISMATCH.into());
+        return Err(size_mismatch());
     }
     out.flush().map_err(e)
 }
@@ -327,7 +329,7 @@ impl Read for ChunkReader {
             return Ok(0);
         }
         if cancelled() {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, CANCELLED));
+            return Err(io::Error::new(io::ErrorKind::Interrupted, cancelled_msg()));
         }
         let i = self.pos / CHUNK as u64;
         let off = (self.pos % CHUNK as u64) as usize;

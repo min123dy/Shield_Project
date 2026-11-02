@@ -5,7 +5,7 @@
 //!   64 KiB..64 MiB and never larger than the input. Small inputs get a high preset (9), large ones
 //!   lower presets. Inputs >= 64 MiB use the multi-threaded LZMA2 encoder (<= 4 threads).
 //! - Zstandard: used for very large inputs (>= 4 GiB), when memory does not allow a useful LZMA2
-//!   dictionary (< 4 MiB), or when the user picks "빠름". sevenz-rust2 0.24 only exposes the level
+//!   dictionary (< 4 MiB), or when the user picks "Fast". sevenz-rust2 0.24 only exposes the level
 //!   (no window/thread options), so levels are capped at 19 (zstd's window for those levels stays
 //!   far below the 128 MiB decoder limit) and encoding is single-threaded.
 //! - Files that already look compressed (by extension or a 64 KiB byte-entropy sample) are stored
@@ -28,10 +28,10 @@ impl Strength {
     pub const ALL: [Strength; 4] = [Strength::Auto, Strength::Fast, Strength::Balanced, Strength::Max];
     pub fn label(self) -> &'static str {
         match self {
-            Strength::Auto => "자동 (권장)",
-            Strength::Fast => "빠름 (Zstandard)",
-            Strength::Balanced => "균형",
-            Strength::Max => "최대 (느림)",
+            Strength::Auto => crate::i18n::t("comp.auto"),
+            Strength::Fast => crate::i18n::t("comp.fast"),
+            Strength::Balanced => crate::i18n::t("comp.balanced"),
+            Strength::Max => crate::i18n::t("comp.max"),
         }
     }
 }

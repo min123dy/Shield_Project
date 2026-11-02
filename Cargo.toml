@@ -1,6 +1,6 @@
 [package]
 name = "shield"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 
 [dependencies]
@@ -15,21 +15,30 @@ unicode-normalization = "0.1"
 eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
 rfd = "0.14"
 
+[dev-dependencies]
+ab_glyph = "0.2"
+
 [build-dependencies]
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
   "Win32_Foundation",
+  "Win32_Globalization",
+  "Win32_Graphics_Dwm",
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
   "Win32_System_DataExchange",
+  "Win32_System_IO",
   "Win32_System_LibraryLoader",
   "Win32_System_Memory",
+  "Win32_System_Registry",
   "Win32_System_SystemInformation",
   "Win32_System_Threading",
+  "Win32_System_Time",
   "Win32_System_Diagnostics_Debug",
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(unix)'.dependencies]

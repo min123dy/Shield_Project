@@ -7,6 +7,8 @@ use crate::compress::{self, Strength};
 use crate::crypto::{encrypt_stream, make_slot, open_slot, read_header, stream_body, ChunkReader, Cred, Header};
 use crate::entropy::rand_hex;
 use crate::format::*;
+use crate::i18n::{t, tf};
+use crate::lock::{lock_container, Mode};
 use crate::manifest::{compare, shred_listed, Digests, Manifest};
 use std::collections::BTreeSet;
 use crate::progress::*;
@@ -42,6 +44,26 @@ pub struct Opts {
     pub strength: Strength,
     /// Key file paths (only for the overlap check; the digest is in `Cred`).
     pub keyfiles: Vec<PathBuf>,
+    /// What to do with alternate data streams of files that will be shredded (B-9).
+    pub streams: StreamPolicy,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StreamPolicy {
+    /// Stop with `C_ADS` when a file to be shredded has streams other than Zone.Identifier
+    /// (the UI then asks; Zone.Identifier-only files are overwritten with a short note).
+    Ask,
+    /// The user chose to overwrite every stream before the files are deleted.
+    Include,
+}
+
+pub const C_ADS: &str = "E_ADS";
+
+/// Decryption options.
+#[derive(Clone, Copy, Default)]
+pub struct DecOpts {
+    /// Settings > Security > strict Mark of the Web: failing to copy it is an error.
+    pub strict_motw: bool,
 }
 
 /// Removes a temporary output file unless `keep` was called (errors, cancel, panic).
@@ -68,12 +90,12 @@ pub fn parent_dir(p: &Path) -> PathBuf {
 
 fn comp_desc(m: &Meta) -> String {
     let base = match m.comp_method {
-        COMP_LZMA2 => format!("LZMA2 레벨 {} · 사전 {}", m.comp_level, human(m.comp_dict as u64)),
-        COMP_ZSTD => format!("Zstandard 레벨 {}", m.comp_level),
+        COMP_LZMA2 => tf("eng.lzma2_desc", &[&m.comp_level, &human(m.comp_dict as u64)]),
+        COMP_ZSTD => tf("eng.zstd_desc", &[&m.comp_level]),
         _ => comp_name(m.comp_method).to_string(),
     };
     if m.flags & FLAG_SOME_STORED != 0 {
-        base + " (이미 압축된 파일은 무압축 저장)"
+        base + t("eng.some_stored")
     } else {
         base
     }
@@ -111,11 +133,11 @@ pub fn seal_archive(mut st: SecTemp, outdir: &Path, c: &Cred, mut meta: Meta) ->
 /// chunk, then decompresses everything and compares paths, sizes and SHA3-512 with `want`.
 pub fn verify_container(part: &Path, built: &Header, c: &Cred, want: &Digests, want_dirs: &BTreeSet<String>, total: u64) -> R<()> {
     set_stage(ST_VERIFY);
-    let fail = |w: &str| format!("검증 실패: {w} — 결과 파일을 삭제했고 원본은 그대로입니다.");
+    let fail = |w: &str| tf("eng.verify_failed", &[&w]);
     let mut f = File::open(part).map_err(e)?;
     let h = read_header(&mut f, c).map_err(|x| fail(&x))?;
     if !crate::password::ct_eq(&h.dek[..], &built.dek[..]) || h.meta != built.meta {
-        return Err(fail("다시 연 키가 다릅니다"));
+        return Err(fail(t("eng.key_differs")));
     }
     stream_body(&mut f, &h, &mut io::sink()).map_err(|x| fail(&x))?;
     let mut cr = ChunkReader::new(f, &h);
@@ -127,10 +149,10 @@ pub fn verify_container(part: &Path, built: &Header, c: &Cred, want: &Digests, w
 
 fn check_paths(src: &Path, dst: &Path, keyfiles: &[PathBuf]) -> R<()> {
     if fs::symlink_metadata(dst).is_ok() {
-        return Err("출력 파일이 이미 있습니다. 덮어쓰지 않습니다.".into());
+        return Err(t("eng.out_exists").into());
     }
     if sysinfo::is_within(dst, src) {
-        return Err("출력 파일이 원본과 같거나 원본 폴더 안에 있습니다.".into());
+        return Err(t("eng.out_inside").into());
     }
     crate::keyfile::check_overlap(keyfiles, &[src, dst])
 }
@@ -140,17 +162,30 @@ pub fn do_encrypt(src: &Path, dst: &Path, c: &Cred, o: &Opts) -> R<String> {
     set_stage(ST_SCAN);
     check_paths(src, dst, &o.keyfiles)?;
     if o.shred_src && fs::symlink_metadata(src).map_err(e)?.file_type().is_symlink() {
-        return Err("바로가기/링크(정션)는 원본 파쇄와 함께 쓸 수 없습니다. 링크 대상 폴더를 직접 선택하세요.".into());
+        return Err(t("eng.link_shred").into());
     }
     let mut m = Manifest::default();
     Manifest::scan(src, "", &mut m)?;
     if m.files.is_empty() && m.dirs.is_empty() {
-        return Err("암호화할 항목이 없습니다 (링크·특수 파일만 있음).".into());
+        return Err(t("eng.nothing").into());
     }
+    // B-9: checked before any work, so "abort" costs nothing
+    let ads = if o.shred_src {
+        set_stage(ST_ADS);
+        let a = crate::ads::scan(m.files.iter().map(|r| r.path.as_path()))?;
+        if o.streams == StreamPolicy::Ask && (!a.data.is_empty() || !a.errors.is_empty()) {
+            let first = a.data.first().map(|(p, v)| format!("{} ({})", p.display(), v.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")));
+            let detail = first.or_else(|| a.errors.first().cloned()).unwrap_or_default();
+            return Err(format!("{} [{C_ADS}]", tf("eng.ads_found", &[&(a.data.len() + a.errors.len()), &detail])));
+        }
+        a
+    } else {
+        crate::ads::AdsScan::default()
+    };
     let is_dir = fs::metadata(src).map_err(e)?.is_dir();
     let name = src.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let outdir = parent_dir(dst);
-    sysinfo::require_space(&outdir, m.total.saturating_mul(2).saturating_add(m.total / 8).saturating_add(64 << 20), "임시 압축본 + 결과 파일")?;
+    sysinfo::require_space(&outdir, m.total.saturating_mul(2).saturating_add(m.total / 8).saturating_add(64 << 20), t("eng.space_enc"))?;
     let disk = if o.shred_src { detect_disk(src) } else { Disk::Unknown };
     let plan = compress::plan(m.total, sysinfo::avail_mem(), sysinfo::cores(), o.strength);
     let mut meta = Meta::new(&name, FLAG_ARCHIVE | if is_dir { FLAG_DIR } else { 0 });
@@ -166,12 +201,12 @@ pub fn do_encrypt(src: &Path, dst: &Path, c: &Cred, o: &Opts) -> R<String> {
     let (mut want, mut want_dirs) = (Digests::new(), BTreeSet::new());
     m.expected(&mut want, &mut want_dirs)?;
     verify_container(&part.path, &h, c, &want, &want_dirs, m.total)?;
-    rename_noreplace(&part.path, dst).map_err(|x| format!("결과 파일을 저장하지 못했습니다 (덮어쓰지 않음): {x}"))?;
+    rename_noreplace(&part.path, dst).map_err(|x| tf("eng.save_failed", &[&x]))?;
     part.keep();
 
-    let mut msg = format!("암호화·복원 검증 완료 ({}, 파일 {}개)", comp_desc(&h.meta), m.files.len());
+    let mut msg = tf("eng.enc_done", &[&comp_desc(&h.meta), &m.files.len()]);
     if m.skipped > 0 {
-        msg += &format!(" · 링크·특수 파일 {}개는 포함하지 않음", m.skipped);
+        msg += &tf("eng.skipped", &[&m.skipped]);
     }
     if let Some(w) = warn {
         msg += &format!(" · {w}");
@@ -182,10 +217,15 @@ pub fn do_encrypt(src: &Path, dst: &Path, c: &Cred, o: &Opts) -> R<String> {
     let passes = if o.force7 || disk != Disk::Ssd { 7 } else { 1 };
     set_stage(ST_SHRED); // from here on: no cancel
     progress_start(m.total.saturating_mul(passes as u64));
-    let rep = shred_listed(&m, passes);
+    let rep = shred_listed(&m, passes, !ads.is_empty());
     msg += &format!(" · {}", rep.summary(passes));
+    // the result file is saved either way, but a failed overwrite/delete is reported as a failure
+    let mut failed = !rep.failed.is_empty();
+    if !ads.zone_only.is_empty() {
+        msg += &tf("eng.zone_only", &[&ads.zone_only.len()]);
+    }
     if disk != Disk::Hdd {
-        msg += " · SSD·스냅샷·클라우드 폴더에서는 물리적 삭제를 보장할 수 없음";
+        msg += t("eng.no_guarantee");
     }
     let parent = src.parent().map(Path::to_path_buf);
     if o.wipe_free_after {
@@ -193,8 +233,11 @@ pub fn do_encrypt(src: &Path, dst: &Path, c: &Cred, o: &Opts) -> R<String> {
             set_stage(ST_WIPE_FREE);
             match wipe_free_space(p) {
                 Ok(t) => msg += &format!(" · {t}"),
-                Err(x) if x == CANCELLED => msg += " · 여유 공간 덮어쓰기 취소됨",
-                Err(x) => msg += &format!(" · 여유 공간 덮어쓰기 실패({x})"),
+                Err(x) if is_cancel(&x) => msg += t("eng.wipe_cancelled"),
+                Err(x) => {
+                    failed = true;
+                    msg += &tf("eng.wipe_failed", &[&x]);
+                }
             }
         }
     }
@@ -203,11 +246,18 @@ pub fn do_encrypt(src: &Path, dst: &Path, c: &Cred, o: &Opts) -> R<String> {
             set_stage(ST_TRIM);
             match trim_volume(l) {
                 Ok(t) => msg += &format!(" · {t}"),
-                Err(x) => msg += &format!(" · {x}"),
+                Err(x) => {
+                    failed = true;
+                    msg += &format!(" · {x}");
+                }
             }
         }
     }
-    Ok(msg)
+    if failed {
+        Err(msg)
+    } else {
+        Ok(msg)
+    }
 }
 
 pub fn safe_name(n: &str) -> Option<String> {
@@ -237,24 +287,25 @@ pub fn move_out(item: &Path, dir: &Path, name: &str, is_dir: bool) -> R<(PathBuf
         match rename_noreplace(item, &dest) {
             Ok(()) => return Ok((dest, i > 0)),
             Err(x) if x.kind() == io::ErrorKind::AlreadyExists || fs::symlink_metadata(&dest).is_ok() => continue,
-            Err(x) => return Err(format!("결과를 옮기지 못했습니다: {x}")),
+            Err(x) => return Err(tf("eng.move_failed", &[&x])),
         }
     }
-    Err("사용할 수 있는 이름이 없습니다.".into())
+    Err(t("eng.no_name").into())
 }
 
 /// Opens + fully authenticates into SecTemp, checks the 7z structure and limits, extracts into a
 /// private staging folder, then moves the result next to the .shd (never overwriting).
-pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred) -> R<String> {
+pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred, o: DecOpts) -> R<String> {
     let fname = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let fallback = safe_name(fname.strip_suffix(".shd").unwrap_or(fname)).unwrap_or_else(|| "decrypted".to_string());
+    let _lock = lock_container(src, Mode::Shared)?; // before the key derivation
     set_stage(ST_DECRYPT);
     let mut f = File::open(src).map_err(e)?;
     let h = read_header(&mut f, c)?;
     if h.meta.comp_method == COMP_LZMA2 && h.meta.comp_dict as u64 > sysinfo::avail_mem() / 2 {
-        return Err(format!("가용 메모리가 부족합니다 (LZMA2 사전 {}).", human(h.meta.comp_dict as u64)));
+        return Err(tf("eng.no_mem", &[&human(h.meta.comp_dict as u64)]));
     }
-    sysinfo::require_space(outdir, h.meta.real_len.saturating_add(h.meta.total_unpacked).saturating_add(64 << 20), "임시 압축본 + 복원 결과")?;
+    sysinfo::require_space(outdir, h.meta.real_len.saturating_add(h.meta.total_unpacked).saturating_add(64 << 20), t("eng.space_dec"))?;
     let mut st = SecTemp::create(outdir).map_err(e)?;
     stream_body(&mut f, &h, &mut st)?; // every chunk authenticated before extraction starts
     drop(f);
@@ -263,8 +314,9 @@ pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred) -> R<String> {
     set_stage(ST_EXTRACT);
     let len = st.len();
     let listing = archive::inspect(&mut st, len)?;
+    archive::check_against_meta(&listing, &h.meta)?; // B-1: the 7z list must match the authenticated meta
     let stage = Stage::create(outdir)?;
-    let r = archive::extract(&mut st, &stage.path, listing.total, &|n| Some(n.to_string()));
+    let r = archive::extract(&mut st, &stage.path, h.meta.total_unpacked, &|n| Some(n.to_string()));
     let warn = st.destroy().err().map(|x| x.to_string());
     if let Err(x) = r {
         return Err(match stage.abort() {
@@ -290,11 +342,13 @@ pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred) -> R<String> {
         stage.finish()?;
         r
     };
-    let mut msg = format!(
-        "복호화 완료: {}{}",
-        dest.display(),
-        if renamed { " (같은 이름이 이미 있어 '(decrypted)'를 붙임)" } else { "" }
-    );
+    let motw = crate::ads::propagate(src, std::slice::from_ref(&dest), o.strict_motw);
+    let mut msg = tf("eng.dec_done", &[&dest.display(), &if renamed { t("eng.renamed") } else { "" }]);
+    match motw {
+        Ok(Some(w)) => msg += &format!(" · {w}"),
+        Ok(None) => {}
+        Err(x) => return Err(tf("eng.motw_strict", &[&dest.display(), &x])),
+    }
     if let Some(w) = warn {
         msg += &format!(" · {w}");
     }
@@ -310,8 +364,9 @@ pub fn do_change_password(path: &Path, old: &Cred, new: &Cred) -> R<String> {
     set_stage(ST_REWRAP);
     crate::crypto::kdf_params(new.pim)?;
     if new.is_empty() {
-        return Err("새 비밀번호 또는 새 키 파일이 필요합니다.".into());
+        return Err(t("eng.need_new").into());
     }
+    let _lock = lock_container(path, Mode::Exclusive)?; // held until the old slot is destroyed
     let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(e)?;
     let h = read_header(&mut f, old)?;
     let spare = 1 - h.slot_idx;
@@ -323,7 +378,7 @@ pub fn do_change_password(path: &Path, old: &Cred, new: &Cred) -> R<String> {
     let mut head2 = [0u8; SLOTS];
     f.seek(SeekFrom::Start(0)).map_err(e)?;
     io::Read::read_exact(&mut f, &mut head2).map_err(e)?;
-    let fail = || "새 키 검증 실패: 기존 키 슬롯은 그대로 유지됩니다.".to_string();
+    let fail = || t("eng.new_key_failed").to_string();
     let k2 = open_slot(new, &head2[spare * SLOT..(spare + 1) * SLOT])?.ok_or_else(fail)?;
     if !crate::password::ct_eq(&k2[..], &h.dek[..]) {
         return Err(fail());
@@ -340,7 +395,7 @@ pub fn do_change_password(path: &Path, old: &Cred, new: &Cred) -> R<String> {
         f.write_all(&b).map_err(e)?;
         f.sync_all().map_err(e)?;
     }
-    Ok("비밀번호 변경 완료: 기존 키 슬롯을 7회 덮어써 파기했습니다. 백업본·클라우드 버전 기록은 이전 비밀번호로 계속 열릴 수 있습니다.".into())
+    Ok(t("eng.pw_changed").into())
 }
 
 /// Writer that hashes everything going through it (SHA3-512).
@@ -368,14 +423,15 @@ fn stamp(p: &Path) -> R<(u64, Option<std::time::SystemTime>)> {
 /// (optionally under new credentials) and verified before the original is atomically replaced.
 pub fn do_full_rekey(path: &Path, old: &Cred, new: &Cred) -> R<String> {
     if new.is_empty() {
-        return Err("새 비밀번호 또는 새 키 파일이 필요합니다.".into());
+        return Err(t("eng.need_new").into());
     }
+    let _lock = lock_container(path, Mode::Exclusive)?; // held through the final rename
     let before = stamp(path)?;
     let dir = parent_dir(path);
     set_stage(ST_DECRYPT);
     let mut f = File::open(path).map_err(e)?;
     let h = read_header(&mut f, old)?;
-    sysinfo::require_space(&dir, h.meta.real_len.saturating_mul(2).saturating_add(64 << 20), "임시 압축본 + 새 파일")?;
+    sysinfo::require_space(&dir, h.meta.real_len.saturating_mul(2).saturating_add(64 << 20), t("eng.space_rekey"))?;
     let st = SecTemp::create(&dir).map_err(e)?;
     let mut hw = HashWriter { w: st, h: Sha3_512::new() };
     stream_body(&mut f, &h, &mut hw)?;
@@ -398,24 +454,24 @@ pub fn do_full_rekey(path: &Path, old: &Cred, new: &Cred) -> R<String> {
 
     set_stage(ST_VERIFY);
     let mut g = File::open(&part.path).map_err(e)?;
-    let vh = read_header(&mut g, new).map_err(|x| format!("검증 실패: {x} — 원본은 그대로입니다."))?;
+    let vh = read_header(&mut g, new).map_err(|x| tf("eng.rekey_verify", &[&x]))?;
     if !crate::password::ct_eq(&vh.dek[..], &nh.dek[..]) {
-        return Err("검증 실패: 다시 연 키가 다릅니다 — 원본은 그대로입니다.".into());
+        return Err(tf("eng.rekey_verify", &[&t("eng.key_differs")]));
     }
     let mut hw2 = HashWriter { w: io::sink(), h: Sha3_512::new() };
     stream_body(&mut g, &vh, &mut hw2)?;
     let got: [u8; 64] = hw2.h.finalize().into();
     if !crate::password::ct_eq(&got, &want) {
-        return Err("검증 실패: 다시 암호화한 내용이 원본과 다릅니다 — 원본은 그대로입니다.".into());
+        return Err(tf("eng.rekey_verify", &[&t("eng.content_differs")]));
     }
     drop(g);
     if stamp(path)? != before {
-        return Err("작업 중에 원본 .shd 파일이 바뀌어 교체하지 않았습니다.".into());
+        return Err(t("eng.changed_meanwhile").into());
     }
     set_stage(ST_REPLACE);
-    rename_replace(&part.path, path).map_err(|x| format!("교체 실패 (원본 유지): {x}"))?;
+    rename_replace(&part.path, path).map_err(|x| tf("eng.replace_failed", &[&x]))?;
     part.keep();
-    let mut msg = "전체 키 교체 완료: 새 DEK·솔트·nonce·패딩으로 전체를 다시 암호화하고 검증했습니다. 이전 파일의 백업본은 이전 키로 계속 열릴 수 있습니다.".to_string();
+    let mut msg = t("eng.rekey_done").to_string();
     if let Some(w) = warn {
         msg += &format!(" · {w}");
     }
