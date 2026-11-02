@@ -69,12 +69,18 @@ fn parse_args(args: &[String], start: settings::StartScreen) -> Start {
 
 fn main() {
     harden::harden_process();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Elevated TRIM helper started by wipe::trim_volume through UAC: must exit before any
+    // window is created (without this the helper opens a second Shield window and never trims).
+    #[cfg(windows)]
+    if args.first().map(String::as_str) == Some(wipe::RETRIM_ARG) {
+        std::process::exit(wipe::retrim_main(args.get(1).filter(|_| args.len() == 2).map(String::as_str)));
+    }
     // E-5: settings are read once, here; changes are saved atomically and applied live
     let set = settings::Settings::load();
     i18n::set_lang(set.effective_lang());
     ui_fmt::set_date_style(set.date_fmt, set.date_seconds);
     entropy::set_mouse_enabled(set.mouse_entropy);
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let start = parse_args(&args, set.start_screen);
     let title = match &start {
         Start::Enc(_) => "Shield",

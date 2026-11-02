@@ -105,6 +105,11 @@ fn seek_penalty(l: char) -> Option<bool> {
 #[cfg(windows)]
 pub const RETRIM_ARG: &str = "--retrim";
 
+/// Exit code of a helper that really trimmed. Not 0: a Shield that ignored `--retrim` and opened
+/// its normal window also exits with 0, and that must never be reported as a finished TRIM.
+#[cfg(windows)]
+const RETRIM_OK: i32 = 0x5452; // "TR"
+
 /// Asks the volume to TRIM all free space through the Storage Management API (WMI
 /// MSFT_Volume.Optimize with ReTrim, what Optimize-Volume -ReTrim calls). Needs administrator
 /// rights: tries directly first, then once through a UAC prompt that runs this executable as
@@ -120,20 +125,20 @@ pub fn trim_volume(l: char) -> R<String> {
     }
     const ERROR_CANCELLED: i32 = 1223; // the user declined the UAC prompt
     match run_elevated(&format!("{RETRIM_ARG} {l}")) {
-        Ok(0) => Ok(tf("wipe.trim_done_admin", &[&l])),
+        Ok(c) if c == RETRIM_OK as u32 => Ok(tf("wipe.trim_done_admin", &[&l])),
         Err(x) if x.raw_os_error() == Some(ERROR_CANCELLED) => Err(t("wipe.trim_denied").into()),
         _ => Err(tf("wipe.trim_failed", &[&l])),
     }
 }
 
-/// Entry point of the elevated helper. Accepts exactly one drive letter; exit code 0 on success,
-/// 2 on a bad argument, 3 when the TRIM request failed.
+/// Entry point of the elevated helper. Accepts exactly one drive letter; exit code RETRIM_OK on
+/// success, 2 on a bad argument, 3 when the TRIM request failed.
 #[cfg(windows)]
 pub fn retrim_main(arg: Option<&str>) -> i32 {
     let mut c = arg.unwrap_or("").chars();
     match (c.next(), c.next()) {
         (Some(l), None) if l.is_ascii_alphabetic() => match retrim_wmi(l.to_ascii_uppercase()) {
-            Ok(()) => 0,
+            Ok(()) => RETRIM_OK,
             Err(_) => 3,
         },
         _ => 2,
