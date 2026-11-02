@@ -256,14 +256,10 @@ pub fn mouse_meter(ui: &mut egui::Ui, compact: bool) {
         let bar = if compact { bar.text(format!("{:.0}%", f * 100.0)) } else { bar.desired_width(260.0) };
         ui.add(bar).on_hover_text(tf("set.mouse_count", &[&samples]));
     });
-    // Keep the sample count on its own fixed line below the bar. The movement tip
-    // occupies a separate line, so a growing sample count cannot shift its position.
-    // Once collection reaches 100%, only the sample count remains visible.
+    // Keep the sample count and the movement tip together on one line below the bar.
+    // The tip remains visible even after the meter reaches 100%.
     let count = tf("set.mouse_count", &[&samples]);
-    hint(ui, count);
-    if compact && !done {
-        hint(ui, t("ui.mouse_hint"));
-    }
+    hint(ui, if compact { format!("{} · {}", count, t("ui.mouse_hint")) } else { count });
 }
 
 /// Memory-protection warnings (shown when a lock failed).
