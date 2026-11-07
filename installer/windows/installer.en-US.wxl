@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- English texts of installer.wxs, and overrides of the WixUI texts (the first page shows
+     cautions and usage, not a license). -->
+<WixLocalization Culture="en-US" Codepage="1252" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="Lcid" Value="1033" />
+  <String Id="Codepage" Value="1252" />
+  <String Id="WelcomeEulaDlgTitle" Value="{\WixUI_Font_Title}Please read the cautions and usage of [ProductName] before installing." />
+  <String Id="WelcomeEulaDlgLicenseAcceptedCheckBox" Value="I have read and understood the cautions (&amp;A)" />
+  <String Id="Downgrade" Value="A newer version of Shield is already installed. Uninstall it first." />
+  <String Id="ExitText" Value="Setup is complete. Use Shield and the Shield file manager from the Start menu, the Explorer context menu, or the shield command in a terminal (shield help). Open a new terminal for the PATH change." />
+  <String Id="LaunchNow" Value="Start Shield now" />
+  <String Id="ShortcutDesc" Value="Shield file encryption" />
+  <String Id="ManagerName" Value="Shield file manager" />
+  <String Id="ManagerDesc" Value="Browse files and open .shd containers" />
+  <String Id="GuideSource" Value="docs\en\03_usage.txt" />
+  <String Id="GuideName" Value="Usage.txt" />
+  <String Id="GuideShortcut" Value="Shield user guide" />
+  <String Id="GuideDesc" Value="How to use Shield" />
+  <String Id="VerbEncrypt" Value="Encrypt with Shield" />
+  <String Id="VerbDecrypt" Value="Decrypt with Shield" />
+  <String Id="VerbOpen" Value="Open in SHIELD" />
+</WixLocalization>

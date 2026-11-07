@@ -1,0 +1,131 @@
+SHIELD 3.0.0 - Project overview
+===============================
+
+1. Scope
+--------
+Source layout, programs, cryptography, file format, safety measures and known limits. Changes from 2.1.0 and the OS
+support table: 06_changes_3.0.0.txt. Tests and the security audit: 05_test_and_audit.txt. 한국어: docs\01_프로젝트_설명.txt
+
+2. Programs and windows (Windows and Linux)
+-------------------------------------------
+- shield-gui (Windows: shield-gui.exe, no console): two windows
+  · encryption window: Encrypt / Decrypt / Password & keys / Disk cleanup / Algorithms / Settings / Guide
+  · file manager (--manager, --open): browse, open .shd, extract some or all, add, delete, check the body
+  · arguments used by context menus: --encrypt-multi <items...>, --decrypt <c>, --open <c>, --manager, --settings
+- shield (Windows: shield.exe, console): the command-line program. The MSI adds the install folder to the system PATH;
+  the deb installs /usr/bin/shield. Builds with the gui feature also open windows with "shield gui ...".
+- Console-only builds (shield-console_v3.0.0_*): one file without any GUI dependency (eframe, rfd ...). The Linux one
+  is statically linked with musl.
+- Portable: Shield_v3.0.0_x64_portable.exe (a name ending in _portable keeps settings in Shield_data next to the exe),
+  Linux AppImage (Shield_v3.0.0_x86_64.AppImage, "cli <command>" runs console commands).
+- Explorer starts one process per selected item. Each writes its item into data_dir\spool; the one holding leader.lck
+  collects until 0.7 s pass quietly (8 s at most) and opens a single window, which asks "one container / separately"
+  and lets the user remove or add items.
+
+3. Workspace and crates
+-----------------------
+crates/shield-platform  OS code only (Windows: windows-sys, Linux: libc). trait Platform and file primitives.
+    windows/  fs (file IDs, protected DACLs, MoveFileEx), mem (VirtualLock, mitigation policies), storage (disk type,
+              TRIM via ReTrim, through UAC with System32 defrag /L when needed, VSS check, cipher /w), shell (HKCU menus),
+              sys (DPAPI, msiexec ...), entropy (extra sources), install (MSI updates)
+    linux/    fs (O_NOFOLLOW, 0600/0700, renameat2 RENAME_NOREPLACE, directory fsync), mem (mlock, RLIMIT_CORE=0,
+              PR_SET_DUMPABLE=0), storage (/proc/self/mountinfo, rotational, dm-crypt / LVM / NVMe, FITRIM, LUKS discard
+              check, btrfs / ZFS / LVM / Timeshift / Snapper snapshot checks, free-space fill), shell (.desktop, MIME,
+              Nautilus / Nemo / Dolphin / Thunar), sys (XDG paths, /proc start times, pkexec), entropy,
+              install (deb: pkexec apt-get, AppImage: write next to it and rename)
+crates/shield-core      no OS branches (no cfg(windows)). Engine and all string tables.
+    crypto, format, engine, rekey, container, archive, compress, manifest, staging, sectemp, keyfile, password,
+    lock (std File::try_lock = Windows LockFileEx / Linux flock), wipe, ads, harden, progress, job, i18n + lang\
+    (ko/en × core/ui/v3/cli, guide), help, ui_fmt, outname (output naming), entropy\ (pool v4, health tests),
+    settings (+ settings_auth: settings password), sigverify (OpenPGP verification), buildinfo (repository URL,
+    embedded public key, self check), update (GitHub release check, download, verification, install),
+    spool (collecting several items), cross_os_tests (containers made on both OSes open on both)
+    build.rs embeds SHIELD_REPO_URL (only https://github.com/<owner>/<repo>; anything else stops the build) and
+    SHIELD_PUBKEY_PATH (default keys/release_key.asc; a file with a secret key stops the build)
+crates/shield-gui       egui windows. lib (run(Start)) + bin shield-gui.
+    enc_app/enc_jobs/enc_views (encryption window), mgr_app/mgr_ops/mgr_views (file manager), settings_view,
+    settings_pw (settings password; Argon2id on a worker thread), update_ui (updates, developer info, integrity),
+    shell (common frame, auto-lock, input timing entropy), dialogs/ui/ui_table/theme/capture/icon
+    examples/export_icon.rs: build tool writing the PNG icons for packages (not shipped)
+crates/shield-cli       console program shield. args (table-driven parser), secret (secret input), cred (credential
+    rules), cmds (container commands), tools (keyfile/verify/update/entropy/version), out (output, exit codes, progress)
+    feature gui (default): depends on shield-gui for "shield gui ..." and the window arguments. Off = console only.
+installer/windows  installer.wxs + installer.ko-KR.wxl / installer.en-US.wxl
+installer/linux    shield.desktop, shield-open.desktop, shield-mime.xml, postinst/postrm, filemanagers\
+build.ps1 / build.sh / .github/workflows/release.yml
+
+4. Cryptography (same as 2.1.0, nothing weakened)
+-------------------------------------------------
+- Data, metadata, key slots, temp files: XChaCha20-Poly1305 (256-bit key, 192-bit nonce)
+- KDF: Argon2id v1.3, 256 MiB, parallelism 4, iterations 3+PIM (PIM 0-64, default 12)
+- Header authentication, encrypted metadata (format version and algorithm IDs only inside), SHA3-512 restore check
+- Keys are wiped after each task and never kept; every task asks for the password again (windows and console).
+- Passwords: Unicode NFC, at most 256 bytes (longer is refused), constant-time comparison
+
+New uses in 3.0
+  settings password   Argon2id (128 MiB, t=3, p=4, 16-byte salt) -> HKDF-SHA3-512("SHIELD-SET-v3") gives a 32-byte
+                      verifier and a 32-byte MAC key. Protected values: HMAC-SHA3-512("SHIELD-SET-MAC-v2\n" + text)
+                      (the v1 MAC written by 3.0.0 is still read). The MAC key file is sealed with DPAPI + entropy
+  random pool         SHA3-512 absorption, output HKDF-SHA3-512(64 OS bytes | pool | counter), remix after output
+  updates, integrity  OpenPGP detached signatures (rPGP 0.21; brainpool via RustCrypto bp256/bp384 + ecdsa),
+                      SHA-256 from a signed release manifest, HTTPS (ureq 3 + rustls, certificates validated)
+  checksum list       SHA-256 (SHA256SUMS.txt, sha256sum -c format)
+
+5. File format v2 (unchanged)
+-----------------------------
+  [slot 0: 88 B][slot 1: 88 B][nonce prefix 15 B][meta 512 B + tag 16][chunks 64 KiB + tag 16] ...
+Header 719 bytes. No magic bytes. Windows and Linux write byte-identical formats; a test opens fixed containers made on
+each OS (tests/fixtures/container). 2.x containers open unchanged. Several items bundled into one container are stored
+under a folder named after the container and unpack into it.
+
+6. New safety measures in 3.0 (summary; details in 06)
+------------------------------------------------------
+- Entropy: the OS CSPRNG is always the base and can't be disabled; if it fails, the task stops. Extra sources are only
+  mixed in; their state shows only "Normal / Weak" (values are never shown, stored or sent). Console commands never
+  collect window state, input timing or mouse data. No /dev/input, no Wayland global coordinates.
+- Overwriting: 3 or 7 passes (asked every time, default in the settings), key areas always 7, snapshot warning before
+  overwriting, TRIM at the end (failure is shown, the task still succeeds). The old container after rekey, add and
+  delete is overwritten too (2.1 did not).
+- Updates: off by default, check-only / auto-download, always asked before installing, strict vX.Y.Z tags, same or
+  older versions refused, signature failures delete the file and stop, nothing identifying is sent (User-Agent
+  "Shield-Updater" only), offline fails silently, secrets wiped before installing, private temp folder.
+- Console: no-echo secret input, --reveal screen cleared with the scrollback after Enter, argument passwords off by
+  default (setting + --allow-arg-secrets + a warning every time), no environment or file input, first Ctrl+C / SIGTERM /
+  SIGHUP cancels, the second wipes the entropy pool and exits.
+- Settings protection: security settings (capture protection, mouse entropy, entropy sources, argument passwords,
+  default passes, updates, auto-lock, lock on focus loss ...) change only after entering the settings password. Edits
+  from outside break the MAC and reset the protected values to safe defaults. A file without a settings password is
+  valid only with the defaults (deleting the auth lines and settings.key leaves the defaults and a warning). Wrong
+  passwords wait 1 s, doubling up to 30 s.
+
+7. Known limits
+---------------
+- Malware running as the same user, administrators/root, the kernel and physical access are not stopped.
+- On Linux the settings MAC key file (settings.key) is only a 0600 file, not sealed (Windows uses DPAPI with extra
+  entropy: tools that unseal all DPAPI data at once get nothing, a same-user program that knows Shield does). A program
+  running as the same user can read it and forge the MAC. Settings protection guards against other accounts and mistakes.
+- The settings password retry delay counts within one process. A new console run starts at 0; then only the Argon2id
+  cost (128 MiB) remains.
+- The self check finds changed or damaged programs but not a program whose embedded public key was replaced too.
+  Compare the fingerprint shown with the one the developer published separately.
+- brainpoolP512r1 signing keys are not supported (256/384, Ed25519, NIST P curves and RSA are, through rPGP).
+- A password given as an argument stays in the OS's copy of the command line (Task Manager, /proc/<pid>/cmdline, shell
+  history) even though Shield wipes its own copy. That is why it is off by default.
+- On the Windows console, TRIM shows a UAC prompt when not elevated; without an answer that stage waits.
+- A same-user process can change files between check and use (TOCTOU). Shield re-checks handles, file IDs, sizes and
+  times and refuses most cases, but not all.
+- On SSDs, flash, COW file systems (btrfs, ZFS), snapshots and cloud folders, overwriting and TRIM don't guarantee
+  physical erasure.
+- Screen capture protection is not available on Wayland or X11 ("not available, switched off (reason)" in the
+  settings).
+- Window positions can't be remembered on Wayland (the window manager places windows).
+- The AppImage and the GUI use the system GTK3. Without an encrypted swap, memory whose mlock failed can be swapped
+  to disk (encrypted swap or none recommended).
+- egui copies input events and drawn text internally (same as 2.x).
+- No independent external security audit.
+
+8. Verification status
+----------------------
+See 05_test_and_audit.txt. In short: cargo test --workspace passes on Windows and on Linux (Docker, Debian bookworm),
+0 clippy warnings, the static musl console build works. Not tested by hand: real MSI install/uninstall, an update from
+a real GitHub release, the menus on real desktops (GNOME, KDE, Xfce).

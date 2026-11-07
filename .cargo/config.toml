@@ -1,0 +1,7 @@
+# Windows (MSVC): the C runtime is linked statically, so the programs need no vcruntime140.dll.
+# That DLL is not a Windows "known DLL": the loader looked for it next to the exe first (a
+# planted copy ran inside Shield), and on a PC without the Visual C++ runtime the portable exe
+# did not start at all (security review 2026-11-08). Also see shield-gui/build.rs and
+# shield-cli/build.rs (/DEPENDENTLOADFLAG:0x800). Do not override with a RUSTFLAGS variable.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

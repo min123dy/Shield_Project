@@ -1,0 +1,197 @@
+SHIELD 3.0.0 - Usage and safety notes
+====================================
+
+This file opens again from "Shield user guide" in the Start menu and as "usage.txt" in the install folder
+(Linux: /usr/share/doc/shield). The 'Guide' tab of both windows has the essentials. 한국어: docs\03_사용_방법.txt
+
+0. Installing and upgrading
+---------------------------
+- Windows: Shield_v3.0.0_x64.msi. Read the notes on the first page, tick the box, [Install]. Older versions are
+  upgraded. The install folder is added to PATH, so the shield command works in a new terminal.
+- Linux: sudo apt install ./shield_v3.0.0_amd64.deb (app menu, /usr/bin/shield, file manager entries, .shd type).
+  Without installing: chmod +x Shield_v3.0.0_x86_64.AppImage and run it, or the console-only
+  shield-console_v3.0.0_linux_x64.
+- 3.0 uses the 2.x file format and opens 2.x containers. The 1.x format is not opened.
+- Verify downloads first: gpg --verify <file>.sig <file>, or with an installed Shield
+  shield verify <file> <file>.sig --key <key.asc>. Compare the key fingerprint with the one the developer
+  published separately. The MSI has no Authenticode signature, so SmartScreen may warn.
+
+1. Two windows
+--------------
+- "Shield" (encryption window): Encrypt / Decrypt / Password & keys / Disk cleanup / Algorithms / Settings / Guide.
+- "Shield File Manager": browse folders, open .shd containers, view, extract some, add files, delete items.
+- The button at the top right opens the other window. When a newer version was found a "new version" badge appears.
+- The bottom bar shows stage, progress, speed, time left and [Cancel]. Windows can't be closed during a task
+  (overwriting, TRIM and replacing can't be cancelled).
+
+2. Encrypting
+-------------
+1) [Add files...] / [Choose folder...], drag and drop, or select several items in Explorer and right-click
+   "Encrypt with Shield". With several items a list is shown: remove an item with [×], add more with [Add files...].
+2) With several items choose "One container" (named after the folder) or "Separately" (one .shd per item).
+   When opened from Explorer with several items, the window asks this first.
+3) Enter the password twice. The strength meter is a rough estimate that knows common patterns.
+4) Keep the recommended PIM (12). Add or generate key files if wanted.
+5) Compression: Auto (recommended) / Fast (Zstandard) / Balanced / Maximum.
+6) [Start encryption] -> fix the list -> compress -> encrypt -> verify the restore.
+- The result is "name.shd" ("name (2).shd" if taken). Nothing is overwritten.
+- Restore check: the new file is reopened, every chunk authenticated, everything unpacked and compared with the
+  originals by size and SHA3-512.
+- Weak passwords show a confirmation with the reasons (default button [Cancel]). At most 256 bytes; longer is refused.
+- A pasted password stays on the clipboard: use [Clear clipboard].
+
+3. Key files
+------------
+- "Generate key file...": 1-1024 KiB, private permissions from the start. Console: shield keyfile <path> [--size KiB].
+- Used through their SHA3-512 fingerprint. Empty files, files of one repeated byte and duplicates are refused.
+- A key file inside the items being encrypted can't be used. Key files without a password need a risk confirmation.
+- Never edit key files and keep a backup elsewhere: one changed byte makes them useless.
+
+4. PIM
+------
+- Argon2id iterations (256 MiB, parallelism 4) = 3 + PIM. Default PIM 12 -> 15 iterations. Range 0-64.
+- It is not stored in the file: write it down if you change it.
+
+5. Decrypting
+-------------
+- Pick the .shd, give the same password, PIM and key files -> [Start decryption]. The whole body is authenticated first.
+- Unpacked into a private temp folder, checked, then moved next to the .shd ("(decrypted)" is added if the name is taken).
+- A container made from several items unpacks into a folder named after the container.
+- A downloaded .shd passes its download mark on to every file (Windows Zone.Identifier, Linux user.xdg.origin.url).
+- Wrong password, PIM or key file, damage and "not a Shield file" all show the same message.
+
+6. File manager and "Open in SHIELD"
+-----------------------------------
+- Double-click or drop a .shd, or right-click "Open in SHIELD" -> credentials -> [Open].
+- Key and password are wiped right after the list is read. Checking, extracting, adding and deleting ask again.
+- [Add files...] / [Delete selected...]: a confirmation shows snapshot and storage warnings and the pass count (3/7).
+  The container is rebuilt with a new key, verified and swapped in; the old container's data is overwritten with the
+  chosen passes (key areas always 7), then TRIM runs.
+- After 5 minutes without input, or on [Close], the open container's list is wiped from memory.
+
+7. Password and key change
+--------------------------
+- Change password only (fast): the data key is rewrapped and the old slot overwritten 7 times.
+- Full rekey: new data key, salts, nonces and padding; re-encrypted, verified and swapped in, then the old container
+  is overwritten with the chosen passes (3/7). The confirmation shows snapshot warnings.
+- Either way, older backups, cloud version history and snapshots still open with the old password.
+
+8. Overwrite deletion (shredding, rekey, add, delete)
+----------------------------------------------------
+- 3 passes (00, FF, random) or 7 (00, FF, random, 55, AA, random, random). Chosen in the confirmation each time;
+  default under Settings > Encryption. Key areas such as headers and key slots always get 7 passes.
+- Snapshots are checked and reported before overwriting: Windows volume shadow copies (VSS), Linux btrfs and ZFS
+  snapshots, LVM snapshots, Timeshift, Snapper. Shield never deletes snapshots (needs admin rights; your decision).
+- TRIM runs on the volume at the end (Windows ReTrim, UAC prompt when not admin: Windows' defrag.exe /L runs / Linux FITRIM, pkexec hint when not
+  root, a note when LUKS has discard off). If TRIM fails the task still succeeds and the result says why.
+- Only files from the fixed list whose size, times and file ID are unchanged are overwritten and deleted. Hard links
+  and links are left alone. Hidden streams (ADS) stop the task with a question.
+- Honest limits: SSDs and flash remap writes (wear levelling); copy-on-write file systems (btrfs, ZFS), snapshots and
+  cloud folders keep old blocks. There overwriting and TRIM cannot guarantee physical erasure. Full-disk encryption
+  (BitLocker, LUKS) from the start is the reliable answer.
+
+9. Disk cleanup tab
+-------------------
+- Choose a volume (drive list or [Choose volume by folder...]); the storage type is shown.
+- TRIM, free-space overwrite (Windows cipher /w, Linux fill file; slow, wears SSDs, can be cancelled).
+
+10. After a crash
+-----------------
+- A leftover plaintext temp folder is reported at the next start; [Overwrite and delete now] removes it.
+- Folders in use by another Shield window are not reported (checked by process start time on Windows and Linux).
+
+11. Safety
+----------
+- Losing the password, the PIM or a key file means nobody can decrypt.
+- Test decryption with copies before shredding originals.
+- Memory locking, zeroize and process protection are best effort; same-user malware, administrators/root, the kernel
+  and physical access are out of reach. There are no hidden volumes or deniable storage.
+
+12. Settings
+------------
+Categories: General / Security / Encryption / File manager / Updates. Changes apply at once and are saved atomically.
+- Settings password (top of Security): create one (8+ characters) to change security settings; afterwards unlock it
+  first. While locked, security items are greyed out; auto-lock locks again. Wrong passwords wait 1 s, doubling up to
+  30 s. Only an Argon2id verifier is stored, never the password.
+  The create / change button is always available: unusable passwords (under 8 characters, confirmation differs,
+  too long) are refused with the reason shown; usable but weak ones (under 12 characters, common words, sequences
+  ...) get the same "Weak password" confirmation as encryption.
+- Protected items: screen capture protection, mouse entropy, entropy sources, command-line password arguments, default
+  passes, update mode, auto-lock time, lock on minimize and lock on focus loss, password [Show], clipboard clearing,
+  strict mode. Removing the settings password returns the protected items to their defaults (only the defaults are
+  kept without a password).
+- If settings.toml is edited outside Shield, the MAC no longer matches: protected items go back to safe defaults, the
+  settings password is dropped and a warning is shown. Deleting the auth lines together with settings.key does the
+  same (defaults + warning). A 2.x settings file (no settings password existed) only has its protected items set to
+  the defaults, without a warning.
+- Forgotten settings password (recovery): "Delete settings file" under General (or delete settings.toml and
+  settings.key by hand) -> everything returns to the safe defaults and a new settings password can be created.
+  Containers are not affected. Location: Windows %LOCALAPPDATA%\Shield, Linux $XDG_CONFIG_HOME/shield (usually
+  ~/.config/shield), portable: Shield_data.
+- Language (Korean/English/system), theme (light/dark/system), date format, start screen, default PIM, compression.
+- File manager: hidden files, start folder, sorting, delete confirmation, context menu (this user) register/remove
+  (for portable and AppImage copies).
+- Screen capture protection works on Windows only; on Linux (X11, Wayland) it shows "not available, switched off
+  (reason)" and the settings file keeps your choice (tried again at the next start).
+- Settings > General > Remember window position (on by default): windows open where they were closed; outside the
+  connected screens they open in the centre. Not available on Wayland (no window positions).
+- Tab choices (pick the destination, bundle, wipe free space, overwrite passes ...) stay for the next start.
+  Passwords, key files, PIM, picked files and acknowledgements such as "originals will be deleted" are not kept.
+- Reasons are listed under the password fields while typing. Empty, differing or too long: you can't go on; 12
+  characters or fewer, common or simple: a warning, then you choose in a confirmation.
+
+13. Entropy (Settings > Security > Entropy sources)
+--------------------------------------------------
+- The OS random generator (CSPRNG) is the base of all randomness and can't be turned off. If it fails, the task stops.
+- The other sources (high-resolution timers, CPU jitter, memory/process/system/disk/network statistics, the CPU's
+  hardware RNG, Windows performance data, Linux /proc and sensors, window state, key timing and the mouse inside the
+  Shield window) are only mixed in. Values never leave memory; only "Normal / Weak / Waiting / Off" is shown.
+- Console commands never use window state, input timing or the mouse. Keyboard devices (/dev/input) and global
+  pointer coordinates are never read.
+- Turning sources off needs the settings password (console: shield entropy --disable <source>).
+
+14. Updates and developer info (Settings > Updates)
+---------------------------------------------------
+- Mode: off (default) / check only / download automatically. Installing is always asked first. [Check now] works anytime.
+- Releases of the repository chosen at build time are checked over HTTPS. Only the request itself and the User-Agent
+  "Shield-Updater" are sent; offline checks fail silently (errors only for a manual check).
+- Downloads go to a private temp folder; the built-in key verifies the manifest signature -> version -> SHA-256 -> the
+  installer's signature. Any failure deletes the download and stops. Same or older versions are never installed.
+- Before installing, typed passwords and open containers are wiped. Windows closes Shield and starts the MSI. Linux deb
+  asks for the admin password via pkexec; an AppImage is replaced in place. Portable exe and console-only files are
+  not replaced; the release page is shown.
+- Developer info: [Developer info (GitHub)] opens https://github.com/ links only. [Check program integrity] verifies the
+  .sig next to the program with the built-in key and shows the release key fingerprint: compare it with the published one.
+
+15. Command line (shield)
+-------------------------
+  shield help                                    full help (with exit codes); also -h, --help, -help
+  shield help encrypt / shield encrypt --help    the options of one command (runs nothing)
+  shield encrypt report.pdf photos/ -o all.shd    several items -> one (--separate: one per item)
+  shield encrypt secret.txt --shred --passes 3    overwrite the original 3 times afterwards (asks, warns about snapshots)
+  shield decrypt all.shd -o out_dir
+  shield list all.shd [--json]
+  shield add all.shd new.txt --into docs          shield remove all.shd docs/new.txt
+  shield change-password all.shd                  shield rekey all.shd --passes 7
+  shield keyfile my.key --size 4                  shield verify file file.sig [--key key.asc]
+  shield update [--check]                         shield entropy                shield version
+  shield gui [encrypt|decrypt|explorer|settings|open <c>]
+- Passwords are read without echo (not even the length). Ctrl+U clears, Esc / Ctrl+C cancel.
+- --reveal: input is shown on a separate screen; after Enter that screen and the scrollback are cleared.
+- --password <value> --allow-arg-secrets: only when allowed in the settings, warned every time. The command line is
+  visible to other programs (Task Manager, ps, shell history): not recommended. Passwords are never taken from
+  environment variables, files or pipes.
+- Key files -k (repeatable), --pim; new values --new-keyfile, --new-pim, --new-password.
+- --yes answers questions with yes but warnings are still printed. --quiet prints errors only, --json prints the result
+  as one JSON line (never anything secret).
+- Exit codes: 0 done, 1 failed, 2 usage, 3 wrong credentials or damaged, 4 bad signature, 5 cancelled, 6 busy,
+  130 interrupted.
+- The first Ctrl+C (or SIGTERM / SIGHUP) cancels and cleans up temp files; the second ends at once.
+
+16. Linux notes
+---------------
+- File managers: Nemo and Dolphin entries appear on install. Nautilus (scripts) and Thunar (custom actions) are per user:
+  run /usr/share/shield/integrate.sh once as yourself. Portable/AppImage copies: Settings > File manager > Context menu.
+- With LUKS full-disk encryption and discard off, TRIM does not reach the hardware (a note is shown).
+- Process protection: no core dumps (RLIMIT_CORE=0), PR_SET_DUMPABLE=0 (blocks same-user ptrace and /proc/<pid>/mem),
+  mlock. An encrypted swap (or none) is recommended. Settings and staging use 0600/0700 permissions.

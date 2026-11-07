@@ -1,0 +1,37 @@
+■ Shield 3.0.0 setup - please read the warnings and the short guide
+
+An installed Shield (2.1.0, 3.0.0 betas included) is removed automatically and upgraded to 3.0.0, whatever its
+installer language.
+3.0 opens 2.x containers unchanged. The 1.x format is not opened: decrypt 1.x files with 1.x first.
+
+■ Important
+- If you lose the password, the PIM or a key file, nobody (the developer included) can decrypt the files.
+- Do not edit or re-save key files; back them up somewhere other than the encrypted files.
+- Overwrite deletion (shredding the originals) cannot be undone. Try encrypting and decrypting a copy first.
+- On SSDs, USB sticks, volume shadow copies and cloud-synced folders, overwriting and TRIM cannot guarantee
+  physical erasure. Shield checks for shadow copies and reports them but never deletes them.
+- After a password change, older backups still open with the old password.
+- Memory and process protection is best effort. It does not stop malware running as the same user,
+  administrators, the kernel or physical access.
+- Screen capture protection (on by default) only blocks software capture such as screenshots and recordings.
+- This installer has no Authenticode signature, so SmartScreen may warn. Verify the OpenPGP signature with the
+  .sig and VERIFY.txt first, and compare the key fingerprint with the one the developer published.
+- Update checks are off by default. When turned on, Shield only contacts GitHub, sends no identifying
+  information, and installs a correctly signed newer version only after asking.
+
+■ What is installed
+- shield-gui.exe (windows) and shield.exe (command line). The install folder is added to the system PATH, so
+  'shield help' works in a new terminal.
+- Start menu shortcuts, Explorer context menu entries (several items at once) and the user guide.
+
+■ Short guide
+1. 'Shield' in the Start menu is the encryption window; 'Shield File Manager' browses folders and opens .shd files.
+2. Right-click files or folders (several at once): 'Encrypt with Shield', then choose one container or one per item.
+   Right-click a .shd: 'Decrypt with Shield', 'Open in SHIELD'. (Windows 11: under 'Show more options')
+3. Enter the password twice and keep the recommended PIM (12).
+4. [Start encryption] compresses, encrypts and verifies the restore.
+5. Create a settings password under Settings > Security first to change security settings.
+
+More in each window's 'Guide' tab and in 'Shield user guide' in the Start menu.
+
+If you have understood this, select the check box below and click [Install].

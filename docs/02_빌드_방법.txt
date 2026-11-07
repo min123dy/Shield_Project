@@ -1,131 +1,131 @@
-SHIELD 2.1.0 - 빌드 방법
+SHIELD 3.0.0 - 빌드 방법
 ========================
+English: docs\en\02_build.txt
 
-1. 프로젝트 폴더 구조
----------------------
-  Shield_Project/
-    Cargo.toml, Cargo.lock
-    build.rs                (exe 아이콘/버전 리소스)
-    build.ps1               (빌드·테스트·MSI·dist·GPG 서명·UPX 포터블)
-    installer.wxs           (WiX 5)
-    installer.ko-KR.wxl     (설치 화면 문구, 한국어)
-    .config/dotnet-tools.json  (WiX 5.0.2 고정)
-    src/                    (Rust 소스, 01_프로젝트_설명.txt 3절)
-    docs/01~06
-
-installer.wxs는 target/release/shield.exe, docs/03_사용_방법.txt, 그리고 build.ps1이
-docs/04_설치_안내.txt로부터 만든 target/installer/notice.rtf를 사용합니다.
-MSI에는 UPX로 압축하지 않은 shield.exe가 들어갑니다. 포터블 exe는 별도 복사본입니다.
+1. 폴더 구조
+------------
+Cargo.toml                워크스페이스(shield-platform, shield-core, shield-gui, shield-cli), 버전 3.0.0
+crates\                   크레이트 4개 (01 문서 3절)
+keys\release_key.asc      내장할 릴리스 공개키 (공개키만. 비밀키는 절대 저장소에 넣지 않음)
+installer\windows\        installer.wxs, installer.ko-KR.wxl, installer.en-US.wxl
+installer\linux\          .desktop, MIME, postinst/postrm, 파일 관리자 메뉴(filemanagers\)
+build.ps1 / build.sh      Windows / Linux 빌드
+.github\workflows\release.yml   GitHub Actions (Windows + Linux x86_64·aarch64, 태그로 릴리스)
+.config\dotnet-tools.json WiX 5.0.2 고정
+.cargo\config.toml        Windows(MSVC): C 런타임 정적 링크(vcruntime140.dll 불필요). RUSTFLAGS 환경 변수는
+                          이 설정을 덮어쓰므로 쓰지 않습니다. 두 exe의 build.rs는 /DEPENDENTLOADFLAG:0x800
+                          (가져오는 DLL을 System32에서만 찾음)을 넣습니다(보안 점검 2026-11-08, release_tests 확인)
 
 2. 필요한 도구
 --------------
-- Windows 10/11 x64, Rust stable(1.80 이상 권장) + Visual Studio C++ Build Tools / Windows SDK(rc.exe)
-- .NET SDK 6 이상 (WiX 5.0.2는 로컬 .NET 도구로 복원, 전역 설치 불필요)
-- 서명할 때만: GnuPG (Gpg4win 권장, https://gpg4win.org). Git for Windows에 들어 있는 gpg도 동작하도록
-  경로를 변환하지만, 둘 다 있으면 Gpg4win을 우선 사용합니다.
-- 포터블 exe를 만들 때만: UPX (upx.exe). 없으면 포터블 빌드는 건너뛰고 MSI만 만듭니다.
-- 최초 의존성 다운로드를 위한 인터넷 연결
+공통      Rust stable 1.89 이상 (개발·시험: 1.99.1)
+Windows   Visual Studio Build Tools(MSVC, rc.exe), .NET SDK 6+ (WiX 5 dotnet tool), 서명 시 Gpg4win, 선택 UPX
+Linux     gcc, pkg-config, libgtk-3-dev, libxkbcommon-dev, libwayland-dev, libxcb-render0-dev,
+          libxcb-shape0-dev, libxcb-xfixes0-dev, libgl1-mesa-dev (GUI), musl-tools와
+          rustup target add <arch>-unknown-linux-musl (정적 콘솔), dpkg-dev (deb), python3 (소스 zip),
+          선택: appimagetool (AppImage, APPIMAGETOOL=<경로>), rpmbuild (rpm), cargo-zigbuild + zig (--zig)
+          서명 시 gnupg
 
-3. 빌드
--------
-  Set-ExecutionPolicy -Scope Process Bypass
-  .\build.ps1                               (아래 질문에 차례로 답함)
-  .\build.ps1 -NoSign                       (GPG 서명 없이)
-  .\build.ps1 -Sign -PublicKeyPath my.asc   (비대화형 서명)
-  .\build.ps1 -Sign -PublicKeyPath my.asc -GpgHome D:\keys\gnupg   (비밀키가 기본이 아닌 키링에 있을 때)
+3. 빌드 입력 (환경 변수 / 인수, 없으면 터미널에서 묻습니다)
+----------------------------------------------------------
+  저장소 URL     -RepoUrl / --repo / SHIELD_REPO_URL      https://github.com/<owner>/<repo>만 허용.
+                 비우면 "개발 정보" 링크와 업데이트가 없는 빌드. build.rs도 형식을 다시 검사해 틀리면 빌드 중단.
+  공개키 .asc    -PublicKeyPath / --pubkey / SHIELD_PUBKEY_PATH   기본 keys\release_key.asc.
+                 프로그램에 내장되어 업데이트·무결성 검사에 쓰입니다. 비밀키 블록이 있으면 거부.
+  서명 여부      -Sign|-NoSign / --sign|--no-sign / SHIELD_SIGN=y|n
+  변형           -Variants msi,portable,console / --variants deb,appimage,console,rpm,zip / SHIELD_VARIANTS
+  기타           -Culture ko-KR|en-US(MSI 언어), -MergeManifest / --merge-manifest(다른 OS 패키지 줄 합치기),
+                 -GpgHome / --gpg-home, -SkipTests / --skip-tests, -UpxPath·-NoUpx, --zig, --arch x86_64|aarch64
+비밀 정보: 서명 비밀번호는 인수·변수·로그 어디에도 들어가지 않고 gpg-agent(pinentry)가 묻습니다. 스크립트는
+공개 값(URL, 지문, 파일 이름)만 출력합니다. bash는 set +x로 명령 추적을 끕니다.
 
-  UPX 포터블 (선택):
-  .\build.ps1 -UpxPath "C:\tools\upx.exe"   (파일 경로 또는 upx.exe가 든 폴더 경로, 묻지 않음)
-  .\build.ps1 -NoUpx                        (묻지 않고 포터블 빌드 건너뜀)
-  - 옵션 없이 .\build.ps1만 실행하면 "GPG 서명을 하시겠습니까? (y/N)"에 이어 "UPX 경로"를 묻습니다.
-    경로를 넣으면 포터블 exe도 만들고, 그냥 Enter를 치면 건너뜁니다.
-  - 창에 파일을 끌어 놓을 때 붙는 따옴표와 "& "는 알아서 지웁니다.
-  - 입력이 자동으로 들어오는 환경(입력 리디렉션)에서는 UPX 경로를 묻지 않습니다.
-  - -UpxPath는 -Sign, -NoSign과 함께 쓸 수 있습니다. 서명할 때는 포터블 exe도 함께 서명합니다.
+4. Windows (build.ps1)
+----------------------
+  .\build.ps1                                    (모두 묻기)
+  .\build.ps1 -RepoUrl https://github.com/o/r -NoSign -Variants msi,console
+  .\build.ps1 -RepoUrl https://github.com/o/r -Sign -PublicKeyPath keys\release_key.asc
+순서: 입력 검사 -> (서명 시) 공개키 하나만 든 임시 키링, 로컬 키링에 비밀키가 있는지 확인 -> cargo test
+--workspace --release -> shield-gui.exe·shield.exe 빌드 -> 콘솔 전용 빌드(target\console) -> (서명 시)
+두 exe 서명(.sig, 설치 폴더에 함께 들어가 무결성 검사에 쓰임) -> MSI -> 포터블 -> 소스 zip -> 릴리스 매니페스트 ->
+(서명 시) 모든 배포 파일과 매니페스트 서명, 각 서명을 임시 키링으로 다시 검증 -> VERIFY.txt, SHA256SUMS.txt
 
-단계 (어느 단계든 실패하면 즉시 중단. UPX 포터블을 만들면 전체 6단계, 아니면 5단계):
-  [서명 준비] (서명 시) gpg 찾기 → 공개키 파일 검사 → 임시 키링에 공개키만 가져오기 → 지문·사용자 ID 표시와 확인
-              → 해당 지문의 비밀키가 로컬 키링에 있는지 확인
-  [UPX 확인]  (UPX 경로를 줄 때) 빌드 전에 upx.exe를 찾아 버전을 확인합니다. 경로가 틀리면 바로 중단합니다.
-  [1/5] cargo build --release
-  [UPX]   (UPX 경로를 줄 때만, 이 단계가 들어가면 번호가 [n/6]으로 바뀜)
-          shield.exe를 Shield_v{버전}_portable.exe로 복사해 upx --best --lzma --strip-relocs=0으로 압축
-          → upx -t 무결성 검사 → ASLR(0x40)·고엔트로피 ASLR(0x20)·DEP(0x100) 플래그가
-          압축 전과 같은지 확인. 하나라도 어긋나면 포터블 exe를 지우고 중단합니다.
-  [2/5] cargo test --release          (아래 "테스트 시간과 출력" 참고)
-  [3/5] WiX 5.0.2 로컬 도구·확장 복원
-  [4/5] docs/04_설치_안내.txt → 설치 첫 화면 RTF(코드 페이지 949)
-  [5/5] wix build → Shield.msi
-  [배포] dist\ 구성, (서명 시) 서명과 검증, SHA256SUMS.txt
+5. Linux (build.sh)
+-------------------
+  ./build.sh --repo https://github.com/o/r --no-sign
+  ./build.sh --repo https://github.com/o/r --sign --variants deb,appimage,console
+  ./build.sh --zig --arch aarch64 --variants console     (정적 콘솔만 교차 빌드)
+deb/AppImage/rpm은 이 컴퓨터의 아키텍처로만 만듭니다(GTK가 필요하므로). aarch64 패키지는 aarch64 컴퓨터나
+GitHub의 ubuntu-24.04-arm 러너에서 만듭니다. 패키지 트리: /usr/bin/shield, /usr/bin/shield-gui,
+/usr/share/applications(shield.desktop, shield-open.desktop), /usr/share/mime/packages/shield.xml,
+/usr/share/icons/hicolor/*/apps/shield.png, /usr/share/nemo/actions, /usr/share/kio/servicemenus(KF6),
+/usr/share/kservices5/ServiceMenus(KF5), /usr/share/shield(integrate.sh: 사용자별 Nautilus 스크립트·Thunar 동작),
+/usr/share/doc/shield. 서명 시 /usr/bin/shield.sig·shield-gui.sig.
 
-테스트 시간과 출력
-  - 현재 자동 테스트는 105개이고, 모두 통과하는 데 약 5분이 걸립니다(Argon2id 등 비용이 큰 시험 포함).
-  - release 빌드의 실행 파일은 콘솔 없는 GUI 프로그램(main.rs 첫 줄의 windows_subsystem)이라, 테스트 실행 파일도
-    콘솔에 출력을 내지 않습니다. [2/5] 단계에서 "Running unittests ..." 줄만 나온 채 아무 출력이 없어도
-    테스트는 돌고 있을 수 있습니다. 5분 정도 기다려 보세요.
-  - 진행 상황을 보려면 파일로 리디렉션합니다.
-      cargo test --release -- --test-threads=1 --nocapture *> test_out.txt
-      Get-Content test_out.txt -Tail 30
-    마지막에 찍힌 "test 이름 ..."이 지금 도는(또는 멈춘) 테스트입니다. 파일이 계속 비어 있고 CPU 사용도 없으면
-    그때 멈춘 것으로 보고 작업 관리자에서 CPU·메모리를 확인하세요.
+6. 산출물 (dist\)
+-----------------
+  Shield_v3.0.0_x64.msi                  Windows 설치 파일 (shield-gui.exe + shield.exe, PATH 추가)
+  Shield_v3.0.0_x64_portable.exe         Windows 포터블 GUI
+  shield-console_v3.0.0_windows_x64.exe  Windows 콘솔 전용 (GUI 의존성 없음)
+  shield_v3.0.0_amd64.deb / _arm64.deb   Debian·Ubuntu 패키지
+  Shield_v3.0.0_x86_64.AppImage / _aarch64.AppImage
+  shield-console_v3.0.0_linux_x64 / _linux_arm64   musl 정적 콘솔
+  shield_v3.0.0_x86_64.rpm               선택
+  Shield_Project_v3_0_0.zip              소스 (target, dist, .git, 비밀키·.env 등 제외. 비밀키 블록이 보이면 중단)
+  Shield_v3.0.0_release.txt              릴리스 매니페스트 (업데이트가 검사)
+  각 파일의 .sig, 공개키 .asc, VERIFY.txt (서명 시), SHA256SUMS.txt (항상)
+매니페스트 형식 (LF, 업데이트가 정확히 이 형식만 받습니다):
+  Shield release manifest 1
+  version 3.0.0
+  sha256 <64자 소문자 16진수> <파일 이름>
+업데이트는 매니페스트 서명 -> 버전(태그와 같고 현재보다 높아야 함) -> 패키지 SHA-256 -> 패키지 서명을 모두
+확인합니다. Windows와 Linux를 따로 빌드했다면 한쪽 매니페스트를 -MergeManifest/--merge-manifest로 넘겨
+한 매니페스트로 합친 뒤 서명하세요. GitHub 릴리스에는 업데이트용 파일 이름이 위 표와 같아야 합니다.
 
-4. 공개키 파일 검사 (서명 시)
------------------------------
-- 파일이 있어야 하고 1 MiB 이하의 ASCII 형식(-----BEGIN PGP PUBLIC KEY BLOCK-----)이어야 합니다.
-- 비밀키 블록(PRIVATE KEY BLOCK)이 들어 있거나 gpg --show-keys가 sec/ssb를 보여 주면 거부합니다.
-- 키는 정확히 하나여야 합니다. 지문과 사용자 ID를 보여 주고, 대화형이면 확인을 받습니다.
-- 그 지문의 비밀키가 로컬 키링에 없으면 중단합니다.
-- 패스프레이즈는 인수나 로그로 다루지 않고 gpg-agent/pinentry 창에 맡깁니다.
-- 임시 키링(%TEMP%\shield_gpg_*)은 성공·실패와 상관없이 마지막에 gpg-agent를 끈 뒤 삭제합니다.
+7. GitHub Actions (.github\workflows\release.yml)
+------------------------------------------------
+- windows(windows-latest), linux(ubuntu-24.04, ubuntu-24.04-arm) 작업이 빌드하고, vX.Y.Z 태그일 때 release
+  작업이 매니페스트를 하나로 합쳐(모든 해시를 실제 파일과 대조) 서명한 뒤 gh release create로 올립니다.
+- 시크릿 사용 방식 (서명 개인키는 절대 저장소에 넣지 않습니다):
+  SHIELD_GPG_KEY         서명 부키만: gpg --armor --export-secret-subkeys <지문>!  (주 키 비밀키는 넣지 않음)
+  SHIELD_GPG_PASSPHRASE  그 비밀번호
+  각 작업은 RUNNER_TEMP 아래 임시 GNUPGHOME에 가져오고, 비밀번호는 그 폴더의 0600 파일로만 gpg에 전달하며,
+  작업 끝에 폴더를 지웁니다. 시크릿 값은 echo하지 않습니다(GitHub도 로그에서 가립니다).
+  시크릿이 없으면 서명 없이 빌드합니다(이 경우 업데이트가 그 릴리스를 거부합니다).
+- AppImage: 저장소 변수 APPIMAGETOOL_URL과 APPIMAGETOOL_SHA256을 둘 다 정하면 그 파일을 받아 해시를 확인한 뒤
+  씁니다. 고정되지 않은 도구는 받지 않습니다.
+- 권장: 태그 보호 규칙, 릴리스 작업에 environment 승인, 부키 만료일 설정.
 
-5. dist\ 산출물
----------------
-  Shield_Project_v{버전}.zip   소스 (target, dist, .git, .vs, .wix(도구 캐시), .claude*(작업 도구 기록), *.msi, *.wixpdb, *.sig, *.asc, *.gpg, *.key,
-                               *.pem, *.pfx, *.p12, *.zip, *.shd, .env* 제외). System.IO.Compression으로 만들어
-                               항목 경로 구분자가 '/'입니다 (Compress-Archive 사용 안 함).
-  Shield.msi
-  Shield_v{버전}_portable.exe  UPX로 압축한 단일 exe (UPX 경로를 준 경우에만). 설치 없이 실행하며
-                               설정을 실행 파일 옆 Shield_data 폴더에 저장합니다.
-  SHA256SUMS.txt               dist의 모든 파일 SHA-256 (항상, 포터블 exe 포함)
-  서명 시 추가:
-  Shield_Project_v{버전}.zip.sig, Shield.msi.sig   gpg --detach-sign (지정한 지문의 키, SHA-512)
-  Shield_v{버전}_portable.exe.sig                  (포터블 exe를 만든 경우)
-  <입력한 공개키 파일 이름>.asc
-  VERIFY.txt                   검증 방법과 지문 (포터블 exe 검증 명령 포함)
-서명 직후 임시 키링(입력한 공개키만 있음)으로 모든 서명을 gpg --verify하고 VALIDSIG의 지문까지 확인합니다.
-실패하면 만들어진 .sig를 지우고 오류로 중단합니다. 빌드 때마다 dist\는 비우고 새로 만듭니다.
+8. OS별 확인 목록
+-----------------
+Windows (설치 후)
+  [ ] 시작 메뉴 Shield / Shield 파일 관리자 / 사용 설명서, 새 명령 창에서 shield version
+  [ ] 탐색기에서 파일 여러 개 + 폴더 선택 -> Shield로 암호화 -> 창 하나, "하나로 묶기 / 각각 따로" 질문
+  [ ] .shd 우클릭 복호화·열기, 설정 > 업데이트 > 프로그램 무결성 검사(서명 빌드면 "무결성 확인")
+  [ ] 원본 파쇄: VSS 경고 표시, 3/7회 선택, 끝에 TRIM 결과(관리자 아니면 UAC)
+  [ ] 제거 후 PATH·우클릭 메뉴가 사라지는지
+  [ ] 2.1.0(한국어·영어 MSI 각각)이 설치된 상태에서 3.0.0 설치 -> 프로그램 목록에 Shield 하나, 우클릭 메뉴 하나,
+      PATH에 설치 폴더 한 번 (05_테스트_및_점검_기록.txt 8.4 표)
+  [ ] 창을 옮기고 닫은 뒤 다시 열면 같은 위치, 모니터를 뺀 뒤에는 화면 안에서 열림
+Linux (deb 설치 후, GNOME·KDE·Xfce 등)
+  [ ] 앱 메뉴 Shield, 터미널 shield version, .shd 두 번 클릭 -> 연결 프로그램
+  [ ] Nemo·Dolphin 메뉴, /usr/share/shield/integrate.sh 실행 후 Nautilus 스크립트·Thunar 동작
+  [ ] btrfs/ZFS/LVM/Timeshift/Snapper 볼륨에서 스냅숏 경고, ext4 SSD에서 FITRIM(root가 아니면 pkexec 안내)
+  [ ] Wayland와 X11에서 창 크기가 Windows와 같은지(1040x700 논리 크기, 글자 크기), Xft.dpi가 없는 X11과
+      잘못된 WINIT_X11_SCALE_FACTOR로도 시작되는지
+  [ ] 화면 캡처 방지 / 창 위치 기억(Wayland)이 "사용할 수 없어 해제됨(사유)"으로 보이는지
+  [ ] AppImage: 실행, "Shield.AppImage cli version", 설정 > 업데이트 확인
+공통
+  [ ] Windows에서 만든 .shd를 Linux에서 열고 반대로도 (자동 테스트가 있지만 실제 파일로도)
+  [ ] shield verify <파일> <파일>.sig --key <공개키>로 배포 파일 검증
 
-6. 설치 구성 (installer.wxs)
-----------------------------
-- UpgradeCode는 1.x와 같아 2.x 설치 시 이전 버전을 자동 제거(MajorUpgrade, 실패 시 MSI 롤백).
-- 시작 메뉴: "Shield"(암호화 창), "Shield 파일 관리자"(--manager), "Shield 사용 설명서".
-- 우클릭: 모든 파일·폴더 "Shield로 암호화"(--encrypt), .shd "Shield로 복호화"(--decrypt),
-  .shd "SHIELD에서 열기"(--open). 제품과 함께 등록·제거됩니다.
-- 설치 화면과 우클릭 메뉴 문구는 지금 한국어만 있습니다. (프로그램 안의 화면은 한국어·영어를 지원합니다.)
-- Authenticode 코드 서명은 하지 않습니다(GPG 서명으로 대체). SmartScreen 경고가 뜰 수 있습니다.
-- 포터블 exe는 설치 프로그램과 무관하며 우클릭 메뉴를 등록하지 않습니다.
-
-7. 설치 후 확인 목록
---------------------
-- 두 시작 메뉴 바로가기가 각각 암호화 창과 파일 관리자 창을 여는가?
-- 우클릭 세 메뉴가 보이고(Windows 11은 "더 많은 옵션 표시"), 제거 후 사라지는가?
-- 파일 관리자에서 .shd를 열고 정보 탭·선택 추출·파일 추가·선택 항목 삭제·본문 검사가 동작하는가?
-  (열린 뒤 작업을 할 때마다 비밀번호를 다시 묻는가?)
-- 1.x에서 업그레이드했을 때 프로그램 목록에 Shield가 하나만 남는가?
-- 설정 탭(일반 / 보안 / 암호화 / 파일 관리자)에서 언어(한국어·영어), 어두운 모드, 화면 캡처 방지(기본 켜짐)가
-  바뀌고 다시 실행해도 유지되는가?
-- 기본 창(1040x700)과 최소 창(800x560)에서 주요 화면이 스크롤 없이 보이는가?
-- 마우스 엔트로피 막대가 100%에서 초록색이 되고, 수집된 샘플 수가 화면에 보이는가?
-- 포터블 exe를 만들었다면: 실행되는가, 설정이 exe 옆 Shield_data에 저장되는가, SmartScreen·백신이 막지 않는가?
-
-8. 직접 확인하지 못한 것 (06_2_1_0_수정_기록.txt 7절)
-------------------------------------------------------
-- UPX 포터블 빌드를 실제로 실행해 보기 (스크립트 문법과 경로 처리만 시험)
-- 서로 다른 프로세스가 비정상 종료했을 때 잠금이 풀리는지
-- 실제 창에서 화면 캡처 방지가 되는지
-- 125 / 150 / 200 % 배율 모니터에서의 배치, 다크 모드 제목 표시줄
-- MSI 우클릭 메뉴의 영어 표시
-- FAT32·USB 같은 NTFS가 아닌 드라이브 (숨은 스트림·파일 ID가 없음)
-- GUI 버튼을 직접 눌러 보는 수동 확인
-
-자동 테스트 통과가 GUI 동작, 설치, 외부 공격 내성의 독립 검증을 뜻하지는 않습니다.
+9. 정식 배포 서명 점검 목록
+---------------------------
+  [ ] Cargo.toml version = 3.0.0, 태그 v3.0.0, docs\06 머리말, MSI ProductVersion이 같음 (release_tests)
+  [ ] UpgradeCode 6B1E5C0A-3D7F-4C52-9A1B-0F8E2D4C7A91 그대로, MajorUpgrade IgnoreLanguage="yes" (release_tests)
+  [ ] SHIELD_REPO_URL(https://github.com/<owner>/<repo>)과 공개키(keys\release_key.asc, 비밀키 없음)를 넣고 빌드
+  [ ] build.ps1 -Sign / build.sh --sign: 두 exe의 .sig, 모든 배포 파일·매니페스트 서명, 임시 키링으로 다시 검증 통과
+  [ ] VERIFY.txt의 지문이 개발자가 공개한 지문과 같음, SHA256SUMS.txt와 실제 파일 일치
+  [ ] 설치한 프로그램의 설정 > 업데이트 > 무결성 검사가 "무결성 확인"
+  [ ] Linux에서 cargo test --workspace / clippy 경고 0 / build.sh (이번 패치의 Linux 코드는 Windows에서 컴파일하지 못함)
+  [ ] cargo audit: .cargo\audit.toml에 적은 3건 외에 새 취약점 없음
+  [ ] 서명 비밀번호와 개인키는 저장소·로그·zip에 없음(소스 zip 비밀키 검사 통과)

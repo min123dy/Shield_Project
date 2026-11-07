@@ -1,0 +1,341 @@
+SHIELD 3.0.0 - Change record (2.1.0 -> 3.0.0)
+============================================
+한국어: docs\06_3.0.0_수정_기록.txt. The 2.1.0 record: docs\history\06_2.1.0_수정_기록.txt (Korean)
+
+1. Summary
+----------
+- The file format is unchanged (v2). 2.x containers open as before and 2.1 opens files made by 3.0 (a bundle of several
+  items unpacks into a folder named after the container in 2.1 too).
+- No security design was weakened: XChaCha20-Poly1305, Argon2id (256 MiB, parallelism 4), SHA3-512, header
+  authentication, encrypted metadata, no keys kept in memory and the password asked for every task are as in 2.1.0.
+- New: entropy pool v4 with per-source switches, 3/7 overwrite passes with snapshot warnings and automatic TRIM, signed
+  updates, OpenPGP integrity check and shield verify, encrypting several items, a console program, a Linux version and
+  a settings password.
+
+2. Crates and dependencies
+--------------------------
+Four workspace crates (the core / platform / gui / cli of §7; the installer is the installer\ folder and the build
+scripts, not a crate)
+  shield-platform  dirs 6 / Windows: windows-sys 0.52, wmi 0.18, serde / Linux: libc 0.2
+  shield-core      chacha20poly1305 0.10, argon2 0.5, sha3 0.10, hkdf 0.12, hmac 0.12, zeroize 1, rand 0.8,
+                   rand_chacha 0.3, sevenz-rust2 0.24 (LZMA2, Zstandard), unicode-normalization 0.1, dirs 6,
+                   pgp (rPGP) 0.21, bp256 / bp384 0.14, ecdsa 0.17, ureq 3 (rustls), serde_json 1, sha2 0.10
+  shield-gui       eframe 0.27 (glow; Linux adds wayland and x11), rfd 0.14
+  shield-cli       crossterm 0.29, ctrlc 3.5 (termination: SIGTERM, SIGHUP), serde_json 1, optional shield-gui
+No hand-written crypto: the entropy pool only combines SHA3-512 and HKDF; brainpool signatures only connect rPGP's
+hashing with RustCrypto's verify function.
+
+Considered and not used
+  sequoia-openpgp  needs CNG or nettle (C) backends on Windows; its pure-Rust backend can't verify brainpool
+  self_update      zipsign/ed25519 only (no OpenPGP) and replaces binaries, which doesn't fit MSI / deb
+  reqwest          far more dependencies than ureq (tokio); updates need a few requests only
+  rpassword        no control over raw mode, alternate screen, scrollback clearing and Ctrl+C -> crossterm
+
+3. Entropy (§1)
+---------------
+- The OS CSPRNG (getrandom / BCryptGenRandom) is the base of every output and can't be turned off. If it fails nothing is
+  generated.
+- Extra sources are only absorbed into a SHA3-512 pool. Output = HKDF-SHA3-512(64 OS bytes | pool | counter), the pool is
+  remixed after output, all intermediate buffers are zeroized. Values never reach disk, logs or the network; there is no
+  Debug output.
+- Only Normal / Weak (plus waiting, off, unavailable) is shown. Health tests leave out sources that repeat, get stuck or
+  just count.
+
+  name (shield entropy)  Windows                                  Linux
+  os            BCryptGenRandom (can't be disabled)         getrandom (can't be disabled)
+  os_aux        32 more bytes of BCryptGenRandom             AT_RANDOM (16 kernel bytes, once)
+  hwrng         RDRAND/RDSEED (when the CPU has them)        same
+  timers        QPC, system time, ticks                      several clock_gettime clocks
+  cpu_jitter    1024 timing jitter samples                    same
+  memory        GlobalMemoryStatusEx                         /proc/meminfo, /proc/vmstat
+  process       process times, handles, memory figures       times, getrusage
+  ids           pid, tid, heap and stack addresses           pid, tid, addresses
+  system_times  GetSystemTimes etc.                          /proc/stat, schedstat, loadavg, uptime
+  disk          free space of system and temp volumes        /proc/diskstats
+  network       IP Helper interface statistics (numbers)     /proc/net/dev, /proc/net/snmp
+  processes     ToolHelp ids, counts, sizes (no names)       pids under /proc (no names or paths)
+  perfdata      HKEY_PERFORMANCE_DATA                        (none)
+  procfs        (none)                                       /proc/interrupts, softirqs, self/stat and io, pressure
+  sensors       (none)                                       /sys/class/hwmon and thermal values
+  window_state  window position, focus, clipboard owner      the GUI window's own state
+                (never the contents)
+  input_timing  key and button event times in Shield's window same
+  mouse         pointer positions in Shield's window          same (no global coordinates, no /dev/input)
+  window_state, input_timing and mouse are GUI-only and "unavailable" for console commands.
+- Switching: Settings > Security (settings password needed) or shield entropy --enable / --disable <name>.
+
+4. License review of VeraCrypt's Random.c
+-----------------------------------------
+- VeraCrypt's Random.c is under the TrueCrypt License 3.0 (parts from TrueCrypt) and the Apache License 2.0 (VeraCrypt's
+  changes). The TrueCrypt License is not OSI-approved and puts naming and notice conditions on derived works, so copying
+  code would complicate Shield's distribution terms.
+- Therefore no code was copied. Only the idea of which OS values are worth polling (the FastPoll / SlowPoll lists) was
+  taken; ideas and lists of facts are not protected by copyright. The implementation, the pool design (SHA3-512 + HKDF),
+  the health tests and the display were all written from scratch. The source comments (entropy/mod.rs,
+  windows/entropy.rs) say the same.
+
+5. Overwrite deletion (§2)
+--------------------------
+- 3 passes = 00, FF, random. 7 passes = 00, FF, random, 55, AA, random, random. Chosen in the confirmation each time;
+  default in the settings (7).
+- Key areas (the 719-byte header, the slot on a password change) always get 7 passes.
+- Besides shredding originals, the old container after rekey, add and delete is overwritten too (2.1 bug B5).
+- Snapshot warnings before overwriting: Windows VSS (WMI Win32_ShadowCopy; "can't check" without admin rights), Linux
+  btrfs subvolume snapshots, ZFS (zfs list), LVM snapshots (device-mapper snapshot-origin), Timeshift, Snapper.
+  Snapshots are never deleted.
+- TRIM at the end: Windows ReTrim (helper elevated via UAC when not admin), Linux FITRIM (pkexec hint when not root,
+  note when LUKS discard is off). Failures are reported; the task succeeds.
+- 2.1's single-pass default on SSDs is gone: overwriting an SSD guarantees nothing either way, and the user picks the count.
+
+6. Updates and integrity (§3, §4)
+---------------------------------
+- The repository URL is a build input (SHIELD_REPO_URL), https://github.com/<owner>/<repo> only. The public key is
+  embedded from SHIELD_PUBKEY_PATH.
+- GitHub API /repos/<o>/<r>/releases/latest -> strict vX.Y.Z tag -> manifest Shield_v<V>_release.txt and .sig ->
+  manifest signature -> manifest version = tag and newer -> the package for this OS (msi / deb / AppImage) and its .sig
+  -> size-limited download (512 MiB at most) -> SHA-256 -> package signature -> install confirmation -> secrets wiped
+  -> install.
+- Any failure deletes the files and stops. Check-only and automatic modes both ask before installing. Off by default.
+- Integrity check (Settings > Updates, shield version): verifies the .sig next to the program with the built-in key and
+  shows the fingerprint.
+- shield verify <file> <signature> [--key <.asc>]: the built-in key when no key is given.
+
+7. Console (§6)
+---------------
+- Commands: encrypt, decrypt, list, add, remove, change-password, rekey, keyfile, verify, update, entropy, version, help,
+  gui (builds with the gui feature only).
+- Secret input: crossterm raw mode, no echo, not even the length. --reveal shows the input on the alternate screen and
+  after Enter clears that screen and the scrollback before returning. Argument mode needs the setting and
+  --allow-arg-secrets, warned every time. No environment, file or pipe input.
+- Exit codes 0/1/2/3/4/5/6/130. --quiet, --json (nothing secret), --yes, --lang ko|en.
+- The console turns off the GUI-only entropy sources and mouse entropy.
+
+8. Linux version (§7)
+---------------------
+- Hardening: RLIMIT_CORE=0, PR_SET_DUMPABLE=0, mlock (warning when it fails), files 0600 and folders 0700, O_NOFOLLOW,
+  XDG paths.
+- Storage: /proc/self/mountinfo, rotational, following dm-crypt / LVM / NVMe to tell SSDs, FITRIM, LUKS discard check.
+- Download mark: the user.xdg.origin.url extended attribute (the counterpart of NTFS Zone.Identifier) is passed on to
+  decrypted files.
+- Screen capture protection: X11 and Wayland have no such feature; greyed out.
+- File dialogs: rfd (GTK3). File managers: Nautilus scripts, Nemo actions, Dolphin service menus (KF5 and KF6), Thunar
+  custom actions, .desktop and MIME (application/x-shield-container, *.shd).
+- Signals: the first SIGINT / SIGTERM / SIGHUP cancels, the second wipes the pool and exits with 130.
+- Updates: deb through pkexec apt-get install, AppImage written next to it and renamed, anything else gets the page.
+
+9. OS support table
+-------------------
+  feature                       Windows 10/11 x64          Linux x86_64 / aarch64
+  encrypt, decrypt, containers  yes                        yes (same format)
+  GUI                           yes                        yes (X11, Wayland; needs GTK3)
+  console program               shield.exe (PATH)          /usr/bin/shield, static musl single file
+  context menus (several items) Explorer                   Nautilus, Nemo, Dolphin, Thunar
+  screen capture protection     yes                        no (greyed out)
+  memory locking, no dumps      VirtualLock, mitigations    mlock, RLIMIT_CORE, PR_SET_DUMPABLE
+  settings MAC key sealed       DPAPI                      no (0600 file)
+  TRIM                          ReTrim (UAC)               FITRIM (root / pkexec)
+  snapshot warnings             VSS                        btrfs, ZFS, LVM, Timeshift, Snapper
+  free-space overwrite          cipher /w                  fill file
+  hidden streams / download mark ADS, Zone.Identifier       xattr, user.xdg.origin.url
+  automatic updates             MSI                        deb, AppImage (static console: page only)
+  packages                      MSI, portable exe, console  deb, AppImage, console, rpm (optional, untested)
+  aarch64 Linux is set up to build on GitHub's ubuntu-24.04-arm runner but was not run by hand.
+
+10. Settings password (§8)
+--------------------------
+- Argon2id 128 MiB, t=3, p=4, 16-byte salt -> HKDF-SHA3-512 -> verifier (stored) and MAC key. HMAC-SHA3-512 covers all
+  protected values.
+- Tampering: protected values back to defaults plus a warning. Wrong passwords wait 1, 2, 4, 8, 16, 30 s (per process).
+- Recovery: delete the settings file (containers are not affected).
+- Create / change: the password check of section 12 (empty, differing confirmation or too long: refused; short or
+  weak: a warning and a confirmation).
+
+11. Remaining limits
+--------------------
+Collected in 01_overview.txt section 7. In particular: Linux settings key not sealed, retry delay per process, the self
+check can't see a replaced embedded key, no brainpoolP512, the OS's copy of argument passwords, the UAC prompt for TRIM
+on the Windows console, same-user TOCTOU, SSD/COW limits, no independent audit, and these release files are unsigned
+(signing needs the developer's key passphrase).
+
+12. Release patch (3.0.0 beta -> 3.0.0, 2026-11-07)
+---------------------------------------------------
+The security design (algorithms, Argon2id 256 MiB / p=4 / t=3+PIM, header MAC, encrypted metadata, keys not kept in
+memory, the password asked for every task) is unchanged. Each item went reproduce -> cause -> fix -> regression test;
+the audit results are in 05_test_and_audit.txt section 8.
+
+12.1 One password check (settings password, encryption, key change, console)
+- Cause: the settings password window only disabled its button under 8 characters without saying why, and
+  encryption and settings used different checks.
+- Fix: password::check_new returns "blocks" and "warnings" separately. The button is always enabled; the reasons are
+  listed under the field while typing. Blocks: empty (and no key file), differing confirmation, longer than the
+  maximum, fewer than 20 characters with a PIM below the default. Warn, then allow (confirmation, Cancel is the
+  default): 12 characters or fewer, digits only / lowercase letters only, a common password, repeats / sequences /
+  keyboard rows, contains "shield" or the user name. Length counts graphemes (Hangul and emoji count as one).
+- Offline only (the lists are built in); the lowercase copy used for comparing is wiped.
+- Decision (the stronger option): the 20-character minimum at a low PIM stays a block, not a warning (a lower PIM
+  means fewer Argon2 passes).
+
+12.2 Linux window size (the same as on Windows)
+- Cause: on X11 without Xft.dpi, winit 0.29 guesses the scale from the monitor's physical size in mm (about 1.67 on a
+  14" 1080p panel), so the UI was drawn larger and the window was clamped to the screen. An invalid
+  WINIT_X11_SCALE_FACTOR makes winit panic at start-up. Noto Sans CJK was also drawn about 8 % smaller than Malgun
+  Gothic.
+- Fix: the size is defined once (window.rs: default 1040x700, minimum 800x560, resizable) for both windows and both
+  systems. Before the window exists, shield_platform::display::prepare_scale sets the scale the OS is configured for
+  (Xft.dpi, else GDK_SCALE x GDK_DPI_SCALE, else 1) and drops invalid values. Fonts get a scale that matches Malgun
+  Gothic's letter size.
+- Tests: the constants, no window size or per-OS window code elsewhere, the scale choice table, the font scale
+  (including Malgun Gothic's real metrics).
+
+12.3 Remember window position (Settings > General > Remember window position, on by default)
+- Saved shortly (0.8 s) after a move and when the window closes; never while minimized (-32000).
+- On start the title bar must be on a connected monitor, otherwise the window is moved into the nearest monitor or
+  centred. Stored in physical pixels and converted with the monitor scale (one more correction on the first frames
+  between monitors with different scales).
+- Wayland does not report window positions: the option shows "not available, switched off (reason)" (12.5).
+
+12.4 Remembered tab options (UiPrefs)
+- The choices of the encrypt / decrypt / key change / disk / file manager tabs (pick the destination, bundle, wipe
+  free space, alternate streams, full re-encryption, overwrite passes, TRIM) are saved through one UiPrefs in the
+  settings file. Compression strength, shredding the originals and the key file size edit the existing settings
+  directly (no second copy of a value).
+- Saving: atomic, owner-only, MAC when a settings password exists, SCHEMA=2 (version 1 files still load). Two windows
+  or two Shield processes saving at once merge their changes into the latest file content under a lock.
+- A damaged value falls back to its default alone and a notice is shown; an unreadable file starts with defaults.
+- Never stored: passwords, key files and their paths, picked files / containers, PIM values, per-task
+  acknowledgements ("originals will be deleted", "key files only"), the file manager's "shred the added originals"
+  (reset after every add on purpose). Remembered passes are never below the protected default.
+
+12.5 Features the environment can't provide
+- One value: an option that is on but cannot work here is shown as off with a short reason; the file keeps the
+  user's choice and it is tried again at the next start. Switching it on again saves that and retries at once.
+- Applied to: capture protection (Linux, or when it fails), remember window position (Wayland), update checks
+  (builds without a repository URL). "Clear the clipboard after pasting" never worked on Linux (no OS API): it now
+  clears it through egui.
+- When a security feature failed (locking secrets in memory, no dumps, process protection ...) jobs that handle
+  secrets first list what is missing and ask (once per window; the console every time, --yes accepts, no terminal
+  and no --yes refuses).
+- The audit list is in 05_test_and_audit.txt 8.3.
+
+12.6 MSI: 2.1.0 and 3.0.0 installed side by side
+- Reproduced by reading the tables of dist_old_v2.1.0\Shield.msi and the 3.0.0 MSI: the same UpgradeCode, but the
+  Upgrade table's Language column was 1042 (Korean).
+- Cause: WiX's MajorUpgrade looks for the package's own language only. MSIs are built per culture (ko-KR 1042 /
+  en-US 1033), so an English 3.0.0 did not see a Korean 2.1.0 (and the reverse) and both stayed installed (two Start
+  menu entries, two sets of verbs).
+- Fix: IgnoreLanguage="yes" (the Language column is empty in both built MSIs), a "do not change" note on the
+  UpgradeCode with 2.1.0's ProductCode, pinned component GUIDs (the 3.0.0 values), the old version removed completely
+  first (afterInstallValidate), one PATH entry. A pre-release X.0.0-tag.N gets the MSI version (X-1).99.N so the
+  release replaces it (build.ps1). The in-app update runs the same MSI through msiexec, so the same rules apply.
+- Tests: release_tests (UpgradeCode, MajorUpgrade attributes, pinned and unique GUIDs, one PATH entry and one set of
+  verbs, version mapping). The install scenario table is in 05 8.4 (not run on this PC: it needs administrator rights).
+
+12.7 Vulnerability audit and fixes
+- Table in 05 section 8. Fixed: the unknown-option error repeated the value of "--option=value" (could be a
+  password); the Debug output of settings_auth::Auth showed the verifier; egui's link opening (webbrowser crate,
+  RUSTSEC-2026-0257) is cut every frame. The other two cargo audit findings (rsa, crypto-bigint) are only used to
+  verify signatures with a public key and do not apply (recorded with the reason in .cargo\audit.toml).
+
+12.8 Console help
+- shield help / -h / --help / -help / -? / /?, shield help <command>, shield <command> --help (shows help and runs
+  nothing, even when other arguments are wrong). Built from the command / option table (args.rs) and one set of
+  translated strings; a test checks that every command and option has a description. Wrapped to the terminal width
+  (Hangul takes 2 columns), bold headings only on a terminal and never with NO_COLOR or TERM=dumb. Errors go to
+  stderr with a "did you mean" for typos and a pointer to "shield <command> --help". Snapshots:
+  crates\shield-cli\snapshots\help_ko.txt, help_en.txt.
+
+12.9 Release finish
+- Version 3.0.0 everywhere (Cargo, MSI, docs, UI), no beta labels (checked by release_tests). The signing checklist
+  is in 02_build.txt.
+
+12.10 Limits of this patch (stated openly)
+- The new Linux code (display.rs X11 scale and monitors, the egui clipboard fallback) could not be compiled on this
+  PC (no Linux target, no Docker). Run cargo test / clippy / build.sh on Linux before the release.
+- The MSI upgrade scenarios (a-e) are written as a table but no real install / uninstall was done (administrator
+  rights, changes to this PC).
+- Window position restore was checked for monitor / scale combinations with unit tests only; it needs a check on
+  real screens.
+- cargo-deny, cargo-geiger, miri and cargo-fuzz are not installed and were not run. Instead the unsafe blocks were
+  counted by hand (107, all in shield-platform; 0 elsewhere) and the existing fuzz-style tests (fuzz_tests.rs) ran.
+
+12.11 The window never appeared (3.0.0 rebuilt, 2026-11-08)
+- Symptom: on Windows shield-gui showed no window; the process sat at about 120-140 MB of memory with almost no CPU
+  or disk use. Task Manager's "End task" and taskkill failed with "Access is denied".
+- Reproduced: the shipped Shield_v3.0.0_x64_portable.exe showed no visible window within 15 s (141.8 MB, 0.34 s
+  CPU). All four frame_tests (below) failed with "a frame did not finish (deadlock)".
+- Cause 1 (hang): the window position tracker in window.rs called ctx.zoom_factor() inside a ctx.input(|i| ...)
+  closure. In egui 0.27 ctx.input holds the context lock (a parking_lot RwLock) for writing and zoom_factor takes the
+  same lock again for reading. The lock is not re-entrant, so the UI thread waited forever in its first frame. eframe
+  (glow) creates the window hidden and shows it after the first frame, so it never appeared. "Remember window
+  position" is on by default and Windows always reports positions, so it happened on every start on Windows (also on
+  Linux X11; Wayland never reaches this code).
+- Cause 2 (could not be ended): the process DACL gave the same user no PROCESS_TERMINATE, so a stuck Shield could
+  only be ended with administrator rights.
+- Fix: zoom_factor is read before ctx.input. The OWNER RIGHTS entry of the process DACL gets PROCESS_TERMINATE (0x1)
+  and PROCESS_QUERY_INFORMATION (0x400) (0x121000 -> 0x121401). taskkill, Stop-Process and Task Manager ask for both
+  when ending a process (TERMINATE alone was checked to be still refused). Reading / writing / operating on its
+  memory, creating threads, duplicating handles and changing the DACL stay denied. Ending a process only lets the OS
+  take its memory back; the query right gives process information, never memory contents.
+- Also fixed: on a window that reports no position (Wayland and others) "Remember window position" was shown as off
+  with a reason, and the next frame took that for the user's choice: the reason vanished and "off" could be written
+  to the file. Now only the user switching it on again retries (shell.rs apply_settings).
+- Tests:
+  frame_tests.rs draws every tab, settings category and start screen of both windows in real egui frames on a thread
+  with a time limit, so a deadlock fails instead of hanging. It also checks saving the window position (minimized
+  ignored, physical pixels at scale 1.5, saved on close), a window without a position and switching the option on
+  again. no_egui_call_blocks_on_its_own_lock fails when a locking egui closure (input, memory, data, options,
+  style_mut, fonts, output ...) in the GUI sources calls ctx. / ui. again (the_scan_finds_the_3_0_0_bug checks that
+  it finds the original code).
+  shield-platform hardened_process_can_be_ended_but_not_read: for a hardened child process the same user is denied
+  VM_READ, VM_WRITE, VM_OPERATION, CREATE_THREAD, DUP_HANDLE and WRITE_DAC, is allowed TERMINATE|QUERY_INFORMATION, and
+  a non-elevated taskkill /F really ends it (fails with 0x121000 and with 0x121001).
+  Run check: the newly built exe was started, a visible window appeared, it kept responding for a few seconds and it
+  closed normally on WM_CLOSE (results in 05 8.7).
+- Linux build test failure (2026-11-08): three position tests in frame_tests failed in the Linux build (build.sh).
+  A headless build has no DISPLAY, so position_supported() answers "no display" and the product correctly switches
+  "Remember window position" off, but the tests assumed positions are always reported, as on Windows (a Wayland
+  desktop gives the same result). Product behaviour is unchanged: Tracker keeps the platform check in a field (default
+  shield_platform::display::position_supported) and the tests pin "supported" with with_support. The new test
+  a_window_system_without_positions_switches_the_option_off pins "unsupported" (Wayland) and checks off + reason,
+  nothing saved and the file keeping the user's value, on every OS. Checked by running the whole cargo test
+  --workspace --release in a Linux container without DISPLAY.
+
+12.12 Fixes from the security review (3.0.0 rebuilt, 2026-11-08)
+Found by the full code review (05 8.8). The container format, crypto parameters and compatibility with existing
+containers are unchanged.
+- H1 (high) DLLs loaded from the exe's own folder: imported DLLs that are not KnownDLLs (dwmapi, uxtheme, propsys,
+  vcruntime140 ...) were looked up next to the exe first. A DLL with such a name next to the portable exe (Downloads)
+  ran inside Shield before main and before the process hardening. Reproduced: a fake dwmapi.dll / vcruntime140.dll
+  made it exit with 0xC000012F. Fix: /DEPENDENTLOADFLAG:0x800 in both exes' build.rs (imported DLLs from System32
+  only) and a static C runtime via .cargo\config.toml (no vcruntime140.dll; also starts on PCs without the VC++
+  runtime).
+- F1 (medium) settings password bypass: deleting the auth_* lines of settings.toml together with settings.key was
+  taken as "no password was ever set" and the protected values written into the file were used (no warning, the
+  settings password gone). Fix: a file without a password is valid only with the protected values at their defaults
+  (the only values a save without the password can write); otherwise defaults + tamper warning. Removing the settings
+  password also returns the protected values to the defaults (said in the button's tooltip). 2.x files (schema 1, no
+  settings password existed) move to the defaults without a warning.
+- F2 (low) DPAPI entropy: settings.key was sealed without CryptProtectData's optional entropy, so tools that unseal all
+  of a user's DPAPI data got the MAC key. It is now sealed with a fixed entropy; files written by 3.0.0 still open
+  (resealed at the next unlocked save). A same-user program that knows Shield is still not stopped (01 section 7).
+- F3 (low) "Lock on focus loss" was shown as protected but not covered by the MAC. It is protected now and the MAC label
+  is v2. The v1 MAC written by 3.0.0 is accepted and becomes v2 at the next save.
+- F4 (low) reusing a folder somebody else made: existing spool and update folders were used without checking the
+  owner (on Linux another user could create them in advance when /tmp is the fallback). Only a real folder owned by
+  this user (on Linux not writable by group/others) is reused now; otherwise spool does not collect (own items only)
+  and an update stops with an error.
+- F5 (low) folder swapped while listing: replacing a checked folder by a junction/link before read_dir put files
+  outside the selection into the list, to be shredded after encryption. Folders are now held by a handle (Windows: it
+  can't be renamed or deleted while held) and every entry must really be in that folder (its handle's real path);
+  otherwise nothing is done.
+- F6 (low) MotW: the download mark was added after the move to the destination (unmarked for a moment) and a
+  Zone.Identifier over 64 KiB counted as "no mark". It is now added inside the private staging folder before the move
+  (a same-volume rename keeps it), and a mark that is too large or unreadable becomes the Internet zone (ZoneId=3).
+- F7 (low) TRIM elevation: when WMI failed, Shield ran itself again through runas. A portable copy lies in a folder its
+  user can write, so together with H1 this meant code running as administrator. Now only System32\defrag.exe <drive>:
+  /L is elevated, and run_elevated refuses anything outside System32 before any UAC prompt.
+- F8 (info) the process DACL relaxation of 12.11 (same user may end / query) is deliberate; memory access stays denied.
+- Tests: settings_auth (the bypass, removing the password, 2.x migration, v1 MAC, focus lock), manifest (entries outside
+  the folder refused, a held folder can't be renamed), shield-platform (own-folder check on Windows/Linux, DPAPI entropy
+  and opening a 3.0.0 key, large Zone.Identifier, TRIM elevates only a System32 tool), release_tests (DLL search
+  setting, static runtime, no RUSTFLAGS). Run checks in 05 8.8.

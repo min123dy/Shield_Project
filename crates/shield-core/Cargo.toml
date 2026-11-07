@@ -1,0 +1,36 @@
+[package]
+name = "shield-core"
+description = "Shield: container format, cryptography, archive, shredding policy, settings, updates (no OS-specific code)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shield-platform = { path = "../shield-platform" }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+argon2 = { version = "0.5", features = ["zeroize"] }
+sha3 = { workspace = true }
+hkdf = "0.12"
+hmac = "0.12"
+zeroize = { workspace = true }
+rand = "0.8"
+rand_chacha = "0.3"
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "zstd"] }
+unicode-normalization = "0.1"
+# password length is counted in user-perceived characters (grapheme clusters: Hangul, emoji)
+unicode-segmentation = "1"
+dirs = "6"
+# OpenPGP (signature verification only; see src/sigverify.rs)
+pgp = { version = "0.21", default-features = false }
+bp256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+bp384 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "std"] }
+ecdsa = { version = "0.17", default-features = false, features = ["algorithm", "std"] }
+# updates: HTTPS only (rustls + Mozilla roots), JSON of the GitHub API, SHA-256 of the manifest
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+serde_json = "1"
+sha2 = "0.10"
+
+[dev-dependencies]
+ab_glyph = "0.2"
+

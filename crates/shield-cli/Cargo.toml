@@ -1,0 +1,27 @@
+[package]
+name = "shield-cli"
+description = "Shield console program `shield` (with the `gui` feature also `shield gui ...`)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "shield"
+path = "src/main.rs"
+
+[features]
+default = ["gui"]
+# `shield gui ...` and the launcher flags; without it the console-only build has no GUI dependencies
+gui = ["dep:shield-gui"]
+
+[dependencies]
+shield-core = { path = "../shield-core" }
+shield-platform = { path = "../shield-platform" }
+shield-gui = { path = "../shield-gui", optional = true }
+zeroize = { workspace = true }
+crossterm = { version = "0.29", default-features = false, features = ["events", "windows", "bracketed-paste"] }
+ctrlc = { version = "3.5", features = ["termination"] }
+serde_json = "1"
+# display width of Hangul in the help layout (already in the lock file)
+unicode-width = "0.1"

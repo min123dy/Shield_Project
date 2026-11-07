@@ -1,0 +1,132 @@
+# Shield release build: Windows (MSI, portable, console) and Linux x86_64 / aarch64 (deb, AppImage,
+# static console), one signed release manifest, GitHub release on a vX.Y.Z tag.
+#
+# Repository secrets (Settings > Secrets and variables > Actions), never files in the repository:
+#   SHIELD_GPG_KEY         armored secret SIGNING SUBKEY only (gpg --export-secret-subkeys --armor <fpr>!)
+#   SHIELD_GPG_PASSPHRASE  its passphrase
+# Repository variables (optional):
+#   APPIMAGETOOL_URL / APPIMAGETOOL_SHA256   pinned appimagetool; without both no AppImage is built
+# The key is imported into a throwaway GNUPGHOME under RUNNER_TEMP and deleted at the end of each
+# job; the passphrase only reaches gpg through a 0600 file in that folder. Nothing secret is echoed
+# (GitHub also masks secret values in logs). Without the secrets the build runs unsigned.
+name: release
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      HAS_KEY: ${{ secrets.SHIELD_GPG_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Import signing key
+        if: ${{ env.HAS_KEY == 'true' }}
+        shell: pwsh
+        env:
+          KEY: ${{ secrets.SHIELD_GPG_KEY }}
+          PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
+        run: |
+          $h = Join-Path $env:RUNNER_TEMP "gnupg"; New-Item -ItemType Directory $h | Out-Null
+          [IO.File]::WriteAllText("$h\pp", $env:PASS)
+          [IO.File]::WriteAllText("$h\gpg.conf", "pinentry-mode loopback`npassphrase-file $($h -replace '\\','/')/pp`n")
+          $env:KEY | gpg --homedir $h --batch --import 2>&1 | Out-Null
+          "GPG_HOME=$h" >> $env:GITHUB_ENV
+          "SIGN=-Sign" >> $env:GITHUB_ENV
+      - name: Build
+        shell: pwsh
+        run: |
+          $sign = if ($env:SIGN) { @{ Sign = $true; GpgHome = $env:GPG_HOME } } else { @{ NoSign = $true } }
+          .\build.ps1 -RepoUrl "https://github.com/${{ github.repository }}" -Variants msi,portable,console -NoUpx @sign
+      - name: Remove key
+        if: always()
+        shell: pwsh
+        run: if ($env:GPG_HOME) { gpgconf --homedir $env:GPG_HOME --kill gpg-agent; Remove-Item -Recurse -Force $env:GPG_HOME }
+      - uses: actions/upload-artifact@v4
+        with: { name: windows, path: dist/ }
+
+  linux:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    env:
+      HAS_KEY: ${{ secrets.SHIELD_GPG_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgtk-3-dev libxkbcommon-dev libwayland-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev musl-tools dpkg-dev file
+          rustup target add "$(uname -m)-unknown-linux-musl"
+      - name: appimagetool (pinned)
+        if: ${{ vars.APPIMAGETOOL_URL != '' && vars.APPIMAGETOOL_SHA256 != '' }}
+        run: |
+          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/appimagetool" "${{ vars.APPIMAGETOOL_URL }}"
+          echo "${{ vars.APPIMAGETOOL_SHA256 }}  $RUNNER_TEMP/appimagetool" | sha256sum -c -
+          chmod 0755 "$RUNNER_TEMP/appimagetool"
+          echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
+          echo "VARIANTS=deb,appimage,console" >> "$GITHUB_ENV"
+      - name: Import signing key
+        if: ${{ env.HAS_KEY == 'true' }}
+        env:
+          KEY: ${{ secrets.SHIELD_GPG_KEY }}
+          PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
+        run: |
+          h="$RUNNER_TEMP/gnupg"; mkdir -m 700 "$h"
+          ( umask 077; printf '%s' "$PASS" > "$h/pp"; printf 'pinentry-mode loopback\npassphrase-file %s/pp\n' "$h" > "$h/gpg.conf" )
+          printf '%s\n' "$KEY" | gpg --homedir "$h" --batch --import >/dev/null 2>&1
+          echo "GPG_HOME=$h" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          s=--no-sign; [ -n "${GPG_HOME:-}" ] && s="--sign --gpg-home $GPG_HOME"
+          SHIELD_VARIANTS=${VARIANTS:-deb,console} ./build.sh --repo "https://github.com/${{ github.repository }}" $s
+      - name: Remove key
+        if: always()
+        run: '[ -z "${GPG_HOME:-}" ] || { gpgconf --homedir "$GPG_HOME" --kill gpg-agent || true; rm -rf "$GPG_HOME"; }'
+      - uses: actions/upload-artifact@v4
+        with: { name: "linux-${{ matrix.runner }}", path: dist/ }
+
+  release:
+    needs: [windows, linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: parts }
+      - name: One manifest for all packages
+        run: |
+          v="${GITHUB_REF_NAME#v}"; mkdir out
+          for d in parts/*; do for f in "$d"/*; do
+            case "$(basename "$f")" in Shield_v*_release.txt*|SHA256SUMS.txt|VERIFY.txt) ;; *) cp -n "$f" out/ ;; esac
+          done; done
+          { echo "Shield release manifest 1"; echo "version $v"
+            cat parts/*/Shield_v"${v}"_release.txt | grep '^sha256 ' | sort -u -k3; } > "out/Shield_v${v}_release.txt"
+          # every listed hash must match the file that is published
+          (cd out && grep '^sha256 ' "Shield_v${v}_release.txt" | awk '{print $2"  "$3}' | sha256sum -c -)
+      - name: Sign the manifest
+        env:
+          KEY: ${{ secrets.SHIELD_GPG_KEY }}
+          PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          [ -n "$KEY" ] || { echo "no signing key: release without manifest signature (updates will refuse it)" >&2; exit 0; }
+          h="$RUNNER_TEMP/gnupg"; mkdir -m 700 "$h"
+          ( umask 077; printf '%s' "$PASS" > "$h/pp" )
+          printf '%s\n' "$KEY" | gpg --homedir "$h" --batch --import >/dev/null 2>&1
+          gpg --homedir "$h" --batch --pinentry-mode loopback --passphrase-file "$h/pp" --digest-algo SHA512 \
+              --detach-sign --output "out/Shield_v${v}_release.txt.sig" "out/Shield_v${v}_release.txt"
+          gpgconf --homedir "$h" --kill gpg-agent || true; rm -rf "$h"
+      - name: Checksums and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd out && sha256sum * > SHA256SUMS.txt)
+          gh release create "$GITHUB_REF_NAME" out/* --repo "${{ github.repository }}" --title "Shield ${GITHUB_REF_NAME}" --notes "Verify: shield verify <file> <file>.sig  (see VERIFY.txt in each build)"

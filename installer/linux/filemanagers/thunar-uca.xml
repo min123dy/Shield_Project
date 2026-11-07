@@ -1,0 +1,11 @@
+<!-- Add inside <actions> of ~/.config/Thunar/uca.xml (Thunar > Edit > Configure custom actions),
+     or run /usr/share/shield/integrate.sh which does it for the current user. -->
+<action>
+  <icon>shield</icon>
+  <name>Encrypt with Shield</name>
+  <unique-id>shield-encrypt-3</unique-id>
+  <command>shield-gui --encrypt-multi %F</command>
+  <description>One container or one per item (asked)</description>
+  <patterns>*</patterns>
+  <directories/><audio-files/><image-files/><other-files/><text-files/><video-files/>
+</action>

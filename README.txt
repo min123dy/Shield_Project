@@ -1,31 +1,25 @@
-SHIELD 2.0 - 프로젝트 파일
+SHIELD 3.0.0 - 프로젝트 파일 / project files
 
-빌드: PowerShell에서 이 폴더를 연 뒤 .\build.ps1 실행
-  - 시작할 때 "GPG 서명을 하시겠습니까?"를 묻습니다.
-  - 비대화형: .\build.ps1 -NoSign  또는  .\build.ps1 -Sign -PublicKeyPath <공개키.asc>
-  - 결과: Shield.msi, dist\ (소스 zip, MSI, SHA256SUMS.txt, 서명 시 .sig·공개키·VERIFY.txt)
+빌드 / Build
+  Windows (PowerShell): .\build.ps1 [-RepoUrl https://github.com/<owner>/<repo>] [-Sign | -NoSign] [-Variants msi,portable,console]
+  Linux (bash):         ./build.sh  [--repo https://github.com/<owner>/<repo>] [--sign | --no-sign] [--variants deb,appimage,console,zip]
+  입력이 없으면 터미널에서 묻습니다 / missing inputs are asked in the terminal.
+  결과 / output: dist\ (MSI, portable, console, deb, AppImage, Shield_Project_v3_0_0.zip, release manifest, SHA256SUMS.txt,
+                  서명 시 .sig·공개키·VERIFY.txt / when signed: .sig files, public key, VERIFY.txt)
 
-프로그램은 실행 파일 하나에 창이 두 개입니다 (7-Zip의 압축 창과 파일 관리자처럼).
-  shield.exe                       암호화 창 (암호화 / 복호화 / 비밀번호·키 교체 / 디스크 정리 / 알고리즘·정보 / 사용법)
-  shield.exe --manager [경로]      파일 관리자 창 (파일 탐색, .shd 열기·일부 추출·파일 추가 / 사용법)
-  shield.exe --open <파일.shd>     파일 관리자 창에서 컨테이너 열기 화면으로 시작
-  shield.exe --encrypt <경로>      암호화 창, 대상 선택됨
-  shield.exe --decrypt <파일.shd>  암호화 창, 복호화 탭
+프로그램 / Programs
+  shield-gui                         암호화 창 / encryption window
+  shield-gui --manager [경로|path]    파일 관리자 / file manager
+  shield-gui --open <c.shd>          컨테이너 열기 / open a container
+  shield-gui --encrypt-multi <...>   여러 항목 암호화 / encrypt several items
+  shield-gui --decrypt <c.shd>       복호화 / decrypt
+  shield help                        명령줄 도움말 / command-line help
 
-문서:
-  docs\01_프로젝트_설명.txt   구조, 암호 구성, 파일 형식, 한계
-  docs\02_빌드_방법.txt       빌드·서명·배포 절차
-  docs\03_사용_방법.txt       사용 설명서 (MSI에 포함되어 설치 폴더 "사용 방법.txt"로 설치)
-  docs\04_설치_안내.txt       설치 첫 화면의 주의사항
-  docs\05_테스트_및_수정_기록.txt  실행한 테스트, 발견한 문제와 수정 내용, 남은 확인 사항
-
-2.0 주요 변경 (요약)
-- 하위 호환 제거: 1.x 형식(.shd v1)은 열지 않습니다. 1.x로 복호화한 뒤 2.0으로 다시 암호화하세요.
-- 암호: XChaCha20-Poly1305 (청크·메타·키 슬롯·임시 파일 모두), Argon2id 메모리 256 MiB · 병렬도 4 · 반복 3+PIM,
-  해시 SHA3-512 (SHA-2 제거), 형식 버전·알고리즘 ID는 암호화된 메타데이터 안에 저장
-- 길이 은닉: 무작위 패딩 0 ~ clamp(실제 길이/16, 64 KiB, 1 GiB)
-- 압축: 크기·메모리·CPU를 보고 LZMA2 또는 Zstandard 자동 선택, 이미 압축된 파일은 무압축 저장, 해제 시 자원 제한
-- 원본 파쇄: 목록 확정 → 전체 복원 검증(SHA3-512) 통과 후, 목록에 있고 바뀌지 않은 파일만 파쇄 (하드 링크·링크 제외)
-- 임시 데이터: 사용자 전용 권한의 스테이징 폴더, 비정상 종료 후 남은 폴더 감지, SecTemp 블록 인증 강화
-- UI 분리: 암호화 창 + 파일 관리자 창, 알고리즘·정보 탭, 창별 사용법 탭, "SHIELD에서 열기" 우클릭 메뉴
-- 빌드: GPG 분리 서명(.sig) 선택, dist\ 산출물
+문서 / Documents
+  docs\01_프로젝트_설명.txt      docs\en\01_overview.txt        구조, 암호, 한계 / layout, crypto, limits
+  docs\02_빌드_방법.txt          docs\en\02_build.txt           빌드·서명·CI / build, signing, CI
+  docs\03_사용_방법.txt          docs\en\03_usage.txt           사용 설명서 / user guide
+  docs\04_설치_안내.txt          docs\en\04_install_notes.txt   설치 첫 화면 / installer notes
+  docs\05_테스트_및_점검_기록.txt docs\en\05_test_and_audit.txt  테스트·보안 점검 / tests, audit
+  docs\06_3.0.0_수정_기록.txt    docs\en\06_changes_3.0.0.txt   3.0 변경 / 3.0 changes
+  docs\history\                  2.x 기록 / 2.x records

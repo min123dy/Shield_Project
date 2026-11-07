@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WiX 5 (built by build.ps1):
+     wix build -arch x64 -culture ko-KR|en-US -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext
+               -d Version=<Cargo.toml version> -d NoticeRtf=<generated rtf> -d Bin=<release dir>
+               -d Signed=yes|no -loc installer.<culture>.wxl installer.wxs -o Shield_v<V>_x64.msi
+     Files: shield-gui.exe (windows, Explorer verbs, Start menu) and shield.exe (console, on PATH).
+     With Signed=yes the detached OpenPGP signatures (<exe>.sig) are installed next to the programs
+     for the in-app integrity check. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <!-- UpgradeCode: DO NOT CHANGE. It is the product family's identity: 2.1.0 (Shield.msi,
+       ProductCode {BACDC814-7CE4-4CE2-891B-40B4CA1A434A}), the 3.0.0 betas and 3.0.0 all use it,
+       and Windows Installer finds the installed version to replace only through it. A new code
+       makes the next MSI install next to the old one (two "Shield" entries, two sets of verbs).
+       Version: the MSI version from build.ps1 (X.Y.Z; a pre-release X.0.0-beta.N is built as
+       (X-1).99.N so that the release replaces it; Windows Installer compares only 3 fields). -->
+  <Package Name="Shield" Manufacturer="Shield" Version="$(var.Version)" Language="!(loc.Lcid)" Codepage="!(loc.Codepage)"
+           UpgradeCode="6B1E5C0A-3D7F-4C52-9A1B-0F8E2D4C7A91" Scope="perMachine">
+    <!-- Older versions are replaced; a same-version reinstall repairs. Downgrades are refused.
+         IgnoreLanguage: the MSI is built per culture (ko-KR 1042 / en-US 1033). Without it the
+         Upgrade table lists only the package's own language, so an English 3.0.0 did not see a
+         Korean 2.1.0 (or the reverse) and both stayed installed (3.0.0 §5). Schedule
+         afterInstallValidate (default): the old version is removed completely first, so its
+         files, verbs and PATH entry are never left twice. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" IgnoreLanguage="yes" Schedule="afterInstallValidate" DowngradeErrorMessage="!(loc.Downgrade)" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="ShieldIcon" SourceFile="$(var.Bin)\shield-gui.exe" />
+    <Property Id="ARPPRODUCTICON" Value="ShieldIcon" />
+
+    <!-- Installer UI: notice (cautions + usage, must be accepted) -> progress -> finish (+ launch). -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(var.NoticeRtf)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="!(loc.ExitText)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="!(loc.LaunchNow)" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#ShieldGuiExe]" />
+    <CustomAction Id="LaunchShield" BinaryRef="Wix4UtilCA_$(sys.BUILDARCHSHORT)" DllEntry="WixShellExec" Impersonate="yes" />
+    <UI>
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchShield"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Shield" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Shield" />
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Shield" Level="1">
+      <ComponentRef Id="GuiExe" />
+      <ComponentRef Id="ConsoleExe" />
+      <ComponentRef Id="ConsolePath" />
+      <ComponentRef Id="UserGuide" />
+      <ComponentRef Id="ShellEncrypt" />
+      <ComponentRef Id="ShellDecrypt" />
+      <ComponentRef Id="ShellOpen" />
+      <?if $(var.Signed) = "yes" ?>
+      <ComponentRef Id="GuiSignature" />
+      <ComponentRef Id="ConsoleSignature" />
+      <?endif?>
+    </Feature>
+
+    <!-- Component GUIDs: DO NOT CHANGE. Pinned to the values WiX derived for these key paths in
+         3.0.0 (ConsoleExe's equals 2.1.0's AppExe: same file Program Files\Shield\shield.exe), so
+         renaming an Id or a source file can't create a second component for the same resource.
+         UserGuide and the .sig files keep automatic GUIDs (their name depends on the culture). -->
+    <Component Id="GuiExe" Directory="INSTALLFOLDER" Bitness="always64" Guid="2149D7DF-3449-5EC9-9F05-D5D77B0E8A13">
+      <File Id="ShieldGuiExe" Source="$(var.Bin)\shield-gui.exe" KeyPath="yes">
+        <Shortcut Id="AppStartMenuShortcut" Directory="ApplicationProgramsFolder" Name="Shield"
+                  Description="!(loc.ShortcutDesc)" WorkingDirectory="INSTALLFOLDER" Icon="ShieldIcon" />
+        <Shortcut Id="ManagerStartMenuShortcut" Directory="ApplicationProgramsFolder" Name="!(loc.ManagerName)"
+                  Description="!(loc.ManagerDesc)" Arguments="--manager" WorkingDirectory="INSTALLFOLDER" Icon="ShieldIcon" />
+      </File>
+    </Component>
+
+    <!-- Console program `shield` (shield help). -->
+    <Component Id="ConsoleExe" Directory="INSTALLFOLDER" Bitness="always64" Guid="50338B79-36DE-5605-9117-ED7A4F0FD500">
+      <File Id="ShieldConsoleExe" Source="$(var.Bin)\shield.exe" KeyPath="yes" />
+    </Component>
+
+    <!-- The install folder is appended to the system PATH and removed again on uninstall.
+         Windows Installer does not append a value that is already in PATH (repair, reinstall),
+         and the major upgrade removes the old entry before the new one is written. -->
+    <Component Id="ConsolePath" Directory="INSTALLFOLDER" Bitness="always64" Guid="9C3A41E2-7B5D-4E08-8F16-2D7C5B0A9E31">
+      <Environment Id="ShieldPath" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
+      <CreateFolder />
+    </Component>
+
+    <?if $(var.Signed) = "yes" ?>
+    <!-- one component per .sig: unversioned files need their own component for an automatic GUID -->
+    <Component Id="GuiSignature" Directory="INSTALLFOLDER" Bitness="always64">
+      <File Id="ShieldGuiSig" Source="$(var.Bin)\shield-gui.exe.sig" KeyPath="yes" />
+    </Component>
+    <Component Id="ConsoleSignature" Directory="INSTALLFOLDER" Bitness="always64">
+      <File Id="ShieldConsoleSig" Source="$(var.Bin)\shield.exe.sig" KeyPath="yes" />
+    </Component>
+    <?endif?>
+
+    <Component Id="UserGuide" Directory="INSTALLFOLDER" Bitness="always64">
+      <File Id="UserGuideFile" Source="!(loc.GuideSource)" Name="!(loc.GuideName)" KeyPath="yes">
+        <Shortcut Id="UserGuideStartMenuShortcut" Directory="ApplicationProgramsFolder" Name="!(loc.GuideShortcut)"
+                  Description="!(loc.GuideDesc)" />
+      </File>
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+    </Component>
+
+    <!-- Right-click "encrypt" on files and folders. With several selected items Explorer starts one
+         process per item; Shield gathers them (private spool, one leader) and asks "separately or
+         bundled" once. MultiSelectModel=Player lifts Explorer's 15-item limit.
+         Win10: shown directly. Win11: under "Show more options" (classic menu). -->
+    <Component Id="ShellEncrypt" Directory="INSTALLFOLDER" Bitness="always64" Guid="B14657AC-1287-5D56-8858-EEB0FA8885E1">
+      <RegistryKey Root="HKCR" Key="*\shell\Shield.Encrypt">
+        <RegistryValue Type="string" Value="!(loc.VerbEncrypt)" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryValue Type="string" Name="MultiSelectModel" Value="Player" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --encrypt-multi "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKCR" Key="Directory\shell\Shield.Encrypt">
+        <RegistryValue Type="string" Value="!(loc.VerbEncrypt)" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryValue Type="string" Name="MultiSelectModel" Value="Player" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --encrypt-multi "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+
+    <Component Id="ShellDecrypt" Directory="INSTALLFOLDER" Bitness="always64" Guid="D36A412F-9CF9-5678-9480-CADEDC89AB90">
+      <RegistryKey Root="HKCR" Key="SystemFileAssociations\.shd\shell\Shield.Decrypt">
+        <RegistryValue Type="string" Value="!(loc.VerbDecrypt)" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --decrypt "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+
+    <Component Id="ShellOpen" Directory="INSTALLFOLDER" Bitness="always64" Guid="FAD7429D-1362-5A6A-BA62-507E092764CC">
+      <RegistryKey Root="HKCR" Key="SystemFileAssociations\.shd\shell\Shield.Open">
+        <RegistryValue Type="string" Value="!(loc.VerbOpen)" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --open "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+  </Package>
+</Wix>

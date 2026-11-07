@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Open in SHIELD
+Name[ko]=SHIELD에서 열기
+Comment=Browse a .shd container
+Comment[ko]=.shd 컨테이너 내용 보기
+Exec=shield-gui --open %f
+Icon=shield
+Terminal=false
+NoDisplay=true
+MimeType=application/x-shield-container;

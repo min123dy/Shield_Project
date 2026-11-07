@@ -1,0 +1,26 @@
+[Desktop Entry]
+Type=Application
+Name=Shield
+Name[ko]=Shield
+GenericName=File encryption
+GenericName[ko]=파일 암호화
+Comment=Encrypt files and folders into .shd containers
+Comment[ko]=파일과 폴더를 .shd 컨테이너로 암호화
+Exec=shield-gui --encrypt-multi %F
+Icon=shield
+Terminal=false
+Categories=Utility;Security;
+MimeType=application/x-shield-container;
+Keywords=encrypt;decrypt;container;암호화;복호화;
+StartupWMClass=shield
+Actions=manager;decrypt;
+
+[Desktop Action manager]
+Name=Shield file manager
+Name[ko]=Shield 파일 관리자
+Exec=shield-gui --manager
+
+[Desktop Action decrypt]
+Name=Decrypt with Shield
+Name[ko]=Shield로 복호화
+Exec=shield-gui --decrypt %f

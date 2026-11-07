@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Korean texts of installer.wxs, and overrides of the WixUI texts (the first page shows cautions
+     and usage, not a license). -->
+<WixLocalization Culture="ko-KR" Codepage="949" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="Lcid" Value="1042" />
+  <String Id="Codepage" Value="949" />
+  <String Id="WelcomeEulaDlgTitle" Value="{\WixUI_Font_Title}[ProductName] 설치 전 주의사항과 사용법을 확인하세요." />
+  <String Id="WelcomeEulaDlgLicenseAcceptedCheckBox" Value="주의사항을 읽고 이해했습니다(&amp;A)" />
+  <String Id="Downgrade" Value="더 새로운 버전의 Shield가 이미 설치되어 있습니다. 먼저 제거한 뒤 설치하세요." />
+  <String Id="ExitText" Value="설치가 끝났습니다. 시작 메뉴의 Shield와 Shield 파일 관리자, 탐색기 우클릭 메뉴, 또는 명령 프롬프트의 shield 명령(shield help)으로 사용할 수 있습니다. 새 명령 창을 열어야 PATH가 적용됩니다." />
+  <String Id="LaunchNow" Value="지금 Shield 실행" />
+  <String Id="ShortcutDesc" Value="Shield 파일 암호화" />
+  <String Id="ManagerName" Value="Shield 파일 관리자" />
+  <String Id="ManagerDesc" Value="파일 탐색 및 .shd 컨테이너 열기" />
+  <String Id="GuideSource" Value="docs\03_사용_방법.txt" />
+  <String Id="GuideName" Value="사용 방법.txt" />
+  <String Id="GuideShortcut" Value="Shield 사용 설명서" />
+  <String Id="GuideDesc" Value="Shield 암호화 프로그램 사용 방법" />
+  <String Id="VerbEncrypt" Value="Shield로 암호화" />
+  <String Id="VerbDecrypt" Value="Shield로 복호화" />
+  <String Id="VerbOpen" Value="SHIELD에서 열기" />
+</WixLocalization>

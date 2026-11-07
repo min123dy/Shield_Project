@@ -1,0 +1,13 @@
+# cargo audit (3.0.0 section 6). Each ignored advisory was reviewed; see docs/05 (audit log).
+[advisories]
+ignore = [
+    # rsa 0.9 (Marvin attack) and crypto-bigint 0.5 (timing): only reached through `pgp` for
+    # verifying release signatures with a PUBLIC key. Timing side channels need secret-key
+    # operations (decrypt / sign), which Shield never performs. No fixed rsa release exists.
+    "RUSTSEC-2023-0071",
+    "RUSTSEC-2026-0387",
+    # webbrowser 0.8 (BROWSER argument injection, Unix): pulled in by egui-winit 0.27's always-on
+    # "links" feature. Unreachable: shield-gui drops every egui open_url request at the end of
+    # each frame (shell::end_frame, tested); its own links go through Platform::open_url.
+    "RUSTSEC-2026-0257",
+]

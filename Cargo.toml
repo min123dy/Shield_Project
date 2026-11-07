@@ -1,52 +1,16 @@
-[package]
-name = "shield"
-version = "2.1.0"
+[workspace]
+resolver = "2"
+members = ["crates/shield-platform", "crates/shield-core", "crates/shield-gui", "crates/shield-cli"]
+
+[workspace.package]
+version = "3.0.0"
 edition = "2021"
+license = "GPL-3.0-or-later"
+rust-version = "1.89"
 
-[dependencies]
-chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
-argon2 = { version = "0.5", features = ["zeroize"] }
-sha3 = { version = "0.10", features = ["zeroize"] }
+[workspace.dependencies]
 zeroize = "1"
-rand = "0.8"
-rand_chacha = "0.3"
-sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "zstd"] }
-unicode-normalization = "0.1"
-eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
-rfd = "0.14"
-
-[dev-dependencies]
-ab_glyph = "0.2"
-
-[build-dependencies]
-winresource = "0.1"
-
-[target.'cfg(windows)'.dependencies]
-serde = { version = "1", features = ["derive"] }
-wmi = "0.18.4"
-windows-sys = { version = "0.52", features = [
-  "Win32_Foundation",
-  "Win32_Globalization",
-  "Win32_Graphics_Dwm",
-  "Win32_Security",
-  "Win32_Security_Authorization",
-  "Win32_Storage_FileSystem",
-  "Win32_System_DataExchange",
-  "Win32_System_IO",
-  "Win32_System_Ioctl",
-  "Win32_System_LibraryLoader",
-  "Win32_System_Memory",
-  "Win32_System_Registry",
-  "Win32_System_SystemInformation",
-  "Win32_System_Threading",
-  "Win32_System_Time",
-  "Win32_System_Diagnostics_Debug",
-  "Win32_UI_Shell",
-  "Win32_UI_WindowsAndMessaging",
-] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+sha3 = { version = "0.10", features = ["zeroize"] }
 
 [profile.release]
 opt-level = 3
@@ -54,5 +18,6 @@ lto = true
 codegen-units = 1
 strip = true
 
-[workspace]
-resolver = "2"
+# Tests run Argon2id (256 MiB) many times: keep the crypto crates optimised in debug test builds too.
+[profile.dev.package."*"]
+opt-level = 3

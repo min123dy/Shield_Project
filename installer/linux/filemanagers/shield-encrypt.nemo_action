@@ -1,0 +1,9 @@
+[Nemo Action]
+Name=Encrypt with Shield
+Name[ko]=Shield로 암호화
+Comment=One container or one per item (asked)
+Exec=shield-gui --encrypt-multi %F
+Icon-Name=shield
+Selection=notnone
+Extensions=any;
+Quote=double

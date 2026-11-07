@@ -1,0 +1,364 @@
+Shield X.Y.Z - file encryption (XChaCha20-Poly1305, Argon2id)
+
+USAGE
+  shield <command> [options] [files...]
+
+COMMANDS
+  encrypt <items...>        Creates a new container. Several items go into one
+                            container, or into one container each with
+                            --separate.
+  decrypt <file.shd>        Extracts a container next to it, or into the folder
+                            given with -o.
+  list <file.shd>           Shows the contents of a container.
+  add <file.shd> <items...>
+                            Adds files or folders to a container.
+  remove <file.shd> <entries...>
+                            Removes entries from a container; their old data is
+                            overwritten.
+  change-password <file.shd>
+                            Changes the password, key files or PIM by rewrapping
+                            the key (fast; the data is not re-encrypted).
+  rekey <file.shd>          Re-encrypts everything with new keys and overwrites
+                            the old data.
+  keyfile <path>            Creates a random key file.
+  verify <file> <file.sig>  Checks an OpenPGP signature (default key: the
+                            release key built into this program).
+  update                    Looks for a new release; its signature is checked
+                            and you are asked before it is installed.
+  entropy                   Shows the randomness sources and their state, or
+                            switches additional sources on or off.
+  version                   Shows the version, the release key fingerprint and
+                            the result of the program integrity check.
+  help [command]            Shows this help, or the help of one command.
+  gui [encrypt [items...] | decrypt [file.shd] | explorer [file.shd] |
+    settings | open <file.shd>]
+                            Opens a window (not available in the console-only
+                            build).
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+  -- ends the options: everything after it is a file name (also names that start
+  with -).
+
+EXIT CODES
+  0 done · 1 failed · 2 usage · 3 wrong password / key file / PIM or damaged
+  file · 4 signature not good · 5 cancelled · 6 file in use · 130 interrupted
+
+  `shield help <command>` or `shield <command> --help` shows the options of a
+  command.
+
+===== encrypt
+USAGE
+  shield encrypt [options] <items...>
+
+  Creates a new container. Several items go into one container, or into one
+  container each with --separate.
+
+OPTIONS
+  -o, --output <path>       the container (with --separate: the folder for the
+                            containers)
+  --separate                one container per item
+  --shred                   overwrite and delete the originals afterwards (asks
+                            first)
+  --passes 3|7              overwrite passes (default from the settings)
+  --wipe-free               with --shred: also overwrite the free space of those
+                            drives
+  --strength auto|fast|balanced|max
+                            compression
+  --include-streams         also overwrite alternate data streams (Windows)
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== decrypt
+USAGE
+  shield decrypt [options] <file.shd>
+
+  Extracts a container next to it, or into the folder given with -o.
+
+OPTIONS
+  -o, --output <folder>     folder to extract into
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== list
+USAGE
+  shield list [options] <file.shd>
+
+  Shows the contents of a container.
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== add
+USAGE
+  shield add [options] <file.shd> <items...>
+
+  Adds files or folders to a container.
+
+OPTIONS
+  --into <folder>           folder inside the container
+  --overwrite               replace entries that already exist
+  --shred                   overwrite and delete the added originals afterwards
+                            (asks first)
+  --passes 3|7              overwrite passes (default from the settings)
+  --strength auto|fast|balanced|max
+                            compression
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== remove
+USAGE
+  shield remove [options] <file.shd> <entries...>
+
+  Removes entries from a container; their old data is overwritten.
+
+OPTIONS
+  --passes 3|7              overwrite passes (default from the settings)
+  --strength auto|fast|balanced|max
+                            compression
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== change-password
+USAGE
+  shield change-password [options] <file.shd>
+
+  Changes the password, key files or PIM by rewrapping the key (fast; the data
+  is not re-encrypted).
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+NEW CREDENTIALS
+  --new-keyfile <path>      new key file (repeat for several)
+  --new-pim <0-64>          new PIM
+  --new-password <password>
+                            new password as an argument (same rules as
+                            --password)
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== rekey
+USAGE
+  shield rekey [options] <file.shd>
+
+  Re-encrypts everything with new keys and overwrites the old data.
+
+OPTIONS
+  --passes 3|7              overwrite passes (default from the settings)
+
+CREDENTIALS
+  -k, --keyfile <path>      key file (repeat for several)
+  --pim <0-64>              PIM; the default comes from the settings
+  --reveal                  show the typed password on a separate screen,
+                            cleared after Enter
+  --password <password>     password as an argument: only when allowed in the
+                            settings and together with --allow-arg-secrets;
+                            other programs can see it
+  --allow-arg-secrets       accept --password / --new-password for this run
+
+NEW CREDENTIALS
+  --new-keyfile <path>      new key file (repeat for several)
+  --new-pim <0-64>          new PIM
+  --new-password <password>
+                            new password as an argument (same rules as
+                            --password)
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== keyfile
+USAGE
+  shield keyfile [options] <path>
+
+  Creates a random key file.
+
+OPTIONS
+  --size <KiB>              size of the key file
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== verify
+USAGE
+  shield verify [options] <file> <file.sig>
+
+  Checks an OpenPGP signature (default key: the release key built into this
+  program).
+
+OPTIONS
+  --key <key.asc>           OpenPGP public key to check with
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== update
+USAGE
+  shield update [options]
+
+  Looks for a new release; its signature is checked and you are asked before it
+  is installed.
+
+OPTIONS
+  --check                   only check; nothing is downloaded or installed
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== entropy
+USAGE
+  shield entropy [options]
+
+  Shows the randomness sources and their state, or switches additional sources
+  on or off.
+
+OPTIONS
+  --enable <source>         switch a source on (names: `shield entropy`)
+  --disable <source>        switch a source off
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== version
+USAGE
+  shield version [options]
+
+  Shows the version, the release key fingerprint and the result of the program
+  integrity check.
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== help
+USAGE
+  shield help [options] [command]
+
+  Shows this help, or the help of one command.
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed)
+  --lang ko|en              language of the output
+
+===== gui
+USAGE
+  shield gui [encrypt [items...] | decrypt [file.shd] | explorer [file.shd] |
+  settings | open <file.shd>]
+
+  Opens a window (not available in the console-only build).

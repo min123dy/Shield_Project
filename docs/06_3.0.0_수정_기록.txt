@@ -1,0 +1,301 @@
+SHIELD 3.0.0 - 수정 기록 (2.1.0 -> 3.0.0)
+=========================================
+English: docs\en\06_changes_3.0.0.txt. 2.1.0의 기록: docs\history\06_2.1.0_수정_기록.txt
+
+1. 요약
+-------
+- 파일 형식은 바뀌지 않았습니다(v2). 2.x 컨테이너를 그대로 열고, 3.0이 만든 파일도 2.1이 엽니다
+  (여러 항목 묶음은 2.1에서 컨테이너 이름의 폴더로 풀립니다).
+- 약화한 보안 설계 없음: XChaCha20-Poly1305, Argon2id(256 MiB, 병렬도 4), SHA3-512, 헤더 인증, 암호화된 메타데이터,
+  키 메모리 비상주, 작업마다 비밀번호 재입력은 2.1.0과 같습니다.
+- 새 기능: 엔트로피 풀 v4와 소스별 켜고 끄기, 덮어쓰기 3/7회와 스냅숏 경고·자동 TRIM, 서명 검증 업데이트,
+  OpenPGP 무결성 검사와 shield verify, 여러 항목 암호화, 콘솔 프로그램, Linux 판, 설정 비밀번호.
+
+2. 크레이트 구성과 의존성
+-------------------------
+워크스페이스 4개 (§7 요구의 core / platform / gui / cli. installer는 크레이트가 아니라 installer\ 폴더와 빌드 스크립트)
+  shield-platform  dirs 6 / Windows: windows-sys 0.52, wmi 0.18, serde / Linux: libc 0.2
+  shield-core      chacha20poly1305 0.10, argon2 0.5, sha3 0.10, hkdf 0.12, hmac 0.12, zeroize 1, rand 0.8,
+                   rand_chacha 0.3, sevenz-rust2 0.24(LZMA2·Zstandard), unicode-normalization 0.1, dirs 6,
+                   pgp(rPGP) 0.21, bp256·bp384 0.14, ecdsa 0.17, ureq 3(rustls), serde_json 1, sha2 0.10
+  shield-gui       eframe 0.27(glow; Linux는 wayland·x11 추가), rfd 0.14
+  shield-cli       crossterm 0.29, ctrlc 3.5(termination: SIGTERM·SIGHUP), serde_json 1, 선택: shield-gui
+직접 작성한 암호 코드는 없습니다. 엔트로피 풀은 SHA3-512와 HKDF를 조합만 하고, brainpool 서명은 rPGP의 해시
+계산 + RustCrypto의 검증 함수를 연결만 합니다.
+
+검토 후 쓰지 않은 것
+  sequoia-openpgp  Windows에서 CNG 또는 nettle(C) 백엔드가 필요하고, 순수 Rust 백엔드는 brainpool을 검증하지 못함
+  self_update      zipsign/ed25519만 지원(OpenPGP 아님), 실행 파일 교체 방식이라 MSI·deb와 맞지 않음
+  reqwest          ureq보다 의존성이 훨씬 많음(tokio). 업데이트는 요청 몇 개면 충분
+  rpassword        raw 모드·대체 화면·스크롤 기록 삭제·Ctrl+C 처리를 직접 제어할 수 없음 -> crossterm
+
+3. 엔트로피 (§1)
+----------------
+- OS CSPRNG(getrandom / BCryptGenRandom)가 모든 출력의 기본이고 끌 수 없습니다. 실패하면 아무것도 만들지 않습니다.
+- 보조 소스는 SHA3-512 풀에 흡수만 하며, 출력은 HKDF-SHA3-512(OS 난수 64B | 풀 | 카운터), 출력 뒤 풀 재혼합.
+  중간 버퍼는 모두 zeroize. 값은 디스크·로그·네트워크에 나가지 않고 Debug 출력도 없습니다.
+- 상태 표시는 정상/약함(그 밖에 대기·꺼짐·없음)만. health 검사가 반복·고정·단순 증가 값을 내는 소스를 뺍니다.
+
+  이름(shield entropy)  Windows                                   Linux
+  os            BCryptGenRandom (끌 수 없음)              getrandom (끌 수 없음)
+  os_aux        BCryptGenRandom 32B 추가                  AT_RANDOM(커널이 준 16B, 한 번)
+  hwrng         RDRAND/RDSEED (CPU가 지원할 때)            같음
+  timers        QPC, 시스템 시각, tick                    clock_gettime 여러 시계
+  cpu_jitter    타이밍 지터 1024회                         같음
+  memory        GlobalMemoryStatusEx                      /proc/meminfo, /proc/vmstat
+  process       프로세스 시간·핸들·메모리 수치              times, getrusage
+  ids           pid, tid, 힙·스택 주소                    pid, tid, 주소
+  system_times  GetSystemTimes 등                         /proc/stat, schedstat, loadavg, uptime
+  disk          시스템·임시 폴더 볼륨의 여유 공간            /proc/diskstats
+  network       IP Helper 인터페이스 통계(숫자만)          /proc/net/dev, /proc/net/snmp
+  processes     ToolHelp 목록의 id·개수·크기(이름 없음)     /proc의 pid 목록(이름·경로 없음)
+  perfdata      HKEY_PERFORMANCE_DATA                     (없음)
+  procfs        (없음)                                    /proc/interrupts, softirqs, self/stat·io, pressure
+  sensors       (없음)                                    /sys/class/hwmon, thermal 값
+  window_state  창 위치·포커스·클립보드 소유자(내용 아님)   GUI 창 자신의 상태
+  input_timing  Shield 창 안의 키·버튼 이벤트 시각          같음
+  mouse         Shield 창 안의 포인터 위치                 같음 (전역 좌표·/dev/input 미사용)
+  window_state·input_timing·mouse는 GUI 전용이며 콘솔 명령에서는 "없음"입니다.
+- 켜고 끄기: 설정 > 보안(설정 비밀번호 필요) 또는 shield entropy --enable/--disable <이름>.
+
+4. VeraCrypt Random.c 라이선스 검토
+-----------------------------------
+- VeraCrypt의 Random.c는 TrueCrypt License 3.0(TrueCrypt에서 온 부분)과 Apache License 2.0(VeraCrypt가 바꾼 부분)
+  아래에 있습니다. TrueCrypt License는 OSI 승인 라이선스가 아니고 파생물에 이름·고지 조건을 붙이므로, 코드를 옮기면
+  Shield 배포 조건이 복잡해집니다.
+- 그래서 코드는 한 줄도 옮기지 않았고, 어떤 OS 값을 읽을 가치가 있는지(FastPoll·SlowPoll의 목록)라는 아이디어만
+  참고했습니다. 아이디어와 사실 목록은 저작권 보호 대상이 아닙니다. 구현, 풀 구조(SHA3-512 + HKDF), 상태 검사,
+  표시 방식은 모두 새로 작성했습니다. 소스 주석(entropy/mod.rs, windows/entropy.rs)에도 같은 내용을 적었습니다.
+
+5. 덮어쓰기 삭제 (§2)
+---------------------
+- 3회 = 00, FF, 난수. 7회 = 00, FF, 난수, 55, AA, 난수, 난수. 작업마다 확인 창에서 고르고 기본값은 설정(기본 7회).
+- 키 영역(헤더 719B, 비밀번호 변경 때의 슬롯)은 항상 7회.
+- 원본 파쇄뿐 아니라 전체 키 교체·추가·삭제 뒤의 이전 컨테이너도 덮어씀(2.1 버그 B5).
+- 덮어쓰기 전에 스냅숏 경고: Windows VSS(WMI Win32_ShadowCopy, 관리자가 아니면 "확인할 수 없음"), Linux btrfs 서브볼륨
+  스냅숏, ZFS(zfs list), LVM 스냅숏(device-mapper snapshot-origin), Timeshift, Snapper. 스냅숏은 지우지 않습니다.
+- 끝나면 TRIM: Windows ReTrim(관리자 아니면 UAC로 도우미 실행), Linux FITRIM(root 아니면 pkexec 안내, LUKS
+  discard 꺼짐 알림). 실패는 결과에 적고 작업은 성공.
+- SSD 1회 기본(2.1)을 없앴습니다. SSD에서 덮어쓰기는 어차피 보장이 없고, 횟수는 사용자가 정합니다.
+
+6. 업데이트와 무결성 (§3, §4)
+----------------------------
+- 저장소 URL은 빌드 입력(SHIELD_REPO_URL), https://github.com/<owner>/<repo>만. 공개키는 SHIELD_PUBKEY_PATH로 내장.
+- GitHub API /repos/<o>/<r>/releases/latest -> 태그 vX.Y.Z 엄격 해석 -> 매니페스트 Shield_v<V>_release.txt와 .sig
+  -> 매니페스트 서명 확인 -> 매니페스트 버전 = 태그, 현재보다 높음 -> OS에 맞는 패키지(msi / deb / AppImage)와 .sig
+  -> 크기 제한 다운로드(최대 512 MiB) -> SHA-256 비교 -> 패키지 서명 확인 -> 설치 확인 -> 비밀 정보 삭제 -> 설치.
+- 실패하면 파일을 지우고 멈춥니다. 확인만 모드와 자동 모드 모두 설치 전에 묻습니다. 기본 꺼짐.
+- 무결성 검사(설정 > 업데이트, shield version): 실행 파일 옆 .sig를 내장 키로 검증하고 지문을 표시.
+- shield verify <파일> <서명> [--key <.asc>]: 키를 주지 않으면 내장 키.
+
+7. 콘솔 (§6)
+------------
+- 명령: encrypt, decrypt, list, add, remove, change-password, rekey, keyfile, verify, update, entropy, version, help,
+  gui(gui 기능이 있는 빌드만).
+- 비밀 입력: crossterm raw 모드, 에코 없음, 길이도 표시하지 않음. --reveal은 대체 화면에서 보이고 Enter 후 화면·스크롤
+  기록 삭제 후 원래 화면으로 돌아감. 인자 모드는 설정 + --allow-arg-secrets, 매번 경고. 환경 변수·파일·파이프 미지원.
+- 종료 코드 0/1/2/3/4/5/6/130. --quiet, --json(비밀 정보 없음), --yes, --lang ko|en.
+- 콘솔은 GUI 전용 엔트로피 소스를 끄고 마우스 엔트로피도 끕니다.
+
+8. Linux 판 (§7)
+----------------
+- 하드닝: RLIMIT_CORE=0, PR_SET_DUMPABLE=0, mlock(실패하면 경고), 파일 0600·폴더 0700, O_NOFOLLOW, XDG 경로.
+- 저장 장치: /proc/self/mountinfo, rotational, dm-crypt·LVM·NVMe를 따라가 SSD 판단, FITRIM, LUKS discard 확인.
+- 다운로드 표시: user.xdg.origin.url 확장 속성(NTFS Zone.Identifier에 해당)을 복호화 결과에도 붙임.
+- 화면 캡처 방지: X11·Wayland에 해당 기능이 없어 회색으로 표시.
+- 파일 대화 상자: rfd(GTK3). 파일 관리자: Nautilus 스크립트, Nemo 동작, Dolphin 서비스 메뉴(KF5·KF6), Thunar 사용자
+  동작, .desktop과 MIME(application/x-shield-container, *.shd).
+- 신호: 첫 SIGINT·SIGTERM·SIGHUP은 취소, 두 번째는 풀을 지우고 130으로 종료.
+- 업데이트: deb는 pkexec apt-get install, AppImage는 같은 폴더에 쓰고 rename, 그 밖은 페이지 안내.
+
+9. OS 지원 표
+-------------
+  기능                         Windows 10/11 x64        Linux x86_64 / aarch64
+  암호화·복호화·컨테이너        예                        예 (같은 형식)
+  GUI                           예                        예 (X11, Wayland; GTK3 필요)
+  콘솔 프로그램                 shield.exe (PATH)         /usr/bin/shield, musl 정적 단일 파일
+  우클릭 메뉴(여러 항목)        탐색기                    Nautilus·Nemo·Dolphin·Thunar
+  화면 캡처 방지                예                        아니요 (회색)
+  메모리 잠금·덤프 방지         VirtualLock, 완화 정책     mlock, RLIMIT_CORE, PR_SET_DUMPABLE
+  설정 MAC 키 봉인              DPAPI                     아니요 (0600 파일)
+  TRIM                          ReTrim (UAC)              FITRIM (root/pkexec)
+  스냅숏 경고                   VSS                       btrfs, ZFS, LVM, Timeshift, Snapper
+  여유 공간 덮어쓰기            cipher /w                 채우기 파일
+  숨은 스트림 / 다운로드 표시    ADS, Zone.Identifier      xattr, user.xdg.origin.url
+  자동 업데이트                 MSI                       deb, AppImage (정적 콘솔은 안내만)
+  패키지                        MSI, 포터블 exe, 콘솔 exe  deb, AppImage, 콘솔, rpm(선택, 시험하지 않음)
+  aarch64 Linux는 GitHub ubuntu-24.04-arm 러너에서 빌드하도록 했지만 직접 실행해 보지는 않았습니다.
+
+10. 설정 비밀번호 (§8)
+---------------------
+- Argon2id 128 MiB, t=3, p=4, 솔트 16B -> HKDF-SHA3-512 -> 검증값(저장)과 MAC 키. HMAC-SHA3-512가 보호 항목 전체를 덮음.
+- 변조 감지 시 보호 항목 기본값 + 경고. 틀린 비밀번호 지연 1, 2, 4, 8, 16, 30초(프로세스 안에서).
+- 복구: 설정 파일 삭제(컨테이너 영향 없음).
+- 만들기 / 바꾸기: 12절의 비밀번호 검사를 씁니다(빈 값·확인 불일치·너무 긴 값은 거부, 짧거나 약하면 경고 후 확인).
+
+11. 남은 한계
+-------------
+01_프로젝트_설명.txt 7절에 모았습니다. 특히: Linux 설정 키 비봉인, 재시도 지연은 프로세스 단위, 자체 무결성 검사는
+내장 키 교체를 찾지 못함, brainpoolP512 미지원, 인자 비밀번호의 OS 사본, Windows 콘솔 TRIM의 UAC 창, 같은 사용자
+TOCTOU, SSD·COW 한계, 독립 감사 없음, 이번 배포 파일은 서명되지 않음(서명은 개발자 키 비밀번호가 필요).
+
+12. 정식판 패치 (3.0.0 베타 -> 3.0.0, 2026-11-07)
+------------------------------------------------
+보안 설계(암호 알고리즘, Argon2id 256 MiB·p=4·t=3+PIM, 헤더 MAC, 암호화된 메타데이터, 키 메모리 비상주, 작업마다
+비밀번호 재입력)는 바꾸지 않았습니다. 항목마다 재현 -> 원인 -> 수정 -> 회귀 테스트 순서로 처리했고 점검 결과는
+05_테스트_및_점검_기록.txt 8절에 있습니다.
+
+12.1 비밀번호 검사 하나로 통일 (설정 비밀번호, 암호화, 키 변경, 콘솔)
+- 원인: 설정 비밀번호 창은 8자 미만이면 버튼을 끄기만 하고 이유를 보여 주지 않았고, 암호화와 설정 창이 서로 다른
+  검사를 썼습니다.
+- 수정: password::check_new 하나가 "막음"과 "경고"를 나눠 돌려줍니다. 버튼은 항상 켜져 있고 이유가 입력하는 동안
+  아래에 표시됩니다. 막음: 빈 값(키 파일도 없을 때), 확인 불일치, 최대 길이 초과, 기본보다 낮은 PIM에서 20자 미만.
+  경고 후 허용(확인 창, 기본 취소): 12자 이하, 숫자만 / 영문 소문자만, 흔한 비밀번호, 반복·연속·키보드 배열,
+  "shield"나 사용자 이름 포함. 길이는 문자소(grapheme) 단위라 한글과 이모지가 한 글자로 셉니다.
+- 오프라인 전용(목록은 프로그램 안), 비교용 소문자 복사본은 사용 후 지웁니다.
+- 결정(보안이 더 강한 쪽): 낮은 PIM에서의 20자 최소는 경고가 아니라 계속 막음입니다(PIM을 낮추면 Argon2 반복이
+  줄어드므로).
+
+12.2 Linux 창 크기 (Windows와 같게)
+- 원인: X11에서 Xft.dpi가 없으면 winit 0.29가 모니터의 물리 크기(mm)로 배율을 추정합니다(14인치 1080p 화면에서
+  약 1.67). 그래서 UI가 크게 그려지고 창이 화면에 맞춰 잘렸습니다. 잘못된 WINIT_X11_SCALE_FACTOR 값이면 winit이
+  시작하다가 멈춥니다(panic). 또 Linux의 Noto Sans CJK는 맑은 고딕보다 글자가 약 8% 작게 그려졌습니다.
+- 수정: 창 크기를 한곳(window.rs: 기본 1040x700, 최소 800x560, 크기 조절 가능)에서만 정하고 두 창, 두 OS가 같이
+  씁니다. 창을 만들기 전에 shield_platform::display::prepare_scale이 OS 설정의 배율(Xft.dpi, 없으면 GDK_SCALE x
+  GDK_DPI_SCALE, 없으면 1)을 정하고 잘못된 값을 지웁니다. 글꼴은 맑은 고딕의 글자 크기에 맞춰 배율을 줍니다.
+- 테스트: 상수 비교, 다른 파일에 창 크기·OS별 창 코드가 없는지, 배율 선택 표, 글꼴 배율(맑은 고딕 실측 포함).
+
+12.3 창 위치 기억 (설정 > 일반 > 창 위치 기억, 기본 켜짐)
+- 창을 옮기면 잠시 뒤(0.8초) 저장하고, 닫을 때도 저장합니다. 최소화 상태(-32000)는 저장하지 않습니다.
+- 다시 열 때 연결된 모니터 안에 제목 표시줄이 보이는지 확인하고, 아니면 가장 가까운 모니터 안으로 옮기거나 가운데에
+  엽니다. 물리 픽셀로 저장하고 모니터 배율로 변환합니다(배율이 다른 모니터 사이에서는 첫 화면에서 한 번 더 맞춤).
+- Wayland는 창 위치를 알려 주지 않으므로 이 옵션은 "사용할 수 없어 해제됨(사유)"으로 표시됩니다(12.5).
+
+12.4 탭 옵션 기억 (UiPrefs)
+- 암호화·복호화·키 변경·디스크·파일 관리자 탭의 선택(저장 위치 직접 고르기, 묶기, 빈 공간 덮어쓰기, 대체 스트림,
+  전체 다시 암호화, 덮어쓰기 횟수, TRIM)은 UiPrefs 하나로 설정 파일에 저장됩니다. 압축 강도·원본 파쇄·키 파일 크기는
+  원래 있던 설정 값을 탭이 직접 바꿉니다(값이 둘로 나뉘지 않게).
+- 저장: 원자적 쓰기, 소유자 전용, 설정 비밀번호가 있으면 MAC, SCHEMA=2(1판 파일도 그대로 읽음). 두 창이나 두 Shield가
+  동시에 저장하면 잠금 아래에서 디스크의 최신 내용에 바뀐 값만 합쳐 서로 덮어쓰지 않습니다.
+- 손상된 값은 그 값만 기본값으로 되돌리고 알림을 띄웁니다. 읽을 수 없는 파일은 기본값으로 시작합니다.
+- 저장하지 않는 것: 비밀번호, 키 파일과 그 경로, 고른 파일·컨테이너, PIM, 작업별 확인("원본이 지워짐을 이해함",
+  "키 파일만"), 파일 관리자의 "추가한 원본 파쇄"(추가할 때마다 일부러 꺼짐). 덮어쓰기 횟수는 보호된 기본값보다 낮게
+  기억되지 않습니다.
+
+12.5 환경 때문에 쓸 수 없는 기능
+- 원칙: 값은 하나입니다. 켜져 있지만 이 환경에서 동작하지 않으면 화면에는 꺼짐 + 짧은 사유로 보이고, 설정 파일에는
+  사용자가 고른 값이 남아 다음 실행 때 다시 시도합니다. 사용자가 다시 켜면 그 값을 저장하고 바로 다시 시도합니다.
+- 적용: 화면 캡처 방지(Linux, 실패 시), 창 위치 기억(Wayland), 업데이트 확인(저장소 URL 없이 만든 빌드).
+  Linux의 "붙여 넣은 뒤 클립보드 비우기"는 OS 기능이 없어 동작하지 않던 것을 egui를 통해 비우도록 고쳤습니다.
+- 보안 기능이 실패하면(비밀 메모리 잠금, 덤프 방지, 프로세스 보호 등) 비밀을 다루는 작업 전에 무엇이 빠졌는지
+  보여 주고 계속할지 묻습니다(창마다 한 번, 콘솔은 매번; --yes는 동의, 터미널이 없고 --yes도 없으면 거부).
+- 점검 목록은 05_테스트_및_점검_기록.txt 8.3절.
+
+12.6 MSI: 2.1.0과 3.0.0이 나란히 설치되던 문제
+- 재현: dist_old_v2.1.0\Shield.msi와 3.0.0 MSI의 표를 읽어 비교. 두 파일 모두 UpgradeCode는 같지만 Upgrade 표의
+  Language 열이 1042(한국어)였습니다.
+- 원인: WiX MajorUpgrade는 기본으로 패키지 언어만 찾습니다. MSI는 언어별(ko-KR 1042 / en-US 1033)로 만들어지므로
+  영어 3.0.0은 한국어 2.1.0을 찾지 못했고(반대도 같음) 둘 다 설치된 채 남았습니다(시작 메뉴·우클릭 메뉴 중복).
+- 수정: IgnoreLanguage="yes"(빌드한 두 MSI에서 Language 열이 비어 있음을 확인), UpgradeCode에 "바꾸지 말 것"
+  주석과 2.1.0 ProductCode 기록, 구성 요소 GUID 고정(3.0.0의 값 그대로), 이전 버전을 먼저 완전히 제거
+  (afterInstallValidate), PATH 항목 하나. 사전 배포 버전 X.0.0-태그.N은 MSI 버전 (X-1).99.N으로 만들어 정식판이
+  교체합니다(build.ps1). 앱 안 업데이트는 같은 MSI를 msiexec로 실행하므로 같은 규칙을 따릅니다.
+- 테스트: release_tests(UpgradeCode, MajorUpgrade 속성, GUID 고정·중복 없음, PATH·우클릭 등록 하나씩, 버전 변환).
+  실제 설치 시나리오 표는 05 8.4절(이 PC에서는 관리자 권한 설치를 하지 않아 실행하지 않음).
+
+12.7 취약점 점검과 수정
+- 05 8절의 표. 고친 것: 알 수 없는 옵션 오류가 "--옵션=값"의 값(비밀번호일 수 있음)을 그대로 출력하던 것,
+  settings_auth::Auth의 Debug 출력에 검증값이 나오던 것, egui의 링크 열기 경로(webbrowser 크레이트, RUSTSEC-2026-0257)를
+  매 프레임 끊음. cargo audit의 나머지 두 건(rsa, crypto-bigint)은 공개 키 서명 검증에만 쓰여 해당 없음(.cargo\audit.toml에
+  이유와 함께 기록).
+
+12.8 콘솔 도움말
+- shield help / -h / --help / -help / -? / /?, shield help <명령>, shield <명령> --help(다른 인자가 틀려도 도움말만
+  보여 주고 아무것도 실행하지 않음). 명령·옵션 표(args.rs)와 번역 문자열 하나에서 만들어 모든 명령·옵션에 설명이 있는지
+  테스트합니다. 터미널 폭에 맞춰 줄 바꿈(한글은 2칸), 굵은 제목은 터미널에서만이고 NO_COLOR·TERM=dumb이면 없음.
+  오류는 표준 오류로, 오타에는 비슷한 명령을 제안하고 "shield <명령> --help"를 안내합니다. 스냅숏:
+  crates\shield-cli\snapshots\help_ko.txt, help_en.txt.
+
+12.9 정식판 정리
+- 버전 3.0.0(Cargo, MSI, 문서, 화면이 같음), 베타 표기 없음(release_tests가 확인). 서명 점검 목록은 02_빌드_방법.txt.
+
+12.10 이번 패치의 한계 (숨기지 않고 적습니다)
+- Linux 쪽 새 코드(display.rs의 X11 배율·모니터, egui 클립보드 대체)는 이 PC에서 컴파일하지 못했습니다(Linux 대상과
+  Docker 없음). 릴리스 전에 Linux에서 cargo test / clippy / build.sh를 실행해야 합니다.
+- MSI 업그레이드 시나리오(a~e)는 표로 정리했지만 실제 설치·제거는 하지 않았습니다(관리자 권한, 이 PC 변경).
+- 창 위치 복원은 여러 모니터·배율 조합을 단위 테스트로만 확인했습니다. 실제 화면에서의 확인이 필요합니다.
+- cargo-deny, cargo-geiger, miri, cargo-fuzz는 설치되어 있지 않아 실행하지 않았습니다. 대신 unsafe 위치를 직접
+  세었고(shield-platform에만 107곳, 다른 크레이트 0), 기존 fuzz 형식 테스트(fuzz_tests.rs)를 그대로 돌렸습니다.
+
+12.11 창이 화면에 나오지 않던 문제 (3.0.0 다시 빌드, 2026-11-08)
+- 증상: Windows에서 shield-gui를 실행하면 창이 나오지 않고, 프로세스가 약 120~140 MB 메모리를 쓴 채 CPU·디스크를
+  거의 쓰지 않고 멈춰 있었습니다. 작업 관리자의 "작업 끝내기"와 taskkill도 "액세스가 거부되었습니다"로 실패했습니다.
+- 재현: 배포한 Shield_v3.0.0_x64_portable.exe를 실행 -> 15초 동안 보이는 창 없음, 메모리 141.8 MB, CPU 0.34초.
+  frame_tests(아래)의 4개 테스트가 모두 "프레임이 끝나지 않음(교착)"으로 실패.
+- 원인 1 (멈춤): window.rs의 창 위치 추적이 ctx.input(|i| ...) 클로저 안에서 ctx.zoom_factor()를 불렀습니다.
+  egui 0.27의 ctx.input은 컨텍스트 잠금(parking_lot RwLock)을 쓰기로 잡고, zoom_factor는 같은 잠금을 읽기로 다시
+  잡습니다. 이 잠금은 재진입이 안 되므로 UI 스레드가 첫 프레임에서 영원히 기다립니다. eframe(glow)은 창을 숨긴 채
+  만들고 첫 프레임이 끝난 뒤에 보이게 하므로 창이 끝내 나타나지 않았습니다. "창 위치 기억"은 기본으로 켜져 있고
+  Windows는 위치를 항상 알려 주므로 Windows에서는 매번 일어났습니다(Linux X11도 같음, Wayland는 이 코드에 오지 않음).
+- 원인 2 (끝낼 수 없음): 프로세스 DACL이 같은 사용자에게 PROCESS_TERMINATE를 주지 않아, 멈춘 Shield를 관리자 권한
+  없이는 끝낼 수 없었습니다.
+- 수정: zoom_factor를 ctx.input 밖에서 먼저 읽습니다. 프로세스 DACL의 OWNER RIGHTS에 PROCESS_TERMINATE(0x1)와
+  PROCESS_QUERY_INFORMATION(0x400)을 더했습니다(0x121000 -> 0x121401). taskkill, Stop-Process, 작업 관리자는 끝낼 때
+  두 권한을 함께 요청합니다(TERMINATE만 주면 여전히 거부됨을 실제로 확인). 메모리 읽기·쓰기·조작, 스레드 만들기,
+  핸들 복제, DACL 바꾸기는 계속 거부됩니다. 끝내기는 OS가 메모리를 회수할 뿐이고, 조회 권한은 프로세스 정보만 줄 뿐
+  메모리 내용을 주지 않습니다.
+- 함께 고친 것: 위치를 알려 주지 않는 창(Wayland 등)에서 "창 위치 기억"이 꺼짐 + 사유로 표시된 다음 프레임에
+  사용자가 끈 것으로 잘못 처리되어 사유가 사라지고 파일에 "꺼짐"이 저장될 수 있었습니다. 이제 사용자가 다시 켤 때만
+  재시도합니다(shell.rs apply_settings).
+- 테스트:
+  frame_tests.rs - 두 창의 모든 탭·설정 범주·시작 화면을 실제 egui 프레임으로 여러 번 그리며, 시간 제한 스레드에서
+  돌려 교착이면 멈추지 않고 실패합니다. 창 위치 저장(최소화 무시, 배율 1.5에서 물리 픽셀, 닫을 때 저장),
+  위치를 알려 주지 않는 창과 다시 켜기도 확인합니다. no_egui_call_blocks_on_its_own_lock은 GUI 소스에서 잠금을 잡는
+  egui 클로저(input, memory, data, options, style_mut, fonts, output 등) 안에서 ctx./ui.를 다시 부르는 곳을 찾으면
+  실패합니다(the_scan_finds_the_3_0_0_bug가 원래 버그 코드를 찾는지 확인).
+  shield-platform hardened_process_can_be_ended_but_not_read - 하드닝한 자식 프로세스에 대해 같은 사용자의
+  VM_READ·VM_WRITE·VM_OPERATION·CREATE_THREAD·DUP_HANDLE·WRITE_DAC는 거부, TERMINATE|QUERY_INFORMATION은 허용되고
+  관리자 권한 없는 taskkill /F로 실제로 끝나는지 확인(0x121000, 0x121001이면 실패함을 확인).
+  실행 확인 - 새로 빌드한 exe를 실행해 보이는 창이 생기는지, 몇 초 동안 응답하는지, WM_CLOSE로 정상 종료하는지
+  확인했습니다(결과는 05 8.7).
+- Linux 빌드에서 테스트 실패 (2026-11-08): frame_tests의 위치 테스트 3개가 Linux 빌드(build.sh)에서 실패했습니다.
+  헤드리스 빌드에는 DISPLAY가 없어 position_supported()가 "no display"를 돌려주고, 제품은 올바르게 "창 위치 기억"을
+  끄는데, 테스트는 Windows처럼 위치를 항상 알려 준다고 가정했습니다(Wayland 데스크톱에서도 같은 결과). 제품 동작은
+  바뀌지 않습니다. Tracker가 플랫폼 확인 함수를 필드로 가지고(기본값 shield_platform::display::position_supported),
+  테스트는 with_support로 "지원"을 고정합니다. 새 테스트 a_window_system_without_positions_switches_the_option_off는
+  "지원 안 함"(Wayland)을 고정해 꺼짐 + 사유, 저장 안 함, 파일은 사용자 값 유지를 모든 OS에서 확인합니다.
+  Linux 컨테이너(DISPLAY 없음)에서 cargo test --workspace --release 전체를 돌려 확인했습니다.
+
+12.12 보안 점검에서 찾은 문제 수정 (3.0.0 다시 빌드, 2026-11-08)
+코드 전체 점검(05 8.8)에서 찾은 문제입니다. 컨테이너 형식, 암호 매개변수, 기존 컨테이너와의 호환은 바뀌지 않습니다.
+- H1 (높음) 같은 폴더의 DLL을 먼저 불러옴: exe가 가져오는 DLL 중 KnownDLLs가 아닌 것(dwmapi, uxtheme, propsys,
+  vcruntime140 등)을 Windows가 exe 폴더에서 먼저 찾았습니다. 다운로드 폴더의 포터블 exe 옆에 같은 이름의 DLL이
+  있으면 main 전에(프로세스 하드닝 전에) Shield 안에서 실행됐습니다. 재현: 가짜 dwmapi.dll / vcruntime140.dll을
+  두면 0xC000012F로 종료. 수정: 두 exe의 build.rs에 /DEPENDENTLOADFLAG:0x800(가져오는 DLL은 System32에서만),
+  .cargo\config.toml로 C 런타임 정적 링크(vcruntime140.dll 의존 제거, VC++ 런타임 없는 PC에서도 실행).
+- F1 (중간) 설정 비밀번호 우회: settings.toml의 auth_* 줄과 settings.key를 함께 지우면 "비밀번호를 만든 적 없음"으로
+  보고 파일에 적힌 보호 항목 값을 그대로 썼습니다(경고 없음, 설정 비밀번호도 사라짐). 수정: 비밀번호가 없는 파일은
+  보호 항목이 기본값일 때만 유효합니다(비밀번호 없이 저장할 수 있는 값이 기본값뿐이므로). 아니면 기본값 + 변조
+  경고. 설정 비밀번호를 없애면 보호 항목도 기본값으로 돌아갑니다(버튼 도움말에 표시). 2.x 파일(schema 1)은 설정
+  비밀번호가 없던 판이므로 경고 없이 기본값으로 옮깁니다.
+- F2 (낮음) DPAPI 추가 엔트로피: settings.key를 CryptProtectData의 추가 엔트로피 없이 봉인해 사용자의 DPAPI 데이터를
+  한꺼번에 푸는 도구가 MAC 키를 꺼낼 수 있었습니다. 이제 고정 엔트로피로 봉인하고, 3.0.0이 쓴 파일도 엽니다(다음
+  잠금 해제 저장 때 새로 봉인). Shield를 아는 같은 사용자 프로그램은 여전히 막지 못합니다(01 7절).
+- F3 (낮음) "포커스를 잃을 때 잠금"이 화면에서는 보호 항목인데 MAC에 들어가지 않았습니다. 보호 항목에 넣고 MAC
+  표시를 v2로 올렸습니다. 3.0.0이 쓴 v1 MAC도 받아들이며 다음 저장 때 v2가 됩니다.
+- F4 (낮음) 남이 만든 폴더 재사용: spool 폴더와 업데이트 폴더가 이미 있으면 소유자를 보지 않고 썼습니다(Linux에서
+  /tmp로 대체될 때 다른 사용자가 미리 만들 수 있음). 이제 이 사용자 소유의 진짜 폴더(Linux는 그룹·기타 쓰기 없음)만
+  다시 씁니다. spool은 아니면 모으지 않고 자기 항목만, 업데이트는 오류로 멈춥니다.
+- F5 (낮음) 목록 작성 중 폴더 바꿔치기: 폴더를 확인한 뒤 read_dir 전에 정션/링크로 바꾸면 선택 밖 파일이 목록에
+  들어가 암호화 후 파쇄될 수 있었습니다. 이제 폴더를 핸들로 잡고(Windows: 잡은 동안 이름 바꾸기·삭제 불가) 각 항목이
+  실제로 그 폴더 안에 있는지 핸들의 실제 경로로 확인합니다. 아니면 아무것도 하지 않고 멈춥니다.
+- F6 (낮음) MotW: 다운로드 표시를 목적지로 옮긴 뒤에 붙여 잠깐 표시 없는 파일이 보였고, 64 KiB를 넘는
+  Zone.Identifier는 "표시 없음"으로 처리됐습니다. 이제 비공개 스테이징 폴더 안에서 붙인 뒤 옮기고(같은 볼륨 rename은
+  표시 유지), 너무 크거나 읽을 수 없는 표시는 인터넷 영역(ZoneId=3)으로 붙입니다.
+- F7 (낮음) TRIM 관리자 권한: WMI가 안 되면 Shield 자신을 runas로 다시 실행했습니다. 포터블은 사용자가 쓸 수 있는
+  폴더에 있어 H1과 합쳐지면 관리자 권한 코드 실행이 됐습니다. 이제 System32\defrag.exe <드라이브>: /L만 올려 실행하며
+  run_elevated는 System32 프로그램이 아니면 UAC 전에 거부합니다.
+- F8 (참고) 12.11의 프로세스 DACL 완화(같은 사용자에게 끝내기·조회 허용)는 의도한 선택이며 메모리 접근은 계속 거부.
+- 테스트: settings_auth(우회 재현, 비밀번호 없애기, 2.x 이동, v1 MAC, 포커스 잠금), manifest(선택 밖 항목 거부,
+  잡은 폴더 이름 바꾸기 불가), shield-platform(소유 폴더 판정 Windows/Linux, DPAPI 엔트로피와 3.0.0 키 열기, 큰
+  Zone.Identifier, TRIM은 System32 도구만), release_tests(DLL 검색 설정·정적 런타임·RUSTFLAGS 없음). 실행 확인은 05 8.8.

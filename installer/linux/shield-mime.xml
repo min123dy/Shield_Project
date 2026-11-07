@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/x-shield-container">
+    <comment>Shield encrypted container</comment>
+    <comment xml:lang="ko">Shield 암호화 컨테이너</comment>
+    <glob pattern="*.shd"/>
+    <!-- no magic: the container format has no recognisable bytes (it looks random) -->
+    <icon name="shield"/>
+  </mime-type>
+</mime-info>

@@ -1,0 +1,134 @@
+SHIELD 3.0.0 - Building
+=======================
+한국어: docs\02_빌드_방법.txt
+
+1. Layout
+---------
+Cargo.toml                workspace (shield-platform, shield-core, shield-gui, shield-cli), version 3.0.0
+crates\                   the four crates (01_overview section 3)
+keys\release_key.asc      release public key to embed (public key only; never put a secret key in the repository)
+installer\windows\        installer.wxs, installer.ko-KR.wxl, installer.en-US.wxl
+installer\linux\          .desktop, MIME, postinst/postrm, file manager entries (filemanagers\)
+build.ps1 / build.sh      Windows / Linux builds
+.github\workflows\release.yml   GitHub Actions (Windows + Linux x86_64 and aarch64, release on a tag)
+.config\dotnet-tools.json WiX 5.0.2 pinned
+.cargo\config.toml        Windows (MSVC): static C runtime (no vcruntime140.dll needed). A RUSTFLAGS variable would
+                          replace it, so none is used. Both exes' build.rs add /DEPENDENTLOADFLAG:0x800 (imported
+                          DLLs only from System32) (security review 2026-11-08, checked by release_tests)
+
+2. Tools
+--------
+All       Rust stable 1.89 or newer (developed and tested with 1.99.1)
+Windows   Visual Studio Build Tools (MSVC, rc.exe), .NET SDK 6+ (WiX 5 dotnet tool), Gpg4win for signing, optional UPX
+Linux     gcc, pkg-config, libgtk-3-dev, libxkbcommon-dev, libwayland-dev, libxcb-render0-dev, libxcb-shape0-dev,
+          libxcb-xfixes0-dev, libgl1-mesa-dev (GUI), musl-tools and rustup target add <arch>-unknown-linux-musl (static
+          console), dpkg-dev (deb), python3 (source zip); optional: appimagetool (APPIMAGETOOL=<path>), rpmbuild,
+          cargo-zigbuild + zig (--zig); gnupg for signing
+
+3. Build inputs (environment / arguments; asked in the terminal when missing)
+-----------------------------------------------------------------------------
+  repository URL  -RepoUrl / --repo / SHIELD_REPO_URL      only https://github.com/<owner>/<repo>.
+                  Empty = a build without "Developer info" link and updates. build.rs checks the form again.
+  public key      -PublicKeyPath / --pubkey / SHIELD_PUBKEY_PATH   default keys\release_key.asc. Embedded for updates and
+                  the integrity check. A file containing a secret key block is refused.
+  sign            -Sign|-NoSign / --sign|--no-sign / SHIELD_SIGN=y|n
+  variants        -Variants msi,portable,console / --variants deb,appimage,console,rpm,zip / SHIELD_VARIANTS
+  other           -Culture ko-KR|en-US (MSI language), -MergeManifest / --merge-manifest (add the other OS's lines),
+                  -GpgHome / --gpg-home, -SkipTests / --skip-tests, -UpxPath / -NoUpx, --zig, --arch x86_64|aarch64
+Secrets: the signing passphrase never passes through arguments, variables or logs; gpg-agent (pinentry) asks for it.
+The scripts print public values only (URL, fingerprint, file names). bash runs with set +x.
+
+4. Windows (build.ps1)
+----------------------
+  .\build.ps1                                    (asks everything)
+  .\build.ps1 -RepoUrl https://github.com/o/r -NoSign -Variants msi,console
+  .\build.ps1 -RepoUrl https://github.com/o/r -Sign -PublicKeyPath keys\release_key.asc
+Steps: check inputs -> (signing) temp keyring with only the public key, check the local keyring holds the secret key ->
+cargo test --workspace --release -> build shield-gui.exe and shield.exe -> console-only build (target\console) ->
+(signing) sign both exes (the .sig files are installed next to them for the integrity check) -> MSI -> portable ->
+source zip -> release manifest -> (signing) sign every artifact and the manifest, re-verify each signature with the temp
+keyring -> VERIFY.txt, SHA256SUMS.txt
+
+5. Linux (build.sh)
+-------------------
+  ./build.sh --repo https://github.com/o/r --no-sign
+  ./build.sh --repo https://github.com/o/r --sign --variants deb,appimage,console
+  ./build.sh --zig --arch aarch64 --variants console     (cross-built static console only)
+deb, AppImage and rpm are built for the machine's own architecture (they need GTK). aarch64 packages come from an
+aarch64 machine or GitHub's ubuntu-24.04-arm runner. Package tree: /usr/bin/shield, /usr/bin/shield-gui,
+/usr/share/applications (shield.desktop, shield-open.desktop), /usr/share/mime/packages/shield.xml,
+/usr/share/icons/hicolor/*/apps/shield.png, /usr/share/nemo/actions, /usr/share/kio/servicemenus (KF6),
+/usr/share/kservices5/ServiceMenus (KF5), /usr/share/shield (integrate.sh: per-user Nautilus scripts and Thunar actions),
+/usr/share/doc/shield. When signed also /usr/bin/shield.sig and shield-gui.sig.
+
+6. Artifacts (dist\)
+--------------------
+  Shield_v3.0.0_x64.msi                  Windows installer (shield-gui.exe + shield.exe, PATH entry)
+  Shield_v3.0.0_x64_portable.exe         Windows portable GUI
+  shield-console_v3.0.0_windows_x64.exe  Windows console only (no GUI dependencies)
+  shield_v3.0.0_amd64.deb / _arm64.deb   Debian / Ubuntu packages
+  Shield_v3.0.0_x86_64.AppImage / _aarch64.AppImage
+  shield-console_v3.0.0_linux_x64 / _linux_arm64   static musl console
+  shield_v3.0.0_x86_64.rpm               optional
+  Shield_Project_v3_0_0.zip              source (without target, dist, .git, secret keys, .env ...; stops on a secret key block)
+  Shield_v3.0.0_release.txt              release manifest (checked by updates)
+  a .sig for each, the public key .asc, VERIFY.txt (when signed), SHA256SUMS.txt (always)
+Manifest format (LF; updates accept exactly this):
+  Shield release manifest 1
+  version 3.0.0
+  sha256 <64 lowercase hex digits> <file name>
+Updates check manifest signature -> version (equal to the tag, newer than the running one) -> package SHA-256 -> package
+signature. When Windows and Linux are built separately, pass one manifest to the other build with -MergeManifest /
+--merge-manifest so a single manifest is signed. Release asset names must match the table above.
+
+7. GitHub Actions (.github\workflows\release.yml)
+------------------------------------------------
+- windows (windows-latest) and linux (ubuntu-24.04, ubuntu-24.04-arm) build; on a vX.Y.Z tag the release job merges the
+  manifests (every hash checked against the real file), signs the result and runs gh release create.
+- How secrets are used (never put the signing private key in the repository):
+  SHIELD_GPG_KEY         signing subkey only: gpg --armor --export-secret-subkeys <fingerprint>!  (no primary secret key)
+  SHIELD_GPG_PASSPHRASE  its passphrase
+  Each job imports them into a throwaway GNUPGHOME under RUNNER_TEMP, hands the passphrase to gpg only through a 0600
+  file there, and deletes the folder at the end. Secret values are never echoed (GitHub also masks them).
+  Without the secrets the build runs unsigned (updates then refuse that release).
+- AppImage: with both repository variables APPIMAGETOOL_URL and APPIMAGETOOL_SHA256 set, the tool is downloaded and its
+  hash checked. Unpinned tools are never downloaded.
+- Recommended: tag protection rules, an environment approval for the release job, an expiry date on the subkey.
+
+8. Checklists per OS
+--------------------
+Windows (after installing)
+  [ ] Start menu Shield / Shield File Manager / user guide; shield version in a new terminal
+  [ ] Select several files + a folder in Explorer -> Encrypt with Shield -> one window asking "one / separately"
+  [ ] .shd right-click decrypt and open; Settings > Updates > Check program integrity ("verified" for signed builds)
+  [ ] Shredding: VSS warning, 3/7 choice, TRIM result at the end (UAC when not admin)
+  [ ] After uninstalling, PATH entry and context menu entries are gone
+  [ ] With 2.1.0 installed (Korean and English MSI, each), install 3.0.0 -> one Shield in Programs, one set of
+      context menu entries, the install folder once in PATH (table in 05_test_and_audit.txt 8.4)
+  [ ] Move and close the window, open it again: same place; after unplugging that monitor it opens on screen
+Linux (after installing the deb; GNOME, KDE, Xfce ...)
+  [ ] App menu Shield, shield version in a terminal, double-clicking a .shd -> Open with
+  [ ] Nemo and Dolphin entries; Nautilus scripts and Thunar actions after /usr/share/shield/integrate.sh
+  [ ] Snapshot warning on btrfs/ZFS/LVM/Timeshift/Snapper volumes; FITRIM on an ext4 SSD (pkexec hint when not root)
+  [ ] On Wayland and X11 the window has the Windows size (1040x700 logical, same letter size); it also starts on
+      X11 without Xft.dpi and with an invalid WINIT_X11_SCALE_FACTOR
+  [ ] Screen capture protection / remember window position (Wayland) show "not available, switched off (reason)"
+  [ ] AppImage: runs, "Shield.AppImage cli version", Settings > Updates check
+Both
+  [ ] Open a .shd made on Windows on Linux and the other way round (automated, but also with real files)
+  [ ] shield verify <file> <file>.sig --key <key> for every artifact
+
+9. Release signing checklist
+----------------------------
+  [ ] Cargo.toml version = 3.0.0, tag v3.0.0, the docs\06 heading and the MSI ProductVersion agree (release_tests)
+  [ ] UpgradeCode 6B1E5C0A-3D7F-4C52-9A1B-0F8E2D4C7A91 unchanged, MajorUpgrade IgnoreLanguage="yes" (release_tests)
+  [ ] Built with SHIELD_REPO_URL (https://github.com/<owner>/<repo>) and the public key (keys\release_key.asc, no
+      private key)
+  [ ] build.ps1 -Sign / build.sh --sign: .sig for both programs, every artifact and the manifest signed and verified
+      again with the temporary keyring
+  [ ] The fingerprint in VERIFY.txt equals the one the developer published; SHA256SUMS.txt matches the files
+  [ ] Settings > Updates > integrity check of the installed program says "integrity confirmed"
+  [ ] On Linux: cargo test --workspace / clippy 0 warnings / build.sh (this patch's Linux code was not compiled on
+      Windows)
+  [ ] cargo audit: nothing new besides the 3 entries in .cargo\audit.toml
+  [ ] The signing passphrase and private keys are not in the repository, logs or the zip (the zip's key scan passes)

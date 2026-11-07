@@ -1,589 +1,172 @@
-# Shield 2.1.0
+# Shield 3.0.0
 
-**Shield**는 Windows 환경을 위한 파일 및 폴더 암호화 프로그램입니다. 파일을 압축한 뒤 XChaCha20-Poly1305 기반 인증 암호화를 적용하여 `.shd` 컨테이너에 저장합니다.
-
-단순한 파일 암호화뿐 아니라 독립적인 파일 관리자, 선택적 파일 추출, 컨테이너 내부 파일 추가 및 삭제, 비밀번호 변경, 데이터 키 교체, 임시 파일 보호 등의 기능을 제공합니다.
-
-Shield는 Rust로 개발되었으며 암호화 데이터의 기밀성, 무결성, 안전한 키 관리와 작업 중 발생할 수 있는 오류를 고려하여 설계되었습니다.
-
-- **프로젝트:** Shield
-- **버전:** 2.1.0
-- **플랫폼:** Windows 10 / 11 (x64)
-- **개발 언어:** Rust
-- **GUI 프레임워크:** egui / eframe
-- **파일 확장자:** `.shd`
-- **라이선스:** Apache License 2.0
+[한국어](#한국어) · [English](#english)
 
 ---
 
-## 1. 주요 기능
+## 한국어
 
-### 1.1 파일 및 폴더 암호화
+Shield는 Windows와 Linux용 파일·폴더 암호화 프로그램입니다. 파일을 압축한 뒤 XChaCha20-Poly1305로 암호화해 `.shd`
+컨테이너에 저장하고, 파일 관리자 창에서 컨테이너 안을 보거나 일부만 꺼내고 파일을 더하거나 뺄 수 있습니다.
+창 프로그램(`shield-gui`)과 명령줄 프로그램(`shield`)이 있으며, 두 OS가 같은 파일 형식을 씁니다.
 
-- 파일과 폴더를 하나의 암호화 컨테이너로 저장
-- XChaCha20-Poly1305 인증 암호화
-- Argon2id 기반 비밀번호 키 유도
-- 비밀번호와 키 파일 조합 지원
-- 키 파일 단독 사용 선택 가능
-- KEK / DEK 분리 구조
-- 청크 단위 스트리밍 암호화
-- 암호화 후 전체 데이터 인증 및 복원 검증
-- 원본 파일 보존 및 선택적 파쇄
+### 3.0의 새 기능
 
-### 1.2 압축 기능
+- **여러 항목 암호화**: 탐색기·파일 관리자에서 여러 개를 골라 하나로 묶거나 항목마다 따로 만듭니다. 목록을 고칠 수 있습니다.
+- **명령줄 프로그램** `shield`: encrypt, decrypt, list, add, remove, change-password, rekey, keyfile, verify, update,
+  entropy, version. 비밀번호는 에코 없이 입력받고, 인자 비밀번호는 기본으로 꺼져 있습니다. GUI 의존성 없는 콘솔 전용 빌드도 있습니다.
+- **Linux 판**: deb, AppImage, musl 정적 콘솔. Nautilus·Nemo·Dolphin·Thunar 메뉴, FITRIM, LUKS·스냅숏 확인, XDG 경로.
+- **덮어쓰기 삭제**: 3회 또는 7회(매번 선택), 키 영역은 항상 7회, 스냅숏(VSS·btrfs·ZFS·LVM·Timeshift·Snapper) 경고,
+  끝나면 TRIM. 키 교체·추가·삭제 뒤의 이전 컨테이너도 덮어씁니다.
+- **엔트로피**: OS 난수가 항상 기본이고, 보조 소스는 섞기만 합니다. 소스별로 켜고 끌 수 있고 상태는 정상/약함만 표시합니다.
+- **업데이트**(기본 꺼짐): GitHub 릴리스를 HTTPS로 확인하고, 내장 공개키로 OpenPGP 서명·SHA-256을 확인한 뒤 물어보고 설치합니다.
+  다운그레이드와 서명 실패는 거부합니다.
+- **무결성 검사**: 프로그램 자신의 서명 확인, `shield verify <파일> <서명>`, 키 지문 표시.
+- **설정 비밀번호**: 보안 설정은 설정 비밀번호(Argon2id)로 잠기고, 설정 파일 변조는 HMAC-SHA3-512로 감지합니다.
 
-7z 기반 압축을 사용하며 다음 방식을 지원합니다.
+### 암호 구성 (2.1과 같음)
 
-| 방식 | 설명 |
+| 항목 | 값 |
 |---|---|
-| 자동 | 입력 크기와 시스템 환경 등을 고려하여 압축 방식 선택 |
-| 빠름 | Zstandard 기반 빠른 압축 |
-| 균형 | LZMA2 중간 압축 설정 |
-| 최대 | LZMA2 높은 압축 설정 |
+| 암호화 | XChaCha20-Poly1305 (256비트 키, 192비트 nonce) |
+| 키 유도 | Argon2id v1.3, 256 MiB, 병렬도 4, 반복 3 + PIM (기본 12) |
+| 해시·복원 검증 | SHA3-512 |
+| 메타데이터 | 암호화 + 헤더 인증 (형식 버전·알고리즘 ID도 안에만) |
+| 압축 | LZMA2, Zstandard, 무압축 (자동 선택) |
+| 서명 검증 | OpenPGP (rPGP; brainpool은 RustCrypto) |
 
-압축하지 않고 저장하는 방식도 지원합니다.
+키는 작업이 끝나면 지우고, 작업마다 비밀번호를 다시 묻습니다. 3.0은 2.x 컨테이너를 그대로 엽니다(1.x 형식은 열지 않음).
 
-### 1.3 파일 관리자
+### 설치
 
-별도의 파일 관리자에서 `.shd` 컨테이너 내부를 탐색할 수 있습니다.
+- Windows: `Shield_v3.0.0_x64.msi` (창 프로그램 + PATH에 `shield`), 또는 `Shield_v3.0.0_x64_portable.exe`,
+  `shield-console_v3.0.0_windows_x64.exe`
+- Linux: `sudo apt install ./shield_v3.0.0_amd64.deb`, 또는 `Shield_v3.0.0_x86_64.AppImage`, `shield-console_v3.0.0_linux_x64`
+- 받은 파일은 `.sig`로 검증하세요: `gpg --verify <파일>.sig <파일>` 또는 `shield verify <파일> <파일>.sig --key <공개키.asc>`
 
-- 컨테이너 열기 및 정보 확인
-- 내부 폴더 탐색
-- 전체 파일 추출
-- 선택 파일 및 폴더 추출
-- 파일 및 폴더 추가
-- 선택 항목 삭제
-- 본문 전체 인증 검사
-- 파일 및 폴더 정보 확인
+### 빠른 사용
 
-파일을 추가하거나 삭제하면 새로운 데이터 키로 컨테이너를 재구성하고 전체 검증을 수행합니다.
+```text
+shield encrypt 보고서.pdf 사진/ -o 묶음.shd     여러 항목을 하나로 (--separate: 항목마다)
+shield decrypt 묶음.shd -o 풀_폴더
+shield list 묶음.shd --json
+shield verify 파일 파일.sig
+shield help                                    전체 도움말과 종료 코드
+```
 
-### 1.4 키 및 비밀번호 관리
+### 빌드
 
-- 비밀번호 변경
-- 전체 데이터 키 교체
-- 키 파일 생성
-- 키 파일 지문 검증
-- 여러 키 파일 조합
-- 약한 비밀번호 경고
-- 비밀번호 입력 유휴 시간 자동 삭제
+```text
+Windows: .\build.ps1 -RepoUrl https://github.com/<owner>/<repo> -NoSign
+Linux:   ./build.sh --repo https://github.com/<owner>/<repo> --no-sign
+```
 
-### 1.5 기타 보안 기능
+입력: 저장소 URL, 내장할 공개키 `.asc`(기본 `keys/release_key.asc`), 서명 여부, 변형. 서명 개인키는 저장소에 넣지 않고,
+CI에서는 GitHub 시크릿(서명 부키)으로만 씁니다. 자세한 내용은 `docs/02_빌드_방법.txt`.
 
-- 암호화된 임시 저장소(SecTemp)
-- 사용자 전용 임시 작업 폴더
-- 비정상 종료 후 남은 임시 폴더 감지
-- 프로세스 보호
-- 메모리 잠금 및 민감 정보 초기화
-- Windows 화면 캡처 방지
-- 컨테이너별 프로세스 간 잠금
-- NTFS 대체 데이터 스트림(ADS) 검사
-- 다운로드 출처 표시(Zone.Identifier) 전달
-- 선택적 원본 파쇄
-- TRIM 및 여유 공간 정리
+### 문서
 
----
-
-## 2. 암호화 알고리즘 및 보안 구조
-
-Shield는 인증 암호화와 메모리 집약적 키 유도 방식을 조합합니다.
-
-| 구성 요소 | 알고리즘 및 설정 |
+| 파일 | 내용 |
 |---|---|
-| 데이터 암호화 | XChaCha20 |
-| 인증 알고리즘 | Poly1305 |
-| AEAD | XChaCha20-Poly1305 |
-| 키 길이 | 256비트 |
-| Nonce | 192비트 |
-| 키 유도 함수 | Argon2id v1.3 |
-| Argon2id 메모리 | 256 MiB |
-| 병렬도 | 4 |
-| 반복 횟수 | 3 + PIM |
-| 기본 PIM | 12 |
-| 해시 | SHA3-512 |
-| 난수 추출 | SHAKE256 |
-| 압축 | LZMA2 / Zstandard |
+| `docs/01_프로젝트_설명.txt` | 구조, 암호 구성, 형식, 한계 |
+| `docs/02_빌드_방법.txt` | 빌드 입력, 스크립트, CI, OS별 확인 목록 |
+| `docs/03_사용_방법.txt` | 사용 설명서 (창과 명령줄) |
+| `docs/04_설치_안내.txt` | 설치 첫 화면의 주의사항 |
+| `docs/05_테스트_및_점검_기록.txt` | 테스트 결과, 발견·수정한 문제, 보안 재점검 |
+| `docs/06_3.0.0_수정_기록.txt` | 3.0 변경, 의존성, 엔트로피 소스, OS 지원 표, 라이선스 검토 |
+| `docs/en/` | 영어판 |
+| `docs/history/` | 2.x 기록 |
 
-### 2.1 XChaCha20-Poly1305
+### 한계 (요약)
 
-Shield의 핵심 암호화 알고리즘입니다.
+같은 사용자 권한의 악성 프로그램, 관리자/root, 커널, 물리적 접근은 막지 못합니다. SSD·COW 파일 시스템·스냅숏·클라우드
+폴더에서는 덮어쓰기와 TRIM이 물리적 삭제를 보장하지 않습니다. Linux에서는 설정 MAC 키가 봉인되지 않고 화면 캡처 방지가
+없습니다. 독립적인 외부 보안 감사를 받지 않았습니다. 전체 목록은 `docs/01_프로젝트_설명.txt` 7절.
 
-XChaCha20은 256비트 키와 192비트 Nonce를 사용하는 스트림 암호이며, Poly1305 인증 태그를 결합하여 데이터의 기밀성과 무결성을 동시에 제공합니다.
+---
 
-Shield에서는 다음 항목에 인증 암호화를 적용합니다.
+## English
 
-- 실제 파일 데이터
-- 암호화된 메타데이터
-- 키 슬롯
-- 임시 저장소 데이터
+Shield encrypts files and folders on Windows and Linux. Items are compressed, encrypted with XChaCha20-Poly1305 and
+stored in a `.shd` container; the file manager window browses containers, extracts some items and adds or removes
+files. There is a windowed program (`shield-gui`) and a command-line program (`shield`); both OSes share one file format.
 
-데이터는 64 KiB 단위로 나누어 처리하며 각 청크에 독립적인 인증을 적용합니다.
+### New in 3.0
 
-### 2.2 Argon2id
+- **Several items at once**: select several in Explorer or a Linux file manager and make one container or one per item;
+  the list can be edited.
+- **Command-line program** `shield`: encrypt, decrypt, list, add, remove, change-password, rekey, keyfile, verify,
+  update, entropy, version. Passwords are read without echo; argument passwords are off by default. A console-only build
+  without GUI dependencies exists too.
+- **Linux version**: deb, AppImage, static musl console. Nautilus, Nemo, Dolphin and Thunar entries, FITRIM, LUKS and
+  snapshot checks, XDG paths.
+- **Overwrite deletion**: 3 or 7 passes (chosen each time), key areas always 7, snapshot warnings (VSS, btrfs, ZFS, LVM,
+  Timeshift, Snapper), TRIM at the end. The old container after rekey, add and delete is overwritten too.
+- **Entropy**: the OS RNG is always the base; extra sources are only mixed in, can be switched per source and show
+  Normal / Weak only.
+- **Updates** (off by default): GitHub releases over HTTPS; the OpenPGP signature and SHA-256 are checked with the
+  built-in key, then you are asked before installing. Downgrades and bad signatures are refused.
+- **Integrity**: the program's own signature check, `shield verify <file> <signature>`, the key fingerprint shown.
+- **Settings password**: security settings are locked by a settings password (Argon2id); edits of the settings file are
+  detected with HMAC-SHA3-512.
 
-비밀번호로부터 암호화 키를 유도하는 데 사용합니다.
+### Cryptography (same as 2.1)
 
-기본 설정은 다음과 같습니다.
-
-- 메모리: 256 MiB
-- 병렬도: 4
-- 반복: 15회 (기본 PIM 12 포함)
-
-Argon2id는 메모리 집약적인 키 유도 함수로, 비밀번호를 대상으로 한 대량의 오프라인 추측 공격 비용을 높이는 역할을 합니다.
-
-PIM은 반복 횟수에 영향을 주며 컨테이너에 저장되지 않습니다. 기본값에서 변경했다면 반드시 별도로 기록해야 합니다.
-
-### 2.3 KEK / DEK 분리 구조
-
-Shield는 파일 데이터 암호화 키와 키 보호용 키를 분리합니다.
-
-- **DEK (Data Encryption Key):** 실제 파일 데이터를 암호화하는 키
-- **KEK (Key Encryption Key):** DEK를 보호하는 키
-
-DEK는 KEK로 암호화되어 컨테이너의 키 슬롯에 저장됩니다.
-
-이 구조의 장점은 비밀번호를 변경할 때 전체 파일 데이터를 다시 암호화할 필요가 없다는 것입니다.
-
-| 작업 | 데이터 재암호화 |
+| Item | Value |
 |---|---|
-| 비밀번호 변경 | 필요 없음 |
-| 전체 키 교체 | 필요 |
-| 파일 추가 | 필요 |
-| 항목 삭제 | 필요 |
-
-### 2.4 난수 생성
-
-OS 난수 생성기를 기본 난수 공급원으로 사용합니다.
-
-마우스 입력 엔트로피는 보조적으로 수집하여 난수 풀에 섞습니다.
-
-- OS 난수 우선
-- SHAKE256 기반 키 등급 난수 추출
-- 마우스 엔트로피 보조 수집
-- ChaCha20 기반 대량 난수 생성
-- 난수 풀 종료 시 민감 데이터 초기화
-
-마우스 입력을 수집하지 않아도 암호화 작업은 정상적으로 진행됩니다. 마우스 엔트로피는 암호학적 난수의 독립적인 보증 수단이 아닙니다.
-
----
-
-## 3. 파일 컨테이너 구조
-
-Shield는 `.shd` 확장자를 사용하는 자체 컨테이너 형식을 사용합니다.
-
-현재 형식은 v2입니다.
-
-주요 구성은 다음과 같습니다.
-
-1. 키 슬롯 2개
-2. Nonce 접두사
-3. 인증된 암호화 메타데이터
-4. 청크 단위 암호화 데이터
-5. 인증 태그
-
-### 3.1 메타데이터
-
-메타데이터에는 다음 정보가 포함됩니다.
-
-- 파일 형식 버전
-- 암호화 알고리즘 식별자
-- 해시 및 KDF 식별자
-- 압축 방식과 설정
-- 청크 크기
-- 실제 데이터 길이
-- 패딩 길이
-- 파일 및 폴더 개수
-- 전체 압축 해제 크기
-- 생성 시각
-- 원래 파일 이름
-
-메타데이터는 인증 암호화되어 있으며 인증되지 않은 정보를 신뢰하지 않습니다.
-
-### 3.2 크기 정보 보호
-
-암호화된 데이터 뒤에 무작위 길이의 패딩을 추가합니다.
-
-이를 통해 원본 데이터 크기를 정확하게 노출하는 것을 일부 완화합니다.
-
-다만 파일 크기로부터 원본 크기의 대략적인 범위를 추정하는 것은 여전히 가능하며, 완전한 크기 은닉을 제공하지는 않습니다.
-
-### 3.3 무결성 검증
-
-복호화 및 컨테이너 관리 과정에서 인증 태그를 확인합니다.
-
-암호화 과정에서는 SHA3-512를 이용해 복원 결과를 검증하며, 검증이 완료되기 전에는 원본 파쇄를 진행하지 않습니다.
-
----
-
-## 4. 안전 장치
-
-### 4.1 청크 단위 인증
-
-파일 데이터를 64 KiB 단위로 처리합니다.
-
-각 청크는 별도의 Nonce와 AAD를 사용하며 데이터 변조, 잘림, 순서 변경 등의 문제를 탐지할 수 있습니다.
-
-### 4.2 임시 파일 보호
-
-평문 데이터가 임시 저장 공간에 남는 문제를 줄이기 위해 SecTemp를 사용합니다.
-
-- 작업마다 새로운 키 사용
-- 블록 단위 XChaCha20-Poly1305 인증
-- 블록 인덱스 및 쓰기 카운터 검증
-- 블록 재사용 및 데이터 구멍 탐지
-- 임시 데이터 삭제 실패 보고
-- 메모리 확보 실패 시 오류 반환
-
-### 4.3 스테이징 및 복구
-
-임시 작업 폴더를 생성하기 전에 기록 파일(journal)에 먼저 등록합니다.
-
-프로그램이 비정상 종료되면 다음 실행에서 남은 작업 폴더를 확인할 수 있습니다.
-
-기록 파일이 손상된 경우 이를 정상적인 빈 목록으로 취급하지 않고 오류로 처리합니다.
-
-### 4.4 동시 작업 잠금
-
-Windows LockFileEx를 이용하여 컨테이너별 프로세스 간 잠금을 적용합니다.
-
-- 여러 읽기 작업 허용
-- 쓰기 작업은 단독 실행
-- 읽기와 쓰기 충돌 방지
-- 3초 이내 잠금 실패 시 오류 표시
-
-### 4.5 경로 및 압축 해제 보호
-
-압축 해제 과정에서 발생할 수 있는 경로 공격과 압축 폭탄 문제를 방지하기 위해 제한을 적용합니다.
-
-| 검사 항목 | 제한 |
-|---|---:|
-| 전체 항목 수 | 1,000,000개 |
-| 디렉터리 깊이 | 64 |
-| 경로 길이 | 1,024자 |
-| 경로 구성 요소 | 255바이트 |
-| 개별 항목 크기 | 4 TiB |
-| 전체 해제 크기 | 16 TiB |
-| 압축률 | 10,000배 |
-| LZMA2 사전 | 64 MiB |
-
-절대 경로, 상위 디렉터리 이동, 장치 이름, 링크 항목 및 대소문자만 다른 중복 이름 등도 검사합니다.
-
-### 4.6 원본 파쇄
-
-원본 파쇄는 선택 기능입니다.
-
-파쇄 전 다음 작업을 수행합니다.
-
-1. 암호화 결과 다시 열기
-2. 전체 인증 검사
-3. 압축 구조 검사
-4. SHA3-512 비교
-5. 원본 파일 변경 여부 확인
-6. 파쇄 대상 확인
-
-원본이 변경되었거나 안전하게 확인할 수 없는 경우 파쇄를 거부합니다.
-
-NTFS 대체 데이터 스트림도 검사하며, 발견되면 처리 여부를 확인합니다.
-
-**주의:** SSD, USB 플래시 저장장치, 클라우드 동기화 및 스냅샷 환경에서는 덮어쓰기나 TRIM이 실제 저장 매체의 물리적 삭제를 보장하지 않습니다.
-
----
-
-## 5. 프로그램 사용법
-
-### 5.1 암호화
-
-1. Shield를 실행합니다.
-2. 암호화 탭에서 파일 또는 폴더를 선택합니다.
-3. 비밀번호와 확인 비밀번호를 입력합니다.
-4. 기본 PIM 12를 사용하거나 원하는 값을 지정합니다.
-5. 필요하면 키 파일을 추가합니다.
-6. 압축 방식을 선택합니다.
-7. 암호화 시작을 누릅니다.
-8. 완료 후 생성된 `.shd` 파일을 확인합니다.
-
-기본적으로 원본 파일은 유지됩니다.
-
-원본 파쇄 옵션을 활성화하면 암호화 및 복원 검증 이후 원본 삭제 절차가 추가됩니다.
-
-### 5.2 복호화
-
-1. 복호화 탭을 엽니다.
-2. `.shd` 파일을 선택합니다.
-3. 암호화에 사용했던 비밀번호를 입력합니다.
-4. 당시 사용한 PIM을 지정합니다.
-5. 키 파일을 사용했다면 동일한 파일을 추가합니다.
-6. 복호화 시작을 누릅니다.
-
-복호화 결과는 기존 파일을 덮어쓰지 않도록 처리합니다.
-
-### 5.3 파일 관리자
-
-파일 관리자 버튼을 누르면 별도 창이 열립니다.
-
-컨테이너를 열고 인증 정보를 입력하면 내부 파일을 탐색할 수 있습니다.
-
-지원 작업:
-
-- 파일 및 폴더 탐색
-- 전체 추출
-- 선택 추출
-- 파일 추가
-- 폴더 추가
-- 선택 항목 삭제
-- 본문 전체 검사
-- 컨테이너 정보 확인
-
-파일을 추가하거나 삭제할 때는 전체 컨테이너를 재구성하고 검증합니다.
-
-### 5.4 비밀번호 변경
-
-비밀번호·키 교체 탭에서 비밀번호만 변경할 수 있습니다.
-
-이 작업은 DEK를 새 자격 증명으로 다시 보호하며 실제 파일 데이터는 다시 암호화하지 않습니다.
-
-### 5.5 전체 키 교체
-
-전체 키 교체는 새로운 DEK를 생성하고 본문 전체를 다시 암호화합니다.
-
-시간이 더 오래 걸리고 추가 저장 공간이 필요할 수 있습니다.
-
----
-
-## 6. Windows 통합
-
-설치 프로그램은 Windows 탐색기와 연동됩니다.
-
-지원 메뉴:
-
-- Shield로 암호화
-- Shield로 복호화
-- SHIELD에서 열기
-
-Windows 11에서는 일부 메뉴가 '더 많은 옵션 표시' 안에 나타날 수 있습니다.
-
-프로그램은 단일 실행 파일에서 명령줄 인수를 통해 각 창을 실행합니다.
-
-```powershell
-shield.exe
-shield.exe --manager
-shield.exe --manager "C:\Files"
-shield.exe --open "C:\Files\archive.shd"
-shield.exe --encrypt "C:\Files\document.txt"
-shield.exe --decrypt "C:\Files\archive.shd"
+| Encryption | XChaCha20-Poly1305 (256-bit key, 192-bit nonce) |
+| Key derivation | Argon2id v1.3, 256 MiB, parallelism 4, iterations 3 + PIM (default 12) |
+| Hash, restore check | SHA3-512 |
+| Metadata | encrypted + header authentication (format version and algorithm IDs only inside) |
+| Compression | LZMA2, Zstandard, stored (automatic) |
+| Signature verification | OpenPGP (rPGP; brainpool via RustCrypto) |
+
+Keys are wiped after each task and the password is asked for every task. 3.0 opens 2.x containers unchanged (not 1.x).
+
+### Install
+
+- Windows: `Shield_v3.0.0_x64.msi` (windows + `shield` on PATH), or `Shield_v3.0.0_x64_portable.exe`,
+  `shield-console_v3.0.0_windows_x64.exe`
+- Linux: `sudo apt install ./shield_v3.0.0_amd64.deb`, or `Shield_v3.0.0_x86_64.AppImage`, `shield-console_v3.0.0_linux_x64`
+- Verify downloads with the `.sig`: `gpg --verify <file>.sig <file>` or `shield verify <file> <file>.sig --key <key.asc>`
+
+### Quick use
+
+```text
+shield encrypt report.pdf photos/ -o all.shd    several items into one (--separate: one per item)
+shield decrypt all.shd -o out_dir
+shield list all.shd --json
+shield verify file file.sig
+shield help                                     full help and exit codes
 ```
 
----
+### Build
 
-## 7. 설정 및 사용자 인터페이스
-
-Shield 2.1.0은 다음 설정을 지원합니다.
-
-### 일반
-- 한국어 / English
-- 밝게 / 어둡게 / 시스템 설정 따르기
-
-### 보안
-- 화면 캡처 방지
-- 마우스 엔트로피 수집
-
-### 암호화
-- 압축 관련 설정
-- 암호화 관련 옵션
-
-### 파일 관리자
-- 파일 관리자 관련 설정
-- 날짜 및 표시 형식
-
-설정은 별도 설정 파일에 저장되며 임시 파일 작성 후 원자적으로 교체합니다.
-
-비밀번호, 키, 키 파일 경로 및 컨테이너 경로는 설정에 저장하지 않습니다.
-
----
-
-## 8. 설치 및 빌드
-
-### 8.1 요구 사항
-
-- Windows 10 / 11 x64
-- Rust stable 1.80 이상 권장
-- Visual Studio C++ Build Tools
-- Windows SDK
-- .NET SDK 6 이상
-- 최초 의존성 복원을 위한 인터넷 연결
-
-선택 사항:
-- GnuPG 또는 Gpg4win
-- UPX
-
-### 8.2 빌드
-
-PowerShell에서 프로젝트 폴더로 이동합니다.
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-.\build.ps1
+```text
+Windows: .\build.ps1 -RepoUrl https://github.com/<owner>/<repo> -NoSign
+Linux:   ./build.sh --repo https://github.com/<owner>/<repo> --no-sign
 ```
 
-GPG 서명 없이 빌드하려면 다음 명령을 사용합니다.
+Inputs: repository URL, the public key `.asc` to embed (default `keys/release_key.asc`), signing yes/no, variants. The
+signing private key never goes into the repository; CI uses it only through GitHub secrets (signing subkey). Details in
+`docs/en/02_build.txt`.
 
-```powershell
-.\build.ps1 -NoSign
-```
+### Documents
 
-공개키를 지정하여 서명하려면 다음과 같이 실행합니다.
-
-```powershell
-.\build.ps1 -Sign -PublicKeyPath .\public-key.asc
-```
-
-별도 GPG 키링을 사용한다면 다음과 같이 지정할 수 있습니다.
-
-```powershell
-.\build.ps1 -Sign -PublicKeyPath .\public-key.asc -GpgHome D:\keys\gnupg
-```
-
-### 8.3 포터블 빌드
-
-UPX를 사용하여 포터블 실행 파일을 생성할 수 있습니다.
-
-```powershell
-.\build.ps1 -UpxPath "C:\Tools\UPX\upx.exe"
-```
-
-또는 실행 시 UPX 경로를 입력할 수 있습니다.
-
-포터블 빌드를 생략하려면 다음 명령을 사용합니다.
-
-```powershell
-.\build.ps1 -NoUpx
-```
-
-포터블 실행 파일은 설치 과정 없이 사용할 수 있으며 설정은 실행 파일 옆의 `Shield_data` 폴더에 저장됩니다.
-
-### 8.4 빌드 과정
-
-빌드 스크립트는 다음 작업을 수행합니다.
-
-1. Rust 릴리스 빌드
-2. 자동 테스트
-3. WiX 도구 복원
-4. MSI 설치 파일 생성
-5. 소스 배포 ZIP 생성
-6. SHA-256 체크섬 생성
-7. 선택적 GPG 서명 및 검증
-8. 선택적 UPX 포터블 빌드
-
----
-
-## 9. 테스트 및 검증
-
-2.1.0 개발 기록에는 다음 결과가 기재되어 있습니다.
-
-| 항목 | 기록된 결과 |
+| File | Content |
 |---|---|
-| Rust 빌드 | 성공 |
-| 자동 테스트 | 105개 통과 |
-| Clippy | 경고 0개 |
-| 소스 파일 크기 | 모두 500줄 미만 |
+| `docs/en/01_overview.txt` | layout, cryptography, format, limits |
+| `docs/en/02_build.txt` | build inputs, scripts, CI, per-OS checklists |
+| `docs/en/03_usage.txt` | user guide (windows and command line) |
+| `docs/en/04_install_notes.txt` | notes on the first installer page |
+| `docs/en/05_test_and_audit.txt` | test results, bugs found and fixed, security re-audit |
+| `docs/en/06_changes_3.0.0.txt` | 3.0 changes, dependencies, entropy sources, OS support table, license review |
+| `docs/` | Korean versions |
+| `docs/history/` | 2.x records (Korean) |
 
-주요 테스트 범위:
+### Limits (summary)
 
-- 파일 및 폴더 암호화·복호화
-- 한글 파일 이름 처리
-- 잘못된 비밀번호 및 PIM 처리
-- 키 슬롯 및 메타데이터 변조
-- 청크 변조 및 순서 변경
-- 데이터 잘림 및 추가 탐지
-- 비밀번호 변경 및 전체 키 교체
-- 경로 공격 및 압축 폭탄 방지
-- 컨테이너 추가 및 삭제
-- 임시 파일 보호
-- 프로세스 간 잠금
-- 설정 및 언어 처리
-- 키 파일 권한
-- 원본 파쇄 관련 검사
-
-단, 2.1.0 수정 기록의 마지막 UI 변경 이후에는 재빌드 및 전체 재테스트가 완료되지 않았습니다. 실제 GUI 조작, 설치·업그레이드, UPX 포터블 실행, 다양한 DPI 환경 및 물리적 저장장치 삭제도 모두 검증된 것은 아닙니다.
-
----
-
-## 10. 알려진 한계 및 주의사항
-
-Shield는 보안성을 고려하여 설계되었지만 모든 공격 상황을 방어하는 완전한 보안 솔루션은 아닙니다.
-
-### 비밀번호 및 키 관리
-- 비밀번호, PIM 또는 필요한 키 파일을 잃으면 복호화할 수 없습니다.
-- 키 파일을 수정하거나 다시 저장하지 마세요.
-- 키 파일은 암호화된 컨테이너와 별도의 안전한 위치에 백업하세요.
-- PIM을 기본값에서 변경했다면 반드시 기록하세요.
-
-### 메모리 보호
-- egui 내부에서 입력 문자열이나 화면 표시 문자열의 사본이 만들어질 수 있습니다.
-- 메모리 잠금은 실패할 수 있으며 실패 시 경고가 표시됩니다.
-- 관리자 권한, 커널 권한 및 물리적 접근을 통한 공격까지 막지는 못합니다.
-
-### 화면 캡처 방지
-- Windows의 소프트웨어 캡처 방지 기능입니다.
-- 외부 카메라 촬영이나 하드웨어 캡처 장치를 방지하지 못합니다.
-- 실제 창에서의 동작은 별도의 수동 검증이 필요합니다.
-
-### 원본 파쇄
-- SSD와 USB 메모리에서 덮어쓰기가 물리적 삭제를 보장하지 않습니다.
-- TRIM도 물리적 삭제를 보장하는 수단은 아닙니다.
-- 백업, 볼륨 섀도 복사본 및 클라우드 버전 기록은 별도로 관리해야 합니다.
-
-### 호환성
-- Shield 2.x는 1.x의 `.shd` 파일과 호환되지 않습니다.
-- 1.x에서 만든 파일은 업그레이드 전에 기존 버전으로 복호화해야 합니다.
-
-### 보안 감사
-- 독립적인 외부 전문 보안 감사는 아직 완료되지 않았습니다.
-- 자동 테스트 통과가 모든 보안 취약점의 부재를 의미하지는 않습니다.
-
----
-
-## 11. 버전 2.1.0 변경 사항
-
-Shield 2.1.0은 2.0.0을 기반으로 안정성, 보안 검사, 파일 관리자 및 사용자 인터페이스를 개선한 버전입니다.
-
-주요 변경 사항:
-
-- 파일 관리자 기능 확장
-- 컨테이너 내부 항목 삭제 지원
-- 프로세스 간 동시 작업 잠금
-- 임시 작업 기록 및 복구 검사 개선
-- 숨은 데이터 스트림 검사 개선
-- 다운로드 출처 표시 전달
-- 압축 해제 제한 및 메타데이터 대조 강화
-- 비밀번호 입력 길이 제한
-- 키 파일 권한 강화
-- 화면 캡처 방지 설정 추가
-- 한국어 및 영어 지원
-- 다크 모드 및 시스템 테마 지원
-- 설정 분류 및 초기화 기능
-- 마우스 엔트로피 수집 상태 표시
-- UPX 포터블 빌드 지원
-- 창 크기 및 UI 배치 개선
-
----
-
-## 12. 라이선스
-
-Shield는 Apache License 2.0에 따라 배포됩니다.
-
-자세한 내용은 프로젝트의 `LICENSE` 파일을 확인하세요.
-
-## 13. 보안 문제 제보
-
-보안 취약점을 발견했다면 공개적으로 악용 방법을 게시하기 전에 유지보수자에게 비공개로 제보하는 것을 권장합니다.
-
-암호화 프로그램의 취약점은 단순한 오류와 달리 데이터 기밀성 및 무결성에 영향을 줄 수 있으므로 재현 환경, 영향 범위 및 관련 로그를 함께 제공하는 것이 좋습니다.
-
----
-
-**Shield 2.1.0**
-
-Secure File Encryption for Windows.
-
-*Security through authenticated encryption, careful key management, and verified file operations.*
+Malware running as the same user, administrators/root, the kernel and physical access are out of reach. On SSDs, COW
+file systems, snapshots and cloud folders, overwriting and TRIM don't guarantee physical erasure. On Linux the settings
+MAC key is not sealed and there is no screen capture protection. No independent external audit. Full list:
+`docs/en/01_overview.txt` section 7.

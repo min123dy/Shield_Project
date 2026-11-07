@@ -1,0 +1,8 @@
+[Nemo Action]
+Name=Decrypt with Shield
+Name[ko]=Shield로 복호화
+Exec=shield-gui --decrypt %F
+Icon-Name=shield
+Selection=s
+Extensions=shd;
+Quote=double

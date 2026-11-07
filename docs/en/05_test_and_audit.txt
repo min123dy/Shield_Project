@@ -1,0 +1,305 @@
+SHIELD 3.0.0 - Test and security audit record
+============================================
+한국어: docs\05_테스트_및_점검_기록.txt. The 2.x record: docs\history\05_테스트_및_수정_기록_2.x.txt (Korean)
+
+1. Test environment
+-------------------
+- Windows 10 Pro 22H2 (x64), Rust 1.99.1 (x86_64-pc-windows-msvc), WiX 5.0.2, Gpg4win
+- Linux: Docker, Debian bookworm (rust:1.99-bookworm + GTK3, xkbcommon, wayland, xcb, musl-tools), x86_64
+- Not checked by hand: menus and windows on real Linux desktops (GNOME, KDE, Xfce), running on aarch64, a full update
+  from a real GitHub release, signatures made with the user's signing key (only the user can enter its passphrase)
+
+2. Automated tests (cargo test --workspace)
+-------------------------------------------
+                    Windows                  Linux (Docker)
+  shield-platform   14 pass                   16 pass
+  shield-core       124 pass, 1 ignored       120 pass, 1 ignored
+                    (ignored = make_fixture, which rewrites the fixed files; run by hand when needed)
+  shield-gui        13 pass                   13 pass
+  shield-cli        11 pass                   11 pass
+  clippy            0 warnings (--all-targets) 0 warnings
+  console-only      cargo tree has no egui/eframe/winit/rfd; musl static-pie build works
+  (counts differ because of OS-specific tests. The final run is in section 7)
+
+What the new tests cover
+- Entropy: value bounds, no repeated blocks in long outputs, key material never waits for extra sources, no GUI sources
+  in console mode, status shows labels only (disabled sources as "off"), equal samples from two sources give different
+  pools, health (repetition, stuck and counter-like values rejected, recovery)
+- Overwriting: 3/7 patterns, changed files refused, only the new file left after replace, exposure check and TRIM
+  failures never fail the job, read-only files. Windows: without rights shadow copies are never reported as "none",
+  ReTrim helper argument checks. Linux: TRIM without rights gives a hint or a clear answer
+- Updates: strict tags (only vX.Y.Z; 3.0.1, v3.0, v3.0.1-rc1, v03.0.1, V3.0.1, full-width digits ... refused), same /
+  older / draft / prerelease ignored, assets pointing elsewhere ignored, strict manifest parsing, any change of signature,
+  hash or version fails, package naming
+- OpenPGP: fixed real signatures (Ed25519, brainpoolP384r1) verify, subkey signatures, tampered data and other keys
+  fail, revoked key refused, garbage input gives errors not panics, file size limits
+- Settings password: create, unlock, change, remove, wrong password and growing delay, outside edits reset the
+  protected values, reset by deleting the file
+- Several items: spool collection (one leader), dedup, bundle naming, decrypt folder of bundled containers
+- Format: fixed containers made on Windows and Linux open on both (cross_os_tests)
+- CLI: parser (options, values, --, unknown commands), secret input keys (Enter, Esc, Ctrl+C/D/U, Backspace), argument
+  passwords refused (setting off / flag missing), exit codes (wrong password 3, bad signature 4), encrypt-list-add-
+  remove-decrypt end to end, bundled and separate, keyfile, verify, entropy switches (os can't be disabled, settings
+  password needed)
+- GUI: every tab and settings category drawn headless without panics, multi-select handling, shred dialog text
+- Strings: Korean and English keys match, {} counts match, error code format, every shown character is in the fonts
+
+3. Bugs found and fixed (present in 2.1.0)
+------------------------------------------
+B1  Leftover temp folders on Linux: 2.1 only knew its own pid and reported staging folders of other running Shield
+    processes as leftovers; [Delete now] could remove another task's temp files. -> live owners are checked by their
+    start time from /proc/<pid>/stat.
+B2  Output naming race on Linux: between "name is free" and rename another process could create the name and be
+    overwritten. -> renameat2(RENAME_NOREPLACE); on file systems without it, link+unlink for files and a checked rename
+    for folders (a small race remains).
+B3  No directory fsync after rename on Linux; the new name could be lost on power failure. -> directory fsync.
+B4  The Linux data folder was $HOME/Shield. -> XDG ($XDG_CONFIG_HOME/shield, 0700).
+B5  Full rekey, adding and deleting simply unlinked the old container, leaving the old key slots and ciphertext on disk;
+    anyone knowing the old password could recover and open it. -> after the swap the old file is overwritten with the
+    chosen passes, key areas 7 times.
+B6  On Linux the "never remove a temp folder from here" check only looked at the path length (3 characters or less), so
+    /usr or /etc were not blocked (the name check still prevented an actual deletion). -> system folder list and /proc,
+    /sys, /dev refused.
+B7  Available memory on Linux came from _SC_AVPHYS_PAGES (without cache), far too low; big files could get a needlessly
+    small dictionary or be refused for decryption. -> MemAvailable from /proc/meminfo.
+B8  The Linux Hangul font path did not exist on Debian/Ubuntu (boxes instead of text). -> candidate list per distribution.
+
+4. Problems found and fixed during the 3.0 work
+-----------------------------------------------
+N1  The console shield.exe treated the TRIM elevation helper argument as an unknown command (TRIM did not run after the
+    UAC prompt). -> the helper is handled first in the console too.
+N2  The portable exe was offered the MSI as an update (it would install over a non-installed copy). -> portable copies
+    only get the release page.
+N3  The MIME definition contained magic bytes that do not exist; format v2 has no magic (by design: a file does not
+    reveal itself as a Shield file). -> extension (*.shd) only.
+N4  In GitHub Actions a step's if can't see that step's env, so signing was always skipped. -> job-level env.
+N5  A single .shd passed from Explorer only went to decryption when the file existed. -> decided by extension; a missing
+    file is an error.
+N6  The CLI tests hung in the TRIM stage waiting for UAC. -> TRIM is off in tests (product behaviour unchanged).
+N7  Only signed builds (-Sign) failed in the MSI step (WIX0367: two unversioned .sig files in one component can't get
+    an automatic GUID). Unsigned test builds leave that component out, so it went unnoticed. -> one component per
+    .sig; a Signed=yes build with placeholder .sig files was checked for ko-KR and en-US.
+N8  The Korean MSI notice (RTF) was garbled (e.g. "¡á Shield 3.0.0 ¼³Ä¡ ¾È³»"): code page 949 bytes (\'xx) without a
+    font charset were decoded with another code page on PCs whose non-Unicode language isn't Korean. -> every
+    non-ASCII character is an RTF Unicode escape (\uN), font \fcharset129. Loaded into RichEdit, the text equals the
+    source for ko-KR and en-US, and Hangul still shows with an ANSI font charset.
+
+5. Security re-audit (the §9 items)
+-----------------------------------
+Races
+  - Output files: new names only through create_new / RENAME_NOREPLACE / MoveFileEx without replace.
+  - Container changes: inter-process lock (writing exclusive, reading shared). A container that changed while open is not
+    replaced (size, times and file ID compared).
+  - Collecting several items: only the holder of leader.lck opens a window; list files are created with create_new.
+  - Remaining risk: a same-user process changing a file right after a check (TOCTOU) is reduced by pinned handles and
+    re-checks but can't be ruled out.
+Temp files
+  - Plaintext staging in 0700 folders with a journal, encrypted SecTemp (random key, block authentication), update
+    downloads in a private folder deleted on failure. Spool lists hold paths only, live in the private data folder (0700)
+    and are deleted after reading.
+Path traversal
+  - Unpacking: .., absolute paths, drive letters, reserved names, NUL and link entries refused; the real path is checked
+    again to be inside the target folder.
+  - Update file names: only the name fixed by version and OS (Shield_v<V>_x64.msi ...) is looked up, so no name from a
+    manifest or release can point outside the private download folder.
+Memory residue
+  - Passwords, keys, key file fingerprints, the entropy pool and settings password derivatives live in Zeroizing /
+    SecretBuf and are wiped. The CLI wipes its argv copies and input buffers. The Ctrl+C / SIGTERM / SIGHUP handler wipes
+    the pool after cancelling.
+  - Remaining risk: the OS's copy of the command line, egui's internal copies, swap (when mlock fails).
+Argument exposure
+  - --password and friends are refused by default (setting + --allow-arg-secrets), with a warning every time. --json and
+    --quiet output contain names, sizes and counts only. Secrets are never read from environment variables, files or
+    stdin pipes (refused when not a terminal).
+Update tampering
+  - HTTPS with rustls certificate validation, non-https redirects refused, response size limits, strict tags, the signed
+    manifest's version must equal the tag and be newer, hash match, installer signature. Any failure deletes and stops.
+  - Re-publishing an old signed installer under a new tag: stopped by the manifest version check.
+  - Remaining risk: a leaked secret signing subkey can't be defended against (subkey expiry and revocation recommended).
+Signature bypass
+  - rPGP checks issuer, hash prefix, binding signatures, subkey signing flags and back-signatures. Shield allows only
+    binary/text signatures, refuses MD5 / SHA-1 / RIPEMD-160 and revoked subkeys. brainpool uses RustCrypto's verify
+    function for the last step only (no hand-written crypto). Tests cover tampering, other keys and revoked keys (weak
+    hash refusal is checked by code review only).
+TOCTOU (other)
+  - Shredding: files whose ID, size or times differ from the fixed list are left alone; overwriting uses the same handle.
+  - Updates: the verified file is handed to the installer straight from the private folder. A same-user process could
+    still swap it in between (same-user malware is outside the threat model).
+Entropy
+  - The OS RNG is always the base and its failure stops the task. Extra sources never make a key alone and their values
+    are never exported. No /dev/input or global coordinates. The console disables the window sources.
+Build and release
+  - build.rs checks the repository URL and the public key; an .asc with a secret key stops the build. The source zip
+    build stops on a secret key block. The signing passphrase never passes through the scripts. CI secrets are used only
+    inside a temporary GNUPGHOME that is deleted.
+
+6. Decisions where the stronger option was chosen
+-------------------------------------------------
+- The old container is overwritten after rekey, add and delete (2.1 did not): slower, but recovery from disk with the old
+  password becomes harder.
+- Without a settings password security settings can't be changed (3.0 starts with the defaults). Create one first.
+- A broken settings MAC resets the protected values to safe defaults, not to the edited values.
+- The default is 7 passes on SSDs too (instead of 2.1's single pass on SSDs; 3 only when the user picks it).
+- The console never reads passwords from stdin pipes (avoiding exposure beats scripting convenience).
+- Updates never install unsigned releases. A build made without a public key says that it can't install updates.
+
+7. Final run (before packaging)
+-------------------------------
+Results of the run right before the final artifacts were made (2026-11-03).
+- Windows: build.ps1 -NoSign (no repository URL) -> cargo test --workspace --release all pass (table above),
+  cargo clippy --workspace --all-targets 0 warnings, MSI (ko-KR) / portable / console / source zip built. The en-US MSI
+  was built separately too. MSI tables (wix msi decompile): shield-gui.exe, shield.exe, the guide, the system PATH entry,
+  3 Start menu shortcuts, context verbs (encrypt with MultiSelectModel=Player, decrypt, open), code page 949.
+- Linux (Docker): cargo test --workspace all pass (table above), clippy 0 warnings, static musl console 0 warnings.
+  build.sh run with signing by a throwaway test key (made and discarded inside the container): deb tree and control
+  checked, static console self check "verified", good signature 0 / tampered 4, manifest and SHA256SUMS match, no dist,
+  target or .git in the source zip.
+- Fixed in this step: both build scripts deleted dist\ (earlier signed release files would be lost) -> moved to
+  dist_old_<time>; the zip's secret key check matched its own script text -> only real armor/PEM headers at a line
+  start; ■ broken in the en-US installer notice RTF -> RTF Unicode escape; musl time_t warning.
+- The final artifacts are unsigned. To sign with the developer key, give the repository URL and run build.ps1 -Sign /
+  build.sh --sign again (gpg asks for the passphrase itself).
+
+8. Release patch audit (2026-11-07, 3.0.0 beta -> 3.0.0)
+--------------------------------------------------------
+8.1 Threat model (STRIDE)
+  Class            Target / path                                Measures (* = changed in this patch)
+  Spoofing         fake update, fake installer                  OpenPGP signatures + manifest hashes, built-in key, tag checks
+                   another program catching Shield's links      * egui link path cut, only Platform::open_url (https check)
+  Tampering        container header and metadata                header MAC, encrypted metadata, AEAD chunks
+                   settings file (protected values, UI state)   HMAC-SHA3-512 (settings password), * merged save under a lock,
+                                                                * only damaged values reset
+                   installation (old version left behind)       * MajorUpgrade IgnoreLanguage, fixed UpgradeCode and GUIDs
+  Repudiation      (little applies: single-user tool)           signed artifacts show their origin
+  Information      passwords, keys, key file contents           wiped after each task, locked memory, * warning before a job
+  disclosure                                                    when that failed
+                   errors, logs, panics, debug output           * no option values, * Auth Debug redacted, no secrets in settings
+                   password left in the clipboard               * cleared on Linux as well (egui)
+                   screen capture                               WDA_EXCLUDEFROMCAPTURE, * "switched off (reason)" when unsupported
+  Denial of        damaged containers, decompression bombs      size / count / depth limits, fuzz-style tests
+  service          invalid WINIT_X11_SCALE_FACTOR stops start   * prepare_scale removes invalid values
+  Elevation        DLL planting, same-user process access       restricted DLL search, process DACL, PR_SET_DUMPABLE=0
+                   extraction paths (.., drives, UNC, ADS, devices) entry_ok checks and tests
+
+8.2 Audit areas (12) and results
+   1 crypto / KDF parameters   unchanged. Argon2id 256 MiB, p=4, t=3+PIM; settings password 128 MiB; 20-char minimum at low PIM kept
+   2 nonces / key separation   unchanged (existing tests pass)
+   3 header / metadata integrity unchanged (fuzz_tests, cross_os_tests pass)
+   4 secret memory             SecretBuf locking / wiping unchanged. * failed locking / protections announced before a job
+   5 input parsing             17 truncating casts reviewed (all bounded by CHUNK or constants), no violation
+   6 paths / extraction        entry_ok kept (.., absolute paths, drives, UNC, ADS, reserved device names)
+   7 temp files / overwriting  unchanged; TRIM and snapshots report reasons in the job result
+   8 settings / settings pw    * merged save (two instances), * notice for damaged values, * no keys or paths stored (test)
+   9 updates / supply chain    cargo audit run (8.5); unsigned releases are not installed (unchanged)
+  10 process hardening / IPC   the spool holds paths only, owner-only folder (unchanged)
+  11 logs / errors / panics    * no option values, * Auth Debug redacted; no eprintln / log of secrets (searched)
+  12 deps / unsafe / argv secrets unsafe only in shield-platform (107, OS calls), 0 in core / gui / cli; argument passwords
+                               need the setting and the flag
+
+  Tools: cargo audit 0.22.2, cargo clippy (default: 0 warnings; pedantic run for reference, only security-relevant casts
+  reviewed), rg searches. cargo-deny, cargo-geiger, miri, cargo-fuzz and proptest are not installed and were not run.
+
+8.3 Features that depend on the environment (§4 audit list)
+  Feature                        Not working on / when                 Shown as                               Settings file
+  Screen capture protection      Linux, failure (Windows)              off + reason; switching on retries     user's value kept
+  Remember window position       Wayland, window systems without pos.  off + reason                           user's value kept
+  Update checks                  builds without a repository URL       off (greyed) + reason                  user's value kept
+  Clear clipboard after pasting  Linux (no OS API)                     * cleared through egui (works now)     -
+  Memory locking (mlock/VirtualLock) limits, rights                    warning and confirmation before a job  -
+  No dumps / process protection  failure                               warning and confirmation; list on the information tab -
+  TRIM                           not admin / root, unsupported volume  reason in the job result (UAC / pkexec note) -
+  Snapshot warning               no rights / tool to check             "could not check" in the shred dialog  -
+  Context menu registration      unsupported file manager              reason in the registration result      -
+  (TRIM, snapshots and menus are not switches but actions with a result, so the reason is shown in that result.)
+
+8.4 MSI upgrade test table
+  "Expected" was checked in the tables of the fixed MSIs. No real install / uninstall was done on this PC
+  (administrator rights, changes to the PC). Run these in a virtual machine and fill in "Actual".
+  No.  Start state                         Action                      Expected                                     Actual
+  a    nothing installed                   install 3.0.0 (ko)          one Shield, PATH once, one set of verbs      not run
+  b    2.1.0 (ko) installed                install 3.0.0 (ko)          2.1.0 removed -> one 3.0.0                   not run (fine before the fix too)
+  c    2.1.0 (ko) installed                install 3.0.0 (en)          2.1.0 removed -> one 3.0.0                   not run (the cause: side by side)
+  d    3.0.0 beta (3.0.0 or 2.99.N)        install 3.0.0               beta removed -> one 3.0.0                    not run
+  e    3.0.0 installed                     reinstall 3.0.0 / install 2.1.0  reinstall replaces (repair); 2.1.0 refused (newer installed) not run
+  more 3.0.0 installed                     in-app update (new MSI)     msiexec replaces it by the same rules, no PATH duplicate not run
+  more 3.0.0 installed                     uninstall                   PATH, verbs and Start menu entries gone      not run
+  Static checks (done): in the built ko-KR / en-US MSIs the Upgrade table's Language column is empty (1042 before),
+  RemoveExistingProducts 1401 (right after InstallValidate 1400), component GUIDs equal 3.0.0's, one Environment row.
+
+8.5 Findings and fixes
+  No.  Area            Severity Finding                                                  Fix                                   Test
+  P1   installer       high     MSI of another language did not find the old version;    IgnoreLanguage, fixed codes and GUIDs  3 release_tests
+                                2.1.0 stayed (an old program kept handling the verbs)
+  P2   console errors  medium   a mistyped "--option=value" printed the value (could be  only the option name (max 64 chars)  errors_never_repeat_an_option_value
+                                a password) to stderr
+  P3   security display medium  capture protection looked on on Linux                    off + reason (environment switch-off)  switched_off_by_the_environment_...
+  P4   clipboard       medium   "clear after pasting" did nothing on Linux               overwrite through egui                (needs a run on Linux)
+  P5   hardening       medium   jobs ran without saying that locking / protections failed warning and confirmation (GUI, console) failed_protections_are_listed_...
+  P6   settings save   medium   two windows / processes undid each other's changes       merged save under a lock              two_instances_do_not_undo_each_other
+  P7   dependency      low      webbrowser 0.8 (RUSTSEC-2026-0257, through egui-winit)   link path cut every frame             links_never_reach_the_webbrowser_crate
+  P8   debug output    low      settings_auth::Auth's Debug printed the verifier         redacted "Auth { .. }"                ui_state_never_holds_secrets_...
+  P9   start-up        low      invalid WINIT_X11_SCALE_FACTOR made winit panic          removed by prepare_scale              display_tests (needs Linux)
+  P10  dependency      n/a      rsa 0.9 / crypto-bigint 0.5 timing (public-key verify only) recorded with the reason in audit.toml cargo audit
+  P11  dependency      note     5 unmaintained (paste, ttf-parser, zbus_names, zvariant*) review again with the next egui/eframe   -
+  Decision: replacing the settings password's 8-character minimum (a block) with "12 or fewer: warning and
+  confirmation" follows requirement §1. The settings password only protects settings changes (not container keys)
+  and its Argon2id cost (128 MiB) is unchanged. The 20-character minimum at a low PIM stays a block (the stronger
+  option).
+
+8.6 Results (Windows 10, 2026-11-07)
+  cargo test --workspace --release all pass, cargo clippy --workspace --all-targets --release 0 warnings, console-only
+  build (--no-default-features) builds, ko-KR and en-US MSIs build with WiX 5.
+  Linux: not run (no Linux target or Docker on this PC; see 06 12.10).
+
+8.7 The window never appeared (06 12.11, Windows 10, 2026-11-08)
+  No.  Area            Severity  Finding                                                   Fix                                    Test
+  P12  GUI start-up    critical  egui context lock deadlock in the first frame: the window   zoom_factor read outside ctx.input     4 frame_tests, 2 static checks
+                                 stays hidden and the process hangs
+  P13  hardening       high      a stuck Shield could not be ended without administrator     OWNER RIGHTS get TERMINATE|QUERY_INFO   hardened_process_can_be_ended_but_not_read
+                                 rights (taskkill refused)
+  P14  settings view   low       on a window without a position the "remember window          only switching it on again retries     a_window_that_reports_no_position_still_runs
+                                 position" reason vanished a frame later and "off" could be saved
+  Before the fix: the shipped portable exe showed no visible window within 15 s (141.8 MB, 0.34 s CPU); taskkill /F
+  was refused. All 4 frame_tests failed with "a frame did not finish (deadlock)". After the fix all 4 pass.
+  Rights (OpenProcess on the running GUI): with 0x121001 TERMINATE alone was allowed but TERMINATE|QUERY_INFORMATION
+  (taskkill, Stop-Process) was refused -> 0x121401. The test was checked to fail with 0x121000 and 0x121001.
+  Run check (new build; time to a visible window / responding for 2 s / normal exit on WM_CLOSE):
+    default start (first run, centred)      0.25 s   responding   exit 0   position saved on close (ui_win_enc = "760,370")
+    default start (second run, restored)    0.35 s   responding   exit 0
+    --manager / --settings / --decrypt      0.22-0.23 s  responding  exit 0
+    saved position changed to 200,150       0.39 s   window opened at (200,150)
+    installed mode (%LOCALAPPDATA%\Shield)  0.25 s   responding   exit 0
+    non-elevated taskkill /F                the running window was ended
+  cargo test --workspace --release all pass, cargo clippy --workspace --all-targets --release 0 warnings.
+
+8.8 Full code security review (06 12.12, 2026-11-08)
+- Scope: all four crates. Crypto (crypto, format, rekey, keyfile), archive extraction (paths, links, size limits,
+  header allocations of sevenz-rust2 0.24.2), temp files (sectemp, staging), shredding (wipe, manifest), MotW (ads),
+  settings and the settings password, updates (signatures, pinning, sizes), spool and lock, CLI secret input
+  (secret, cred), GUI secret fields, Windows/Linux platform code (DACLs, DPAPI, registry / .desktop quoting, elevated
+  helper, msiexec / pkexec), DLL imports of the built exes.
+- Findings ("reproduced" where shown in practice):
+    H1 high    DLLs loaded from the exe's folder (portable, console)   reproduced (fake DLL -> 0xC000012F)  fixed
+    F1 medium  settings password bypass: delete auth lines + key       reproduced (PoC test)                fixed
+    F2 low     no DPAPI optional entropy                                -                                    fixed (limit documented)
+    F3 low     lock on focus loss outside the MAC                       -                                    fixed
+    F4 low     reusing spool / update folders made by somebody else     -                                    fixed
+    F5 low     folder -> junction swap while listing (TOCTOU)           -                                    fixed
+    F6 low     MotW added after the move; marks over 64 KiB ignored     -                                    fixed
+    F7 low     portable build elevated its own exe                      -                                    fixed (System32 defrag)
+    F8 info    process DACL allows end / query (12.11)                  -                                    deliberate
+- Judged sound: AEAD chunks (order, truncation, LAST flag), slot handling, password change and rekey verification,
+  ct_eq, key files, archive path checks, staging and SecTemp, shred identity checks and delete by handle, the update
+  signature chain, registry and .desktop / script quoting, elevated helper argument checks, System32 msiexec and
+  cipher, absolute pkexec path, CLI secret input.
+- Run results (Windows 10 / Linux container with rust 1.99.1, 2026-11-08):
+    cargo test --workspace --release (Windows)     cli 18, core 152, gui 27, platform 19 pass
+    the same tests (Linux, no DISPLAY)              cli 18, core 148, gui 27, platform 18 pass
+    cargo clippy --workspace --all-targets          0 warnings on Windows and Linux
+    build.ps1 -NoSign -NoUpx                        tests pass; MSI, portable, console and source zip built
+    dumpbin (portable, console)                     no vcruntime140 import, Dependent Load Flag 0800
+    8 fake DLLs next to the exe                     new build: none loaded (normal start)
+                                                    previous build: dwmapi, uxtheme, propsys ... loaded (0xC000012F)
+    portable start (default, --manager,             window visible in 0.22-0.51 s, responding, exit 0 on WM_CLOSE
+    --settings, --decrypt)
+    console --version                               exit 0
