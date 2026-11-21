@@ -24,7 +24,7 @@ sevenz-rust2 = { version = "0.24", default-features = false, features = ["compre
 unicode-normalization = "0.1"
 # password length is counted in user-perceived characters (grapheme clusters: Hangul, emoji)
 unicode-segmentation = "1"
-dirs = "6"
+dirs = "7"
 # OpenPGP (signature verification only; see src/sigverify.rs)
 pgp = { version = "0.21", default-features = false }
 bp256 = { version = "0.14", default-features = false, features = ["ecdsa", "arithmetic", "std"] }

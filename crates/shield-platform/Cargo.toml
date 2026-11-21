@@ -12,7 +12,7 @@ publish.workspace = true
 display = ["dep:x11rb"]
 
 [dependencies]
-dirs = "6"
+dirs = "7"
 
 [target.'cfg(windows)'.dependencies]
 serde = { version = "1", features = ["derive"] }
