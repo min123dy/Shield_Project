@@ -80,7 +80,7 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         if: ${{ github.event_name == 'push' && vars.SHIELD_ATTESTATIONS != 'off' }}
         with: { subject-path: "${{ runner.temp }}/bin/*.exe" }
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: bin-windows, path: "${{ runner.temp }}/bin/", if-no-files-found: error }
 
   build-linux:
@@ -108,7 +108,7 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         if: ${{ github.event_name == 'push' && vars.SHIELD_ATTESTATIONS != 'off' }}
         with: { subject-path: "${{ runner.temp }}/bin/shield*" }
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: "bin-linux-${{ matrix.runner }}", path: "${{ runner.temp }}/bin/", if-no-files-found: error }
 
   sign-binaries:
@@ -160,7 +160,7 @@ jobs:
               gpg --homedir "$v" --batch --status-fd 1 --verify "sigs/$p/$(basename "$f").sig" "$f" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG .*$fpr"
             done
           done
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: sigs, path: sigs/, if-no-files-found: error }
 
   package-windows:
@@ -181,7 +181,7 @@ jobs:
           if (Test-Path $s) { Copy-Item "$s\*.sig" "$env:RUNNER_TEMP\bin\" }
           .\build.ps1 -Stage package -NoSign -RepoUrl "https://github.com/$env:GITHUB_REPOSITORY" -Variants msi,portable,console -NoUpx -BinDir "$env:RUNNER_TEMP\bin"
           .\build.ps1 -Stage manifest -NoSign -RepoUrl "https://github.com/$env:GITHUB_REPOSITORY" -Variants msi,portable,console -BinDir "$env:RUNNER_TEMP\bin"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: dist-windows, path: dist/, if-no-files-found: error }
 
   package-linux:
@@ -226,7 +226,7 @@ jobs:
           r="https://github.com/$GITHUB_REPOSITORY"
           ./build.sh --stage package --no-sign --repo "$r" --variants "${VARIANTS:-deb,console}" --bin-dir "$RUNNER_TEMP/bin"
           ./build.sh --stage manifest --no-sign --repo "$r" --variants "${VARIANTS:-deb,console}" --bin-dir "$RUNNER_TEMP/bin"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: "dist-linux-${{ matrix.runner }}", path: dist/, if-no-files-found: error }
 
   sign-release:
@@ -285,7 +285,7 @@ jobs:
             echo "Verify:  shield verify <file> <file>.sig --key release_key.asc"
             echo "   or:   gpg --import release_key.asc && gpg --verify <file>.sig <file>"; } > out/VERIFY.txt
           (cd out && sha256sum * > SHA256SUMS.txt)
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with: { name: release, path: out/, if-no-files-found: error }
 
   publish:
