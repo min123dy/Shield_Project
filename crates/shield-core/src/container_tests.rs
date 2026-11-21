@@ -288,3 +288,198 @@ fn listing_is_written_back_after_writes() {
     assert!(verify_body(&o, c).is_ok());
     let _ = fs::remove_dir_all(dir);
 }
+
+// ---- 3.1.0 #4: direction-control characters in names ----
+
+fn archive_of(names: &[&str]) -> Cursor<Vec<u8>> {
+    let mut buf = Cursor::new(Vec::new());
+    {
+        let mut z = ArchiveWriter::new(&mut buf).unwrap();
+        for n in names {
+            if let Some(d) = n.strip_suffix('/') {
+                z.push_archive_entry::<&[u8]>(ArchiveEntry::new_directory(d), None).unwrap();
+            } else {
+                z.push_archive_entry(ArchiveEntry::new_file(n), Some(&b"x"[..])).unwrap();
+            }
+        }
+        z.finish().unwrap();
+    }
+    buf.set_position(0);
+    buf
+}
+
+#[test]
+fn spoof_characters_are_listed_but_replaced_on_extraction() {
+    let names = [
+        "d\u{202E}ir/",
+        "d\u{202E}ir/invoice\u{202E}fdp.exe",
+        "photo\u{2067}gpj.scr",
+        "zwj\u{200D}emoji\u{200C}.txt", // ZWJ / ZWNJ are kept
+        "plain.txt",
+        "desktop.ini",
+        "link.URL",
+    ];
+    let mut c = archive_of(&names);
+    let len = c.get_ref().len() as u64;
+    let l = archive::inspect(&mut c, len).unwrap(); // existing containers keep opening
+    assert_eq!(l.entries.len(), names.len());
+    let dir = tmpdir();
+    let done = archive::extract(&mut c, &dir, 100, &|n| Some(n.to_string())).unwrap();
+    assert_eq!(done, archive::Extracted { files: 6, renamed: 3, risky: 2 });
+    assert!(dir.join("d_ir").join("invoice_fdp.exe").is_file());
+    assert!(dir.join("photo_gpj.scr").is_file());
+    assert!(dir.join("zwj\u{200D}emoji\u{200C}.txt").is_file());
+    let all: Vec<String> = walk_names(&dir);
+    assert!(all.iter().all(|n| !n.chars().any(archive::is_spoof_char)), "{all:?}");
+    let notes = done.notes();
+    assert!(notes.contains('3') && notes.contains('2'), "{notes}");
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn walk_names(d: &Path) -> Vec<String> {
+    let mut v = vec![];
+    for e in fs::read_dir(d).unwrap().flatten() {
+        v.push(e.file_name().to_string_lossy().into_owned());
+        if e.path().is_dir() {
+            v.extend(walk_names(&e.path()));
+        }
+    }
+    v
+}
+
+#[test]
+fn names_that_collide_after_replacement_stop_the_extraction() {
+    for pair in [["a\u{202E}b.txt", "a_b.txt"], ["a_b.txt", "a\u{202E}b.txt"], ["a\u{202E}b.txt", "A\u{202D}B.txt"]] {
+        let mut c = archive_of(&pair);
+        let dir = tmpdir();
+        let err = archive::extract(&mut c, &dir, 100, &|n| Some(n.to_string())).unwrap_err();
+        assert!(err.contains("<U+202"), "the message shows the hidden character: {err}");
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
+/// 3.1.0 final, review H: names that could be the same file or look the same are duplicates.
+#[test]
+fn duplicate_names_are_compared_conservatively() {
+    use archive::dup_key as k;
+    assert_eq!(k("Dir/A.TXT"), k("dir/a.txt"), "case");
+    assert_eq!(k("caf\u{e9}.txt"), k("cafe\u{301}.txt"), "NFC / NFD (macOS)");
+    assert_eq!(k("\u{FF21}.txt"), k("a.txt"), "full-width letter");
+    assert_eq!(k("\u{FB01}le"), k("file"), "ligature");
+    assert_eq!(k("a\u{200B}b"), k("ab"), "zero width space");
+    assert_eq!(k("a\u{200D}b"), k("ab"), "ZWJ is ignored for comparison");
+    assert_eq!(k("x\u{FE0F}"), k("x"), "variation selector");
+    assert_ne!(k("a.txt"), k("b.txt"));
+    assert_ne!(k("\u{d55c}"), k("\u{d55c}\u{ae00}"));
+}
+
+/// 3.1.0 final, review H: zstd frame headers are checked before any decoder sees them.
+#[test]
+fn zstd_windows_are_limited() {
+    use archive::{zstd_frame_window as w, MAX_ZSTD_WINDOW};
+    let magic = [0x28u8, 0xB5, 0x2F, 0xFD];
+    let frame = |fhd: u8, rest: &[u8]| [&magic[..], &[fhd], rest].concat();
+    // window descriptor: exponent 13 (8 MiB) and 17 (128 MiB)
+    assert_eq!(w(&frame(0x00, &[13 << 3])).unwrap(), (8 << 20, 6));
+    assert_eq!(w(&frame(0x00, &[17 << 3])).unwrap().0, 128 << 20);
+    assert_eq!(w(&frame(0x00, &[(12 << 3) | 4])).unwrap().0, (4 << 20) + (4 << 20) / 8 * 4, "mantissa");
+    // single segment: the content size is the buffer
+    assert_eq!(w(&frame(0x20, &[200])).unwrap(), (200, 6));
+    assert_eq!(w(&frame(0x60, &[0x00, 0x01])).unwrap().0, 256 + 256, "2-byte size has +256");
+    assert_eq!(w(&frame(0xA0, &[0, 0, 0, 0x08])).unwrap().0, 128 << 20);
+    assert_eq!(w(&frame(0x01, &[13 << 3, 7])).unwrap_err(), "arc.zstd_dict");
+    assert_eq!(w(&frame(0x08, &[13 << 3])).unwrap_err(), "arc.zstd_frame", "reserved bit");
+    assert_eq!(w(&[1, 2, 3, 4, 5, 6]).unwrap_err(), "arc.zstd_frame", "not zstd");
+    assert_eq!(w(&frame(0x00, &[])).unwrap_err(), "arc.zstd_frame", "cut off");
+    const { assert!(MAX_ZSTD_WINDOW >= 8 << 20, "everything Shield writes (level <= 19) fits") };
+}
+
+#[test]
+fn spoof_set_and_display_escaping() {
+    for c in ['\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}', '\u{FEFF}'] {
+        assert!(archive::is_spoof_char(c), "{:04X}", c as u32);
+    }
+    for c in ['\u{200C}', '\u{200D}', 'a', '한', '_', '\u{2065}', '\u{2029}', '\u{FE0F}', 'é'] {
+        assert!(!archive::is_spoof_char(c), "{:04X}", c as u32);
+    }
+    // 3.1.0 final, review H: other format characters, private use, noncharacters
+    for c in ['\u{00AD}', '\u{200B}', '\u{2060}', '\u{2062}', '\u{180E}', '\u{FFF9}', '\u{E0041}', '\u{E000}', '\u{F8FF}', '\u{F0000}', '\u{10FFFD}', '\u{FDD0}', '\u{FFFE}', '\u{1FFFF}'] {
+        assert!(archive::is_spoof_char(c), "{:04X}", c as u32);
+    }
+    // a variation selector is fine after a visible character, spoofing on its own
+    assert!(!archive::has_spoof("\u{2764}\u{FE0F}.txt"), "red heart emoji");
+    assert!(archive::has_spoof("\u{FE0F}x.txt") && archive::has_spoof("a\u{FE0F}\u{FE0F}.txt") && archive::has_spoof("a \u{FE0F}b"));
+    assert_eq!(archive::sanitize_component("\u{FE0F}a\u{200B}b"), "_a_b");
+    assert_eq!(archive::display_name("pay\u{00AD}ment"), "pay<U+00AD>ment");
+    assert_eq!(archive::display_name("a\u{202E}gpj.exe"), "a<U+202E>gpj.exe");
+    assert_eq!(archive::display_name("\u{FEFF}x"), "<U+FEFF>x");
+    assert!(matches!(archive::display_name("plain"), std::borrow::Cow::Borrowed(_)));
+    assert_eq!(archive::sanitize_component("a\u{202E}b\u{2066}c"), "a_b_c");
+    for (n, risky) in [("desktop.ini", true), ("Desktop.INI", true), ("x.url", true), ("a.library-ms", true), ("b.searchConnector-ms", true), ("c.scf", true), ("d.lnk", false), ("e.exe", false), ("desktop.ini.txt", false)] {
+        assert_eq!(archive::is_risky_windows_name(n), risky, "{n}");
+    }
+}
+
+#[test]
+fn decrypted_single_file_name_is_cleaned_too() {
+    let dir = tmpdir();
+    let f = dir.join("report\u{202E}fdp.exe");
+    fs::write(&f, b"content").unwrap();
+    let c = cred("container password 1", 0);
+    let shd = dir.join("r.shd");
+    do_encrypt(&f, &shd, &c, &opts()).unwrap();
+    fs::remove_file(&f).unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+    let msg = crate::engine::do_decrypt(&shd, &out, &c, crate::engine::DecOpts::default()).unwrap();
+    assert_eq!(fs::read(out.join("report_fdp.exe")).unwrap(), b"content", "{msg}");
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    assert!(msg.contains(&crate::i18n::tf("arc.spoof_renamed", &[&1])), "{msg}");
+    // the manager still lists the stored (real) name, and extracting it by that name works
+    let o = open(&shd, c.duplicate()).unwrap();
+    assert_eq!(o.entries[0].name.as_str(), "report\u{202E}fdp.exe");
+    let sel: std::collections::HashSet<String> = [o.entries[0].name.to_string()].into();
+    let out2 = dir.join("out2");
+    fs::create_dir_all(&out2).unwrap();
+    extract_selected(&o, c, &sel, "", &out2, crate::engine::DecOpts::default()).unwrap();
+    assert!(out2.join("report_fdp.exe").is_file());
+    let _ = fs::remove_dir_all(dir);
+}
+
+// ---- 3.1.0 #14 ----
+
+#[test]
+fn only_regular_files_are_opened() {
+    let dir = tmpdir();
+    let (p, c) = sample(&dir);
+    let renamed = dir.join("picture.png");
+    fs::rename(&p, &renamed).unwrap();
+    assert!(open(&renamed, c.duplicate()).is_ok(), "any name");
+    let bad = |p: &Path| open(p, c.duplicate()).err().unwrap();
+    assert_eq!(bad(&dir.join("Docs")), not_regular(), "folder");
+    // a missing file says so (the system's "not found"), as in 3.0.0, not "not a regular file"
+    let missing = bad(&dir.join("nope"));
+    assert_ne!(missing, not_regular(), "missing");
+    assert!(missing.contains("(os error 2)"), "missing: {missing}");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&renamed, dir.join("link.shd")).unwrap();
+        assert_eq!(bad(&dir.join("link.shd")), not_regular(), "link");
+        let fifo = dir.join("fifo.shd");
+        assert!(std::process::Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+        let t0 = std::time::Instant::now();
+        assert_eq!(bad(&fifo), not_regular(), "FIFO");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5), "opening a FIFO never blocks");
+        assert_eq!(bad(Path::new("/dev/zero")), not_regular(), "device");
+    }
+    #[cfg(windows)]
+    for dev in [r"\\.\PhysicalDrive0", r"\\?\GLOBALROOT\Device\Null", "NUL", "CON", r"C:\dir\COM1.shd", r"\\.\pipe\x"] {
+        assert!(dev.starts_with(r"\\") || !dev.starts_with('\\'), "test data: {dev}");
+        assert_eq!(bad(Path::new(dev)), not_regular(), "{dev}");
+    }
+    // a regular file that is no container: the usual "wrong password or not a container" answer
+    let junk = dir.join("junk.bin");
+    fs::write(&junk, vec![1u8; 4096]).unwrap();
+    assert!(has_code(&bad(&junk), C_OPEN_BAD));
+    let _ = fs::remove_dir_all(dir);
+}

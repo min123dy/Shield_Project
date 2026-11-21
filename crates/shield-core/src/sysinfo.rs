@@ -62,6 +62,34 @@ pub fn file_id(f: &File) -> io::Result<FileId> {
     pfs::file_id(f)
 }
 
+pub use shield_platform::EntryKind;
+
+/// Entry names of the held folder `dir` (at `path`); see `shield_platform::fs::list_dir_held`.
+pub fn list_dir_held(dir: &File, path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+    pfs::list_dir_held(dir, path)
+}
+
+/// Kind of the entry `name` (at `path`) of the held folder `dir`, links not followed.
+pub fn entry_kind_at(dir: &File, name: &std::ffi::OsStr, path: &Path) -> io::Result<EntryKind> {
+    pfs::entry_kind_at(dir, name, path)
+}
+
+/// Opens and holds the sub-folder `name` (at `path`) of the held folder `dir`.
+pub fn open_dir_at(dir: &File, name: &std::ffi::OsStr, path: &Path) -> io::Result<File> {
+    pfs::open_dir_at(dir, name, path)
+}
+
+/// Opens the regular file `name` (at `path`) of the held folder `dir` for reading.
+pub fn open_file_at(dir: &File, name: &std::ffi::OsStr, path: &Path) -> io::Result<File> {
+    pfs::open_file_at(dir, name, path)
+}
+
+/// Opens `p` for reading only if it is a regular file (no folder, device, FIFO, socket or link;
+/// the open itself can't block). See `shield_platform::fs::open_regular`.
+pub fn open_regular(p: &Path) -> io::Result<File> {
+    pfs::open_regular(p)
+}
+
 /// Creates a new folder only the current user can access. Fails if anything already exists at
 /// `p`, then checks that the result is a real folder (not a link).
 pub fn create_private_dir(p: &Path) -> io::Result<()> {
@@ -92,8 +120,18 @@ pub fn create_private_file(p: &Path) -> io::Result<File> {
 }
 
 /// Rename that fails instead of replacing an existing destination (Linux: renameat2 NOREPLACE).
+/// A folder that cannot be moved without replacing safely is refused with a translated message.
 pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-    pfs::rename_noreplace(from, to)
+    pfs::rename_noreplace(from, to).map_err(translate_noreplace)
+}
+
+/// The platform's `NOREPLACE_DIR_REFUSED` error as a translated one (3.1.0 #11).
+pub fn translate_noreplace(x: io::Error) -> io::Error {
+    if x.get_ref().is_some_and(|m| m.to_string() == shield_platform::NOREPLACE_DIR_REFUSED) {
+        io::Error::new(io::ErrorKind::PermissionDenied, crate::i18n::t("eng.noreplace_dir"))
+    } else {
+        x
+    }
 }
 
 /// Atomic replace of `to` by `from` (same folder), written through to disk.
@@ -150,4 +188,21 @@ pub fn forbidden_parent(p: &Path) -> bool {
 
 pub fn is_shd(p: &Path) -> bool {
     p.is_file() && p.extension().is_some_and(|x| x.eq_ignore_ascii_case("shd"))
+}
+
+/// Removes `p` only while it is still the file `id` names (3.1.0 #12: temporary files are deleted
+/// by identity, not by name). Ok(true): removed or already gone. Ok(false): another object has
+/// that name now and was left alone. Deletion goes through the handle that was compared.
+pub fn remove_if_same(p: &Path, id: &FileId) -> io::Result<bool> {
+    let f = match pfs::open_no_follow(p, true) {
+        Ok(f) => f,
+        Err(x) if x.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(x) => return Err(x),
+    };
+    let now = pfs::file_id(&f)?;
+    if now.vol != id.vol || now.idx != id.idx || now.special {
+        return Ok(false);
+    }
+    pfs::delete_checked(f, p)?;
+    Ok(true)
 }

@@ -1,0 +1,196 @@
+SHIELD 3.1.0 final - Changes (earlier 3.1.0 build -> 3.1.0 final)
+=================================================================
+한국어: docs\08_3.1.0_최종_변경_내역.txt
+Related: docs\en\09_security_report.txt (verdicts and findings), docs\en\10_secure_delete_design.txt (new feature)
+
+0. Version and scope of this file
+---------------------------------
+- The version number stays 3.1.0 (Cargo.toml, MSI, installer names, --version, the info tab and the docs all say 3.1.0;
+  checked by release_tests::one_version_and_no_pre_release_labels).
+- "Earlier 3.1.0 build" = the build with docs\en\06_changes_3.1.0.txt sections 1-19 (3.0.0 review items 1-15, review 2)
+  (built 2026-11-09, the earlier files in dist\). It may already have been given to people under the same number.
+- "3.1.0 final (after the fixes)" = that plus the changes in this file (secure delete, development review items A-J, the section 4
+  analysis, docs).
+- Both builds print the same --version. Tell them apart by file hashes (SHA256SUMS.txt) or by behaviour: a Secure
+  delete tab and shield wipe mean the final build.
+- Review 3 (unbounded reads, code comments "3.1.0 review 3") was an unreleased intermediate step and is listed under A.
+
+1. Features
+-----------
+1-1. New: secure delete (docs/10)
+  - GUI "Secure delete" tab, console shield wipe, context menu "Secure delete with SHIELD" (Windows classic menu, Linux
+    Nautilus, Nemo, Dolphin, Thunar). Ordinary files and folders: warning -> limits (checkbox) -> 6-character code (3 s
+    wait, 3 wrong answers abort), three steps; only .shd files: two steps. Blocklist (system folders, drive roots and
+    mount points, home roots, Shield's own files, special files).
+  - No weakening option ("don't ask again" ...). --yes does not stand in for the secure delete confirmation.
+  - The existing "shred originals after encryption" keeps its confirmation; its overwrite loop is now the same one as
+    secure delete (wipe::overwrite_with). Results (patterns, buffer, syncing) are the same.
+1-2. CLI --allow-weak (E)
+  - New passwords with warnings (short, common words, patterns, PIM below the default ...) are used only after a direct
+    "yes" on a terminal or with --allow-weak. Up to the earlier 3.1.0 build, --yes also passed these warnings.
+1-3. The number of unusable items from context menu encryption and secure delete is shown (F, S-03).
+1-4. Artifact name: the source zip Shield_Project_v3_1_0.zip -> Shield_Project_v3.1.0.zip (the same _v3.1.0 form as the
+     other files).
+
+2. Security fixes (development review items A-J)
+---------------------------------------
+ A Unbounded file reads [medium, CWE-789/400]
+   Before: signature files read completely before the 64 KiB check, signed data read into memory after a size check,
+   --key public keys and settings.key unbounded.
+   Final: shield_platform::bounded (open -> type and size on the handle -> take(max+1)). Signatures 64 KiB, public keys
+   1 MiB, settings.key 4 KiB, settings, spool, journal, update_seen ... each with a limit, signed data streamed (at most
+   2 GiB). clippy.toml forbids std::fs::read / read_to_string / Read::read_to_end / read_to_string (test code excepted);
+   CI clippy -D warnings enforces it on Windows and Linux.
+ B Update manifest replay, rollback, revocation [medium]
+   Final: every release publishes v1 (Shield_v<V>_release.txt, the format 3.0.0 reads, unchanged) and v2
+   (Shield_v<V>_release_v2.txt + .sig). v2: version, release_id, issued_at, expires_at (+365 days, at most 400),
+   min_allowed_version, revoked_key (keys/revoked_keys.txt), sha256 lines. The whole file is signed.
+   3.1.0 final clients: without v2, or when it fails, nothing is installed automatically; only the release page link.
+   Refused: expired, issued more than 24 h in the future, min_allowed_version > version, not newer than the running
+   version (downgrade), signed by a revoked key, release_id lower than seen so far or version lower than the highest
+   minimum seen (rollback).
+   The rollback state is kept in update_seen.txt (a private user file) in the data folder. When missing or damaged the
+   state is empty (the "only newer than the running version" rule remains); it never makes something acceptable that
+   should not be. Why not in the MAC-protected settings: docs/09 B.
+   Messages: upd.m_expired, upd.m_future (check the clock), upd.m_rollback, upd.m_revoked (ko/en).
+   Compatibility: 3.0.0 and the earlier 3.1.0 build read only v1 and know nothing of v2 (3.0.0's parser is pinned by
+   compat_tests), so v1 stays published. These clients get no replay or rollback protection until they are on 3.1.0
+   final or later. v1 end-of-life: v1 is published alongside for at least 12 months after 3.1.0 final, and its end is
+   announced in the release notes beforehand. After that, 3.0.0 and earlier-3.1.0 users must download the installer.
+ C Bundled release key does not match the operating model [medium]
+   Found: keys/release_key.asc = primary [SC] without expiry, no [S] subkey, an [E] subkey, a personal mail user ID.
+   Final: (1) test fixtures use a test-only key (user ID @invalid); a test checks that no copy of the real key is among
+   the fixtures; the pinned fingerprint test reads keys/release_key.asc of the repository. (2) a backup public key slot
+   (keys/release_key_backup.asc, SHIELD_PUBKEY_BACKUP_PATH) and the "primary + backup" trust list (since 3.1.0 #3).
+   (3) new release key gate: Cert::shape() reads the key's structure and release_tests::release_key_gate checks for a
+   signing subkey (with expiry, about 2 years at most), a certify-only primary, a project user ID (no personal mail
+   domain) and the backup key file. It runs in the audit job of tag releases; when it fails nothing is built, signed or
+   published. Local build.ps1/build.sh print the same check as a warning. (4) docs/07 rewritten (key creation,
+   operation, rotation, revocation, the manual GitHub settings checklist).
+   State at that time (before the follow-up): the tag gate required that key topology. The 2026-11-11 follow-up removed
+   the key-shape gate, so this sentence is not the current policy after the follow-up below.
+ D Linux config folder fallback /tmp/shield [low]
+   Final: XDG_CONFIG_HOME (only when absolute) or $HOME/.config. Neither: an error (settings are not read or saved). The
+   config folder must be a real folder (no link), owned by the current user, mode 0700 (looser modes are tightened to
+   0700). The settings file must not be writable by others, and settings.key must be the user's own with mode 0600
+   (checked on the open handle). Lock files are not created elsewhere either.
+ E Weak passwords and CLI --yes [low]
+   Rules (one place: password::check_new, engine::check_new_password; shared by GUI, settings password and CLI):
+     refused (blocks): empty password (no key file), PIM below the default (12) with no key file and fewer than 20
+                       characters, confirmation mismatch, input buffer overflow.
+     warnings:         under 13 characters, digits only or one kind of character, common passwords or containing one,
+                       repeats and sequences, containing a name or user name, low score, key file only without password.
+   With a key file an empty password is allowed (warning) and the PIM length rule does not apply (engine::min_password_len).
+   GUI: the "use anyway after a warning" policy stays. CLI: --yes does not pass; only --allow-weak or a terminal answer.
+ F Nautilus relative paths [low, functional defect]
+   Final: the three Nautilus scripts (encrypt, open, secure delete) make paths absolute with the same block.
+   $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS is used only when it matches the arguments 1:1 (every line absolute and ending
+   in "/<argument>"); when a newline in a name makes it ambiguous, each argument is made absolute against $PWD. Names
+   are never evaluated or run. The GUI normalises arguments again (file:// URIs, relative -> current folder, . removed,
+   no link following). The spool is NUL-terminated (S-01); dropped items are counted in the encryption window and the
+   Secure delete tab.
+   Tests: installer/linux/tests/nautilus_scripts_test.sh (47 cases: spaces, quotes, $( ), backticks, newlines, file://,
+   search view ...; dash and bash; run by build.sh), release_tests::nautilus_scripts_share_the_absolute_path_block.
+   Not verified in a real Nautilus.
+ G CI signing path [low]
+   Final: rust-toolchain.toml (1.99.1, clippy, rustfmt); runners windows-2022 / ubuntu-24.04 / ubuntu-24.04-arm; actions
+   pinned by commit SHA; build provenance attestations (attest-build-provenance) and gh attestation verify in the signing
+   job before signing (same SHA-256, made by this workflow of this repository); no ${{ }} inside run: (env: and GITHUB_*
+   only, enforced by a test); appimagetool pinned by URL + SHA-256; audit job (cargo audit --deny warnings, cargo deny,
+   review date check; the key-shape tag gate existed in that historical build and was removed by the 2026-11-11 follow-up); build path remapping (S-05).
+   Reproducible builds: --remap-path-prefix applied; SOURCE_DATE_EPOCH does not apply to the Rust programs (no build
+   time is embedded), MSI and zip time stamps remain. Whether the same bytes are produced again was not checked.
+   Manual settings (cannot be enforced by files): checklist in docs/07 section 7. The workflow has not run on GitHub.
+ H Name spoofing and compression properties [info]
+   Final: Cf (zero-width, bidi, tag characters ...), Co (private use) and noncharacters refused / shown as <U+XXXX>;
+   variation selectors without a visible base refused; duplicates judged by dup_key (NFKC + case folding + normalisation
+   + invisible characters removed; a collision refuses the whole archive); Zstd frame headers checked before the decoder
+   (window at most 32 MiB, block count limit). The LZMA2 dictionary limit already existed.
+ I Dependencies [info]
+   cargo audit / cargo deny pass (8 exceptions, each with reason, impact path and review-by 2027-05-10; CI fails after
+   that date). egui 0.27, rfd 0.14 and pgp 0.21 were not upgraded (section 9).
+ J Limits disclosure [code + docs]
+   Secure delete step 2 and the passes note (SSD, snapshots, cloud), docs/01 section 7 (same-user attackers, Linux
+   settings key), docs/04 (no MSI signature, how to check the GPG .sig, SmartScreen), docs/07 (key backup and rotation),
+   docs/09 (no third-party audit).
+
+3. Security fixes (found in the section 4 analysis; table in docs/09 section 3)
+------------------------------------------------------------------------------
+ S-01 spool split on newlines -> NUL-terminated         S-02 GUI panic on non-UTF-8 arguments -> args_os
+ S-03 encryption window did not show dropped items      S-04 ${{ github.repository }} etc. removed from run:
+ S-05 local absolute paths (account name) in programs   S-06 one overwrite loop (shredding = secure delete)
+ S-07 more secure delete tests                          S-08 test against weakening options
+ S-09 terminal control characters and long names        S-10 part of D: data_dir() failures reach every caller (+ Linux tests)
+
+4. Compatibility
+----------------
+ - Container format: unchanged (v2; 2.x opens, 1.x does not). Cross-OS fixture tests pass.
+ - Settings file: same format. On Linux a settings file others can write and a settings.key that is not 0600 are not used
+   (files Shield made are 0600 from the start, so usually no effect). The config folder becomes 0700 automatically.
+ - Updates: v1 + v2 manifests per release (section 2 B). 3.0.0 -> 3.1.0 final still works through v1.
+ - CLI scripts: scripts that passed weak passwords with --yes need --allow-weak (otherwise nothing is created and the
+   exit code is 1; answering "no" on a terminal gives 5). The new exit codes 7 (PARTIAL) and 8 (REFUSED) are used only by
+   shield wipe.
+ - Spool entries changed from newline- to NUL-terminated: if an old and a new process write the spool at the same time
+   during an upgrade, the old entries are dropped and counted (select again).
+ - integrate.sh copies the Nautilus scripts into the user's folder, so upgrading the package does not change them by
+   itself (section 5).
+ - Building: build.ps1/build.sh write target\remap-paths.toml and pass it to cargo with --config (path remapping). No
+   flags variable is set (it would replace the crt-static flags of .cargo\config.toml). A RUSTFLAGS set by the user
+   makes cargo ignore all config flags, as before, so do not combine it with the build scripts.
+
+5. What users need to do
+------------------------
+ - Linux Nautilus users: run /usr/share/shield/integrate.sh again as yourself after upgrading (copies the new scripts).
+ - CLI script users: add --allow-weak to scripts that use a weak password on purpose.
+ - Linux environments without HOME (some service accounts): set XDG_CONFIG_HOME or HOME, or settings are not saved.
+ - The publisher (developer): key replacement and backup key per docs/07, the GitHub settings checklist were follow-up
+   hardening tasks at the time this change log was written. The 2026-11-11 follow-up removed the key-shape tag gate;
+   current signing requirements are listed in section C and docs/en/07_key_rotation.txt.
+
+6. Removed and changed options
+------------------------------
+ - Removed: the Linux /tmp/shield config folder fallback.
+ - Changed: CLI --yes does not answer weak password warnings or the secure delete confirmation (ignored with a note).
+ - Added: --allow-weak, shield wipe (--passes, -r/--recursive, --dry-run, --confirm-token, --i-understand-irreversible),
+   the GUI launch argument --wipe.
+
+7. Upgrading
+------------
+ - Windows: the new MSI removes an earlier 3.x and installs (same UpgradeCode; test against the 2.1.0 + 3.0.0 side-by-side
+   problem). "Secure delete with SHIELD" is registered with it. Portable: replace the file, then register the context
+   menu again in the settings.
+ - Linux: reinstall the deb (sudo apt install ./shield_v3.1.0_amd64.deb) or replace the AppImage, then integrate.sh.
+ - In-app update: from 3.1.0 final a v2 manifest is needed. From the earlier build with the same 3.1.0 number to the
+   final one there is no in-app update (same version: "no new version"). Replace it with the installer.
+
+8. Known limits
+---------------
+ - Secure delete cannot guarantee physical erasure on SSD/NVMe, snapshots, COW, cloud or backups (docs/10 section 5).
+ - Malware running as the same user can get around the confirmation, the settings key and the rollback state.
+ - The MSI and the programs have no Authenticode signature (SmartScreen warning, docs/04).
+ - No independent third-party security audit. Static analysis and automated tests; some items not verified on real
+   systems (docs/09 section 7).
+ - cargo fmt --check does not pass (the code base was never formatted with rustfmt; docs/09 R-7).
+
+9. Not done, and why
+--------------------
+ - egui/eframe 0.27 -> latest, rfd 0.14 -> latest, pgp 0.21 -> latest: the APIs changed a lot and the whole GUI and
+   signature verification would have to be tested again. Mixed with this scope (secure delete + fixes) regressions would
+   be hard to see, so it moves to the next release. Effect: the 8 advisory exceptions stay (.cargo/audit.toml, with the
+   impact analysis). Follow-up: before the review date 2027-05-10.
+ - Authenticode signing: needs a certificate (cost, storage). To be reviewed later.
+ - MAC protection of the rollback state: docs/09 B (meaningless against a same-user attacker).
+
+10. Tests
+---------
+ docs/en/05 section "3.1.0 final" lists the commands run, the results (counts, time) and what could not be run.
+
+
+10. Follow-up fixes and corrections dated 2026-11-11
+-----------------------------------------------------
+- Section C records a release-key gate that existed in that historical build. It is no longer mandatory: the tag gate and pinned fingerprint assertion that required a signing subkey, expiry, project-specific user ID and backup public key were removed. A valid public key remains required; signed releases still require a signing-capable secret key matching it.
+- Fixed the secure-delete guard so a directly selected file or folder inside Shield's data directory is refused, not only the directory and its ancestors. Added regression coverage for files, nested folders, root, ancestor and unrelated sibling.
+- Added protected machine-wide rollback state and a cross-process lock to the elevated update helper so concurrent updates cannot lower the rollback floor.
+- Unified the root LICENSE, Cargo workspace and four crates on Apache-2.0.
+- The full Rust test suite for this follow-up could not be rerun because cargo/rustc are unavailable in the editing environment. See the follow-up verification limits in docs/05 and docs/09.

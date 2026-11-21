@@ -30,7 +30,7 @@ impl<T: Send + 'static> Job<T> {
         set_stage(0);
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let r = catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(panic_msg()));
+            let r = with_cleanup_warnings(catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Err(panic_msg())));
             set_stage(0);
             let _ = tx.send(r);
         });

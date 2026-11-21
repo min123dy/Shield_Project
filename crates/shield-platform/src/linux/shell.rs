@@ -14,6 +14,8 @@ use std::{
 pub const MIME: &str = "application/x-shield-container";
 const BEGIN: &str = "<!-- shield-begin -->";
 const END: &str = "<!-- shield-end -->";
+/// Largest Thunar uca.xml read (3.1.0 review 3).
+const MAX_UCA: u64 = 16 << 20;
 
 pub fn open_url(url: &str) -> PResult<()> {
     // defense in depth: the caller validated the URL already
@@ -30,14 +32,15 @@ struct Labels {
     enc: &'static str,
     dec: &'static str,
     open: &'static str,
+    wipe: &'static str,
     app: &'static str,
 }
 
 fn labels() -> Labels {
     if super::sys::system_lang_is_korean() {
-        Labels { enc: "Shield로 암호화", dec: "Shield로 복호화", open: "SHIELD에서 열기", app: "Shield 파일 암호화" }
+        Labels { enc: "Shield로 암호화", dec: "Shield로 복호화", open: "SHIELD에서 열기", wipe: "SHIELD로 완전삭제", app: "Shield 파일 암호화" }
     } else {
-        Labels { enc: "Encrypt with Shield", dec: "Decrypt with Shield", open: "Open in SHIELD", app: "Shield file encryption" }
+        Labels { enc: "Encrypt with Shield", dec: "Decrypt with Shield", open: "Open in SHIELD", wipe: "Secure delete with SHIELD", app: "Shield file encryption" }
     }
 }
 
@@ -72,8 +75,8 @@ fn write(p: &Path, text: &str, exec: bool, out: &mut Vec<PathBuf>) -> PResult<()
 struct Files {
     desktop: PathBuf,
     mime: PathBuf,
-    nautilus: [PathBuf; 2],
-    nemo: [PathBuf; 2],
+    nautilus: [PathBuf; 4],
+    nemo: [PathBuf; 4],
     dolphin: Vec<PathBuf>,
     thunar: PathBuf,
 }
@@ -85,8 +88,13 @@ fn files() -> PResult<Files> {
     Ok(Files {
         desktop: d.join("applications/shield.desktop"),
         mime: d.join("mime/packages/shield.xml"),
-        nautilus: [ns.join(l.enc), ns.join(l.dec)],
-        nemo: [d.join("nemo/actions/shield-encrypt.nemo_action"), d.join("nemo/actions/shield-decrypt.nemo_action")],
+        nautilus: [ns.join(l.enc), ns.join(l.dec), ns.join(l.open), ns.join(l.wipe)],
+        nemo: [
+            d.join("nemo/actions/shield-encrypt.nemo_action"),
+            d.join("nemo/actions/shield-decrypt.nemo_action"),
+            d.join("nemo/actions/shield-open.nemo_action"),
+            d.join("nemo/actions/shield-wipe.nemo_action"),
+        ],
         dolphin: vec![d.join("kio/servicemenus/shield.desktop"), d.join("kservices5/ServiceMenus/shield.desktop")],
         thunar: c.join("Thunar/uca.xml"),
     })
@@ -99,7 +107,18 @@ fn thunar_block(exe: &str, l: &Labels) -> String {
             if dirs { "<directories/>" } else { "" }
         )
     };
-    format!("{BEGIN}\n{}\n{}\n{END}\n", act("encrypt", l.enc, "--encrypt-multi", "*", true), act("decrypt", l.dec, "--decrypt", "*.shd", false))
+    // 3.1.0 #14: "open" on every file (one: %f), whatever its name
+    let open = format!(
+        "<action><icon>shield</icon><name>{n}</name><unique-id>shield-open</unique-id><command>\"{exe}\" --open %f</command><description>{n}</description><patterns>*</patterns><audio-files/><image-files/><other-files/><text-files/><video-files/></action>",
+        n = l.open
+    );
+    // 3.1.0 final: "secure delete" only opens the window (three confirmations happen there)
+    format!(
+        "{BEGIN}\n{}\n{}\n{open}\n{}\n{END}\n",
+        act("encrypt", l.enc, "--encrypt-multi", "*", true),
+        act("decrypt", l.dec, "--decrypt", "*.shd", false),
+        act("wipe", l.wipe, "--wipe", "*", true)
+    )
 }
 
 fn strip_block(xml: &str) -> String {
@@ -131,16 +150,30 @@ pub fn register(exe: &Path) -> PResult<Vec<PathBuf>> {
     )?;
     write(&f.nautilus[0], &format!("#!/bin/sh\nexec \"{e}\" --encrypt-multi \"$@\"\n"), true, &mut out)?;
     write(&f.nautilus[1], &format!("#!/bin/sh\nexec \"{e}\" --decrypt \"$@\"\n"), true, &mut out)?;
-    write(&f.nemo[0], &format!("[Nemo Action]\nName={}\nExec=\"{e}\" --encrypt-multi %F\nIcon-Name=shield\nSelection=notnone\nExtensions=any;\n", l.enc), false, &mut out)?;
-    write(&f.nemo[1], &format!("[Nemo Action]\nName={}\nExec=\"{e}\" --decrypt %F\nIcon-Name=shield\nSelection=notnone\nExtensions=shd;\n", l.dec), false, &mut out)?;
+    // one item only: Nautilus passes every selected item; the first is opened
+    write(&f.nautilus[2], &format!("#!/bin/sh\n[ $# -ge 1 ] || exit 0\nexec \"{e}\" --open \"$1\"\n"), true, &mut out)?;
+    // review F: Nautilus may pass names relative to the folder it runs the script in; the window
+    // makes them absolute (`spool::normalize_arg`), `--` keeps names starting with - as names
+    write(&f.nautilus[3], &format!("#!/bin/sh\n[ $# -ge 1 ] || exit 0\nexec \"{e}\" --wipe -- \"$@\"\n"), true, &mut out)?;
+    // 3.1.0 #9-B: Quote=double, so Nemo passes names with spaces or quotes as one argument each
+    write(&f.nemo[0], &format!("[Nemo Action]\nName={}\nExec=\"{e}\" --encrypt-multi %F\nIcon-Name=shield\nSelection=notnone\nExtensions=any;\nQuote=double\n", l.enc), false, &mut out)?;
+    write(&f.nemo[1], &format!("[Nemo Action]\nName={}\nExec=\"{e}\" --decrypt %F\nIcon-Name=shield\nSelection=notnone\nExtensions=shd;\nQuote=double\n", l.dec), false, &mut out)?;
+    write(&f.nemo[2], &format!("[Nemo Action]\nName={}\nExec=\"{e}\" --open %F\nIcon-Name=shield\nSelection=s\nExtensions=any;\nQuote=double\n", l.open), false, &mut out)?;
+    write(&f.nemo[3], &format!("[Nemo Action]\nName={}\nExec=\"{e}\" --wipe %F\nIcon-Name=shield\nSelection=notnone\nExtensions=any;\nQuote=double\n", l.wipe), false, &mut out)?;
     let svc = format!(
-        "[Desktop Entry]\nType=Service\nMimeType=all/allfiles;inode/directory;\nActions=shieldEncrypt;shieldDecrypt;shieldOpen;\nX-KDE-ServiceTypes=KonqPopupMenu/Plugin\nX-KDE-Submenu=Shield\n\n[Desktop Action shieldEncrypt]\nName={}\nIcon=shield\nExec=\"{e}\" --encrypt-multi %F\n\n[Desktop Action shieldDecrypt]\nName={}\nIcon=shield\nExec=\"{e}\" --decrypt %F\n\n[Desktop Action shieldOpen]\nName={}\nIcon=shield\nExec=\"{e}\" --open %f\n",
-        l.enc, l.dec, l.open
+        "[Desktop Entry]\nType=Service\nMimeType=all/allfiles;inode/directory;\nActions=shieldEncrypt;shieldDecrypt;shieldOpen;shieldWipe;\nX-KDE-ServiceTypes=KonqPopupMenu/Plugin\nX-KDE-Submenu=Shield\n\n[Desktop Action shieldEncrypt]\nName={}\nIcon=shield\nExec=\"{e}\" --encrypt-multi %F\n\n[Desktop Action shieldDecrypt]\nName={}\nIcon=shield\nExec=\"{e}\" --decrypt %F\n\n[Desktop Action shieldOpen]\nName={}\nIcon=shield\nExec=\"{e}\" --open %f\n\n[Desktop Action shieldWipe]\nName={}\nIcon=shield\nExec=\"{e}\" --wipe %F\n",
+        l.enc, l.dec, l.open, l.wipe
     );
     for p in &f.dolphin {
         write(p, &svc, true, &mut out)?; // KF6 runs only executable service menus
     }
-    let old = fs::read_to_string(&f.thunar).unwrap_or_default();
+    // 3.1.0 review 3: read with a limit; a file that exists but cannot be read (too large, not
+    // UTF-8, no access) is left alone instead of being replaced by one without the user's actions
+    let old = match crate::bounded::read_text_limited(&f.thunar, MAX_UCA) {
+        Ok(s) => s,
+        Err(x) if x.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(x) => return Err(std::io::Error::new(x.kind(), format!("{}: {x}", f.thunar.display())).into()),
+    };
     let base = strip_block(&old);
     let xml = if base.contains("</actions>") {
         base.replacen("</actions>", &format!("{}</actions>", thunar_block(&e, &l)), 1)
@@ -165,13 +198,13 @@ pub fn unregister() -> PResult<Vec<PathBuf>> {
     let mut gone = Vec::new();
     // both languages: the labels (= Nautilus script names) may have changed since registering
     let ns = data_home()?.join("nautilus/scripts");
-    let names = ["Shield로 암호화", "Shield로 복호화", "Encrypt with Shield", "Decrypt with Shield"].map(|n| ns.join(n));
+    let names = ["Shield로 암호화", "Shield로 복호화", "SHIELD에서 열기", "SHIELD로 완전삭제", "Encrypt with Shield", "Decrypt with Shield", "Open in SHIELD", "Secure delete with SHIELD"].map(|n| ns.join(n));
     for p in [f.desktop.clone(), f.mime.clone()].iter().chain(names.iter()).chain(f.nemo.iter()).chain(f.dolphin.iter()) {
         if fs::remove_file(p).is_ok() {
             gone.push(p.clone());
         }
     }
-    if let Ok(x) = fs::read_to_string(&f.thunar) {
+    if let Ok(x) = crate::bounded::read_text_limited(&f.thunar, MAX_UCA) {
         let s = strip_block(&x);
         if s != x {
             fs::write(&f.thunar, s)?;
@@ -191,6 +224,8 @@ mod tests {
         let base = "<?xml version=\"1.0\"?>\n<actions>\n<action><name>x</name></action>\n</actions>\n";
         let with = base.replacen("</actions>", &format!("{}</actions>", thunar_block("/usr/bin/shield-gui", &l)), 1);
         assert!(with.contains("shield-encrypt") && with.contains("\"/usr/bin/shield-gui\" --decrypt %F"));
+        assert!(with.contains("<unique-id>shield-open</unique-id><command>\"/usr/bin/shield-gui\" --open %f</command>"), "3.1.0 #14");
+        assert!(with.contains("<unique-id>shield-wipe</unique-id><command>\"/usr/bin/shield-gui\" --wipe %F</command>"), "3.1.0 final");
         assert_eq!(strip_block(&with), base);
         assert_eq!(strip_block(base), base);
     }

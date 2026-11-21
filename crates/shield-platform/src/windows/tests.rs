@@ -250,3 +250,105 @@ fn trim_elevates_only_a_system32_tool() {
     let e = sys::run_elevated(&sys32.join("..").join("System32").join("defrag.exe"), "C: /L").unwrap_err();
     assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "only the exact System32 folder");
 }
+
+
+// ---- 3.1.0 #1: update helper ----
+
+#[test]
+fn update_private_folder_has_admin_only_protected_dacl() {
+    let d = dir();
+    let p = d.join("upd");
+    install::create_admin_dir(&p).unwrap();
+    assert!(install::create_admin_dir(&p).is_err(), "an existing folder is refused");
+    let sddl = install::dacl_sddl(&p).unwrap();
+    assert_eq!(sddl, install::ADMIN_DACL, "SYSTEM + Administrators only, protected (no inheritance)");
+    // the same seen through icacls (locale-neutral checks: two ACEs, nothing inherited)
+    let out = std::process::Command::new(fs::system_dir().unwrap().join("icacls.exe")).arg(&p).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert_eq!(text.lines().filter(|l| l.contains(":(")).count(), 2, "{text}");
+    assert!(!text.contains("(I)"), "nothing inherited: {text}");
+    // clean up as the owner (an owner may always rewrite the DACL)
+    OS.restrict_file_permissions(&p).unwrap();
+    let _ = sfs::remove_dir_all(d);
+}
+
+// ---- 3.1.0 review 2 #3: an existing update folder is not taken over ----
+
+#[test]
+fn update_folder_owners_that_count() {
+    for s in ["S-1-5-18", "S-1-5-32-544", "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"] {
+        assert!(install::trusted_owner_sid(s), "{s}");
+    }
+    for s in ["S-1-5-32-545", "S-1-1-0", "S-1-5-11", "S-1-5-21-1-2-3-1001", "S-1-5-80-0", "", "S-1-5-18-1"] {
+        assert!(!install::trusted_owner_sid(s), "{s}");
+    }
+}
+
+#[test]
+fn a_folder_made_by_a_normal_account_or_a_junction_is_refused_unchanged() {
+    // the test runs as a normal (not elevated) account: the folder it makes is its own
+    let d = dir();
+    let own = d.join("Shield");
+    sfs::create_dir(&own).unwrap();
+    let before = install::dacl_sddl(&own).unwrap();
+    let owner = install::owner_sid(&sfs::File::open(&own).or_else(|_| {
+        use std::os::windows::fs::OpenOptionsExt;
+        sfs::OpenOptions::new().read(true).custom_flags(0x0200_0000).open(&own)
+    }).unwrap()).unwrap();
+    assert!(owner.starts_with("S-1-5-"), "{owner}");
+    if !install::trusted_owner_sid(&owner) {
+        let e = install::secure_parent_for_test(&own).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+        assert_eq!(install::dacl_sddl(&own).unwrap(), before, "nothing changed");
+    }
+    // a junction in place of the folder is refused without touching its target
+    let j = d.join("ShieldJ");
+    let st = std::process::Command::new(fs::system_dir().unwrap().join("cmd.exe")).args(["/c", "mklink", "/J"]).arg(&j).arg(&own).output().unwrap();
+    assert!(st.status.success(), "mklink /J: {}", String::from_utf8_lossy(&st.stdout));
+    let e = install::secure_parent_for_test(&j).unwrap_err();
+    assert!(e.to_string().contains("not a real folder"), "{e}");
+    assert_eq!(install::dacl_sddl(&own).unwrap(), before, "the junction target is untouched");
+    // the takeover by path is gone
+    let src = include_str!("install.rs");
+    assert!(!src.contains("SetNamedSecurityInfoW("), "no security change by path");
+    let _ = sfs::remove_dir(&j);
+    let _ = sfs::remove_dir_all(d);
+}
+
+#[test]
+fn helper_command_line_quoting_refuses_what_it_cannot_quote() {
+    assert_eq!(install::quote_arg(Path::new(r"C:\Users\a b\x.msi")).unwrap(), r#""C:\Users\a b\x.msi""#);
+    for bad in [r#"C:\a"b.msi"#, r"C:\dir\"] {
+        assert!(install::quote_arg(Path::new(bad)).is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn only_programs_below_program_files_are_elevated_for_updates() {
+    // a test binary lives in target\, not below Program Files: refused before any prompt
+    let me = std::env::current_exe().unwrap();
+    assert!(sys::run_elevated_installed(&me, "--install-update").is_err());
+    let files = [me.as_path(); 4];
+    assert!(matches!(sys::run_update_helper(&files), Err(PlatformError::Unsupported(_))));
+    assert!(!install::below(&me, &std::env::temp_dir().join("nowhere")));
+}
+
+#[test]
+fn second_stage_arguments_are_checked() {
+    let root = dir();
+    let run = root.join("abc");
+    sfs::create_dir_all(&run).unwrap();
+    let me = run.join("shield-update-run.exe");
+    let arg = |p: &Path| vec![p.to_string_lossy().into_owned()];
+    assert_eq!(install::check_run_args(&arg(&run), &me, &root), Err(3), "no package yet");
+    sfs::write(run.join(install::PKG_FILE), b"msi").unwrap();
+    assert_eq!(install::check_run_args(&arg(&run), &me, &root), Ok(run.join(install::PKG_FILE)));
+    assert_eq!(install::check_run_args(&[], &me, &root), Err(2));
+    assert_eq!(install::check_run_args(&arg(&root), &me, &root), Err(2), "not a folder in the update root");
+    assert_eq!(install::check_run_args(&arg(Path::new("abc")), &me, &root), Err(2), "relative");
+    assert_eq!(install::check_run_args(&arg(&run), &root.join("other.exe"), &root), Err(2), "not run from that folder");
+    if !install::is_elevated() {
+        assert_eq!(install::run_stage2(&arg(&run)), 71, "unelevated second stage refused");
+    }
+    let _ = sfs::remove_dir_all(root);
+}

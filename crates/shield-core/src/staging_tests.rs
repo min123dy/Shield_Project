@@ -78,14 +78,14 @@ fn live_owner_entry_survives_before_its_folder_exists() {
 #[test]
 fn corrupt_journal_is_an_error_and_can_be_reset() {
     with_journal(|d| {
-        fs::write(journal(), "garbage without tabs\n").unwrap();
+        fs::write(journal().unwrap(), "garbage without tabs\n").unwrap();
         assert!(leftovers().is_err(), "a damaged journal is never read as 'nothing left'");
         assert!(Stage::create(d).is_err(), "nothing is extracted without a journal entry");
         let orphan = stage_dir(d);
         fs::create_dir(&orphan).unwrap();
         let found = reset_journal(Some(d)).unwrap();
         assert!(found.iter().any(|en| en.path() == orphan));
-        assert!(journal().with_extension("lst.bad").exists());
+        assert!(journal().unwrap().with_extension("lst.bad").exists());
         assert!(leftovers().unwrap().is_empty());
         assert_eq!(remove_leftovers(&found).0, 1);
         assert!(!orphan.exists());
@@ -96,7 +96,7 @@ fn corrupt_journal_is_an_error_and_can_be_reset() {
 fn unwritable_journal_stops_stage_creation() {
     with_journal(|d| {
         // a folder where the journal file should be: the atomic replace fails
-        fs::create_dir_all(journal()).unwrap();
+        fs::create_dir_all(journal().unwrap()).unwrap();
         let before = fs::read_dir(d).unwrap().count();
         assert!(Stage::create(d).is_err());
         let staged = fs::read_dir(d).unwrap().flatten().any(|e| is_stage_name(&e.file_name().to_string_lossy()));

@@ -44,20 +44,20 @@ thread_local! {
     pub(crate) static JOURNAL_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
-fn journal() -> PathBuf {
+fn journal() -> R<PathBuf> {
     #[cfg(test)]
     {
         if let Some(p) = JOURNAL_OVERRIDE.with(|o| o.borrow().clone()) {
-            return p;
+            return Ok(p);
         }
-        std::env::temp_dir().join("shield_test_journal").join("staging.lst")
+        Ok(std::env::temp_dir().join("shield_test_journal").join("staging.lst"))
     }
     #[cfg(not(test))]
-    crate::settings::data_dir().join("staging.lst")
+    Ok(crate::settings::data_dir()?.join("staging.lst"))
 }
 
 fn journal_lock() -> R<FileLock> {
-    let j = journal();
+    let j = journal()?;
     acquire(&j.with_extension("lck"), Mode::Exclusive, Duration::from_secs(10)).map_err(|x| tf("stage.journal_lock", &[&x]))
 }
 
@@ -88,9 +88,13 @@ fn parse(s: &str) -> R<Vec<Entry>> {
     Ok(v)
 }
 
+/// Largest journal read (3.1.0 review 3; a journal lists a few staging folders). Larger counts
+/// as unreadable: an error, never "no leftovers".
+const MAX_JOURNAL: u64 = 16 << 20;
+
 /// Missing journal = empty. Unreadable or corrupt = error (never treated as "no leftovers").
 fn read_list() -> R<Vec<Entry>> {
-    match fs::read(journal()) {
+    match shield_platform::bounded::read_file_limited(&journal()?, MAX_JOURNAL) {
         Ok(b) => {
             let s = String::from_utf8(b).map_err(|_| t("stage.journal_corrupt").to_string())?;
             parse(&s).map_err(|x| tf("stage.journal_corrupt_detail", &[&x]))
@@ -101,7 +105,7 @@ fn read_list() -> R<Vec<Entry>> {
 }
 
 fn write_list(v: &[Entry]) -> R<()> {
-    let j = journal();
+    let j = journal()?;
     let dir = j.parent().ok_or_else(|| t("stage.journal_write").to_string())?;
     fs::create_dir_all(dir).map_err(|x| tf("stage.journal_write_detail", &[&x]))?;
     let tmp = dir.join(format!("staging.{}.{}.tmp", std::process::id(), rand_hex()?));
@@ -220,7 +224,7 @@ pub fn remove_leftovers(v: &[Entry]) -> (usize, Vec<String>) {
 /// empty journal and returns the staging folders found directly inside `scan_dir`.
 pub fn reset_journal(scan_dir: Option<&Path>) -> R<Vec<Entry>> {
     let _g = journal_lock()?;
-    let j = journal();
+    let j = journal()?;
     if j.exists() {
         fs::copy(&j, j.with_extension("lst.bad")).map_err(|x| tf("stage.journal_write_detail", &[&x]))?;
     }

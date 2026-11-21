@@ -9,3 +9,21 @@
   <patterns>*</patterns>
   <directories/><audio-files/><image-files/><other-files/><text-files/><video-files/>
 </action>
+<action>
+  <icon>shield</icon>
+  <name>Open in SHIELD</name>
+  <unique-id>shield-open-3</unique-id>
+  <command>shield-gui --open %f</command>
+  <description>Open a container (any file name)</description>
+  <patterns>*</patterns>
+  <audio-files/><image-files/><other-files/><text-files/><video-files/>
+</action>
+<action>
+  <icon>shield</icon>
+  <name>Secure delete with SHIELD</name>
+  <unique-id>shield-wipe-3</unique-id>
+  <command>shield-gui --wipe %F</command>
+  <description>Opens Shield; it asks three confirmations before overwriting anything</description>
+  <patterns>*</patterns>
+  <directories/><audio-files/><image-files/><other-files/><text-files/><video-files/>
+</action>

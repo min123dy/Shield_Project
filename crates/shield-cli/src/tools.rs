@@ -27,15 +27,16 @@ pub fn keyfile(cx: &mut Ctx) -> R {
 pub fn verify(cx: &mut Ctx) -> Result<i32, String> {
     let (file, sig) = (PathBuf::from(&cx.a.items[0]), PathBuf::from(&cx.a.items[1]));
     let own;
-    let cert = match cx.a.val("key") {
+    let certs: &[crate::sigverify::Cert] = match cx.a.val("key") {
         Some(k) => {
-            let bytes = std::fs::read(k).map_err(|e| tf("sig.read", &[&e]))?;
-            own = crate::sigverify::Cert::parse(&bytes)?;
+            // 3.1.0 review 3: at most sigverify::MAX_CERT bytes, checked on the open handle
+            own = [crate::sigverify::Cert::from_file(std::path::Path::new(k))?];
             &own
         }
-        None => buildinfo::release_key().ok_or_else(|| t("upd.no_key").to_string())?,
+        // the embedded main release key, and the backup key when this build has one (3.1.0 #3)
+        None => Some(buildinfo::release_keys()).filter(|k| !k.is_empty()).ok_or_else(|| t("upd.no_key").to_string())?,
     };
-    match cert.verify_file(&file, &sig) {
+    match crate::sigverify::verify_file_any(certs, &file, &sig) {
         Ok(v) => {
             let created = v.created.map(|c| crate::ui_fmt::date(Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(c.max(0) as u64)))).unwrap_or_default();
             cx.o.result(&tf("cli.verify_ok", &[&v.fingerprint, &v.signer, &created]), json!({ "verified": true, "fingerprint": v.fingerprint, "signer": v.signer, "created": v.created }));
@@ -174,8 +175,13 @@ pub fn version(cx: &mut Ctx) -> R {
         SelfCheck::NoKey => (t("upd.no_key").to_string(), None),
         SelfCheck::Invalid(e) => (tf("upd.self_bad", &[&e]), Some(false)),
     };
-    let text = format!("Shield {v}\n{repo}\n{}\n{integrity}", tf("upd.fingerprint", &[&fpr]));
-    cx.o.result(&text, json!({ "version": v, "repo": repo, "fingerprint": fpr, "integrity": ok }));
+    let backup = buildinfo::backup_fingerprint();
+    let mut text = format!("Shield {v}\n{repo}\n{}", tf("upd.fingerprint", &[&fpr]));
+    if let Some(b) = &backup {
+        text += &format!("\n{}", tf("upd.backup_key", &[b]));
+    }
+    text += &format!("\n{integrity}");
+    cx.o.result(&text, json!({ "version": v, "repo": repo, "fingerprint": fpr, "backup_fingerprint": backup, "integrity": ok }));
     if ok == Some(false) {
         return Err(tf("upd.self_bad", &[&""]));
     }

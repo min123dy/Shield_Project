@@ -2,6 +2,7 @@
 
 pub mod display;
 mod entropy;
+mod erase;
 pub mod fs;
 mod install;
 pub mod mem;
@@ -15,14 +16,22 @@ mod tests;
 /// System helpers (memory, processes, UI language, time, sealing, the elevated TRIM helper).
 pub mod sys {
     pub use super::storage::{volume_label, wipe_free_space};
-    pub use super::install::{install_package, package_kind, Installed};
+    pub use super::install::{
+        create_update_file, install_from_private, install_package, package_kind, remove_private_dir, run_update_helper, update_helper_allowed, update_input_owner_ok, update_private_dir, update_state_path, Installed,
+        HELPER_ARG as UPDATE_HELPER_ARG,
+    };
     pub use super::sys_impl::*;
 
-    /// Runs the hidden elevated helper when `args` asks for it (exit code), otherwise None.
-    /// Must be called before any window is created.
+    /// Runs a hidden elevated helper when `args` asks for it (exit code), otherwise None: the
+    /// TRIM helper and the second stage of an update installation. (The first stage of an
+    /// update, `UPDATE_HELPER_ARG`, needs shield-core and is handled by the program.) Must be
+    /// called before any window is created.
     pub fn elevated_helper(args: &[String]) -> Option<i32> {
-        (args.first().map(String::as_str) == Some(super::storage::RETRIM_ARG))
-            .then(|| super::storage::retrim_main(args.get(1).filter(|_| args.len() == 2).map(String::as_str)))
+        match args.first().map(String::as_str) {
+            Some(super::storage::RETRIM_ARG) => Some(super::storage::retrim_main(args.get(1).filter(|_| args.len() == 2).map(String::as_str))),
+            Some(super::install::RUN_ARG) => Some(super::install::run_stage2(&args[1..])),
+            _ => None,
+        }
     }
 }
 
@@ -66,9 +75,9 @@ impl Platform for WindowsOs {
     fn open_url(&self, url: &str) -> PResult<()> {
         shell::open_url(url)
     }
-    fn config_dir(&self) -> PathBuf {
-        // %LOCALAPPDATA%\Shield (FOLDERID_LocalAppData), the same place as Shield 2.x
-        dirs::data_local_dir().unwrap_or_else(std::env::temp_dir).join("Shield")
+    fn config_dir(&self) -> PResult<PathBuf> {
+        // %LOCALAPPDATA%\Shield (FOLDERID_LocalAppData), the same place as Shield 2.x; no fallback
+        dirs::data_local_dir().map(|d| d.join("Shield")).ok_or_else(|| PlatformError::Failed("no local application data folder".into()))
     }
     fn temp_dir(&self) -> PathBuf {
         // %TEMP% is below the user's profile, which is owner-only by default

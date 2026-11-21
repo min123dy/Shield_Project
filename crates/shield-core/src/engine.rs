@@ -74,14 +74,21 @@ pub struct DecOpts {
     pub strict_motw: bool,
 }
 
-/// Removes a temporary output file unless `keep` was called (errors, cancel, panic).
+/// Removes a temporary output file unless `keep` was called (errors, cancel, panic). 3.1.0 #12:
+/// the file's identity is recorded when it is created and only that file is removed; if the name
+/// now belongs to something else it is left alone and a warning is queued
+/// (`progress::cleanup_warning`). Drop never panics.
 pub struct PartGuard {
     pub path: PathBuf,
+    id: Option<sysinfo::FileId>,
     keep: bool,
 }
 impl PartGuard {
-    pub fn new(path: PathBuf) -> Self {
-        PartGuard { path, keep: false }
+    /// Creates `path` (never an existing one) and returns the guard and the open file.
+    pub fn create(path: PathBuf) -> io::Result<(Self, File)> {
+        let f = OpenOptions::new().write(true).create_new(true).open(&path)?;
+        let g = PartGuard { id: sysinfo::file_id(&f).ok(), path, keep: false };
+        Ok((g, f))
     }
     pub fn keep(mut self) {
         self.keep = true;
@@ -89,8 +96,20 @@ impl PartGuard {
 }
 impl Drop for PartGuard {
     fn drop(&mut self) {
-        if !self.keep {
-            let _ = fs::remove_file(&self.path);
+        if self.keep {
+            return;
+        }
+        let w = match &self.id {
+            Some(id) => match sysinfo::remove_if_same(&self.path, id) {
+                Ok(true) => None,
+                Ok(false) => Some(tf("st.not_ours", &[&self.path.display()])),
+                Err(x) => Some(tf("st.delete_failed", &[&self.path.display(), &x])),
+            },
+            // the identity could not be read at creation: nothing is removed by name alone
+            None => Some(tf("st.not_ours", &[&self.path.display()])),
+        };
+        if let Some(w) = w {
+            crate::progress::cleanup_warning(w);
         }
     }
 }
@@ -129,8 +148,7 @@ pub fn seal_archive(mut st: SecTemp, outdir: &Path, c: &Cred, mut meta: Meta) ->
     meta.real_len = st.len();
     st.seek(SeekFrom::Start(0)).map_err(e)?;
     set_stage(ST_ENCRYPT);
-    let part = PartGuard::new(outdir.join(format!(".shd_{}.part", rand_hex()?)));
-    let f = OpenOptions::new().write(true).create_new(true).open(&part.path).map_err(e)?;
+    let (part, f) = PartGuard::create(outdir.join(format!(".shd_{}.part", rand_hex()?))).map_err(e)?;
     let mut w = BufWriter::with_capacity(1 << 20, f);
     let h = encrypt_stream(&mut st, &mut w, c, &mut meta)?;
     let f = w.into_inner().map_err(|x| e(x.into_error()))?;
@@ -296,7 +314,7 @@ pub fn do_encrypt_many(srcs: &[PathBuf], dst: &Path, c: &Cred, o: &Opts) -> R<St
     let rep = shred_listed(&m, o.passes, !ads.is_empty());
     msg += &format!(" · {}", rep.summary(o.passes));
     // the result file is saved either way, but a failed overwrite/delete is reported as a failure
-    let mut failed = !rep.failed.is_empty();
+    let mut failed = rep.is_failure();
     if !ads.zone_only.is_empty() {
         msg += &tf("eng.zone_only", &[&ads.zone_only.len()]);
     }
@@ -361,11 +379,27 @@ pub fn move_out(item: &Path, dir: &Path, name: &str, is_dir: bool) -> R<(PathBuf
     Err(t("eng.no_name").into())
 }
 
+/// Where a decrypted archive goes (3.1.0 review 2 #4), from what lies at the top of the extracted
+/// archive and the archive's own name (the .shd file name without ".shd"):
+/// * one file: the file itself (`None`), whatever the archive is called;
+/// * one folder with the archive's name (letter case ignored): the folder itself, so
+///   "photos.shd" holding "photos" gives "photos", not "photos/photos";
+/// * anything else (several items, one folder under another name, nothing): a folder named after
+///   the archive holding everything (`Some(name)`).
+pub(crate) fn out_folder(items: &[(&str, bool)], archive: &str) -> Option<String> {
+    match items {
+        [(_, false)] => None,
+        [(n, true)] if n.to_lowercase() == archive.to_lowercase() => None,
+        _ => Some(archive.to_string()),
+    }
+}
+
 /// Opens + fully authenticates into SecTemp, checks the 7z structure and limits, extracts into a
-/// private staging folder, then moves the result next to the .shd (never overwriting).
+/// private staging folder, then moves the result next to the .shd (never overwriting), in a folder
+/// named after the archive when it holds a folder or several items (`out_folder`).
 pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred, o: DecOpts) -> R<String> {
     let fname = src.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let fallback = safe_name(fname.strip_suffix(".shd").unwrap_or(fname)).unwrap_or_else(|| "decrypted".to_string());
+    let archive_name = safe_name(&archive::sanitize_component(fname.strip_suffix(".shd").unwrap_or(fname))).unwrap_or_else(|| "decrypted".to_string());
     let _lock = lock_container(src, Mode::Shared)?; // before the key derivation
     set_stage(ST_DECRYPT);
     let mut f = File::open(src).map_err(e)?;
@@ -386,14 +420,15 @@ pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred, o: DecOpts) -> R<String> 
     let stage = Stage::create(outdir)?;
     let r = archive::extract(&mut st, &stage.path, h.meta.total_unpacked, &|n| Some(n.to_string()));
     let warn = st.destroy().err().map(|x| x.to_string());
-    if let Err(x) = r {
-        return Err(match stage.abort() {
-            Some(w) => format!("{x} · {w}"),
-            None => x,
-        });
-    }
-    let want = safe_name(&h.meta.name).unwrap_or(fallback);
-    let is_dir = h.meta.flags & FLAG_DIR != 0;
+    let done = match r {
+        Ok(d) => d,
+        Err(x) => {
+            return Err(match stage.abort() {
+                Some(w) => format!("{x} · {w}"),
+                None => x,
+            })
+        }
+    };
     let mut items: Vec<PathBuf> = fs::read_dir(&stage.path).map_err(e)?.flatten().map(|d| d.path()).collect();
     // B-7: the download mark goes on while everything is still in the private staging folder, so
     // nothing appears at the destination unmarked (security review 2026-11-08); the move below
@@ -408,22 +443,30 @@ pub fn do_decrypt(src: &Path, outdir: &Path, c: &Cred, o: DecOpts) -> R<String> 
             });
         }
     };
-    let single = items.len() == 1
-        && items[0].is_dir() == is_dir
-        && items[0].file_name().and_then(|n| n.to_str()) == Some(want.as_str());
-    let (dest, renamed) = if single {
-        let it = items.remove(0);
-        let r = move_out(&it, outdir, &want, is_dir)?;
-        stage.finish()?;
-        r
-    } else {
-        // several top-level items (e.g. a whole drive was encrypted): keep them together
-        let p = stage.path.clone();
-        let r = move_out(&p, outdir, &want, true)?;
-        stage.finish()?;
-        r
+    // the entry names were made safe while extracting (3.1.0 #4: direction-control characters)
+    let top: Vec<(String, bool)> = items
+        .iter()
+        .map(|p| (p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())))
+        .collect();
+    let top_ref: Vec<(&str, bool)> = top.iter().map(|(n, d)| (n.as_str(), *d)).collect();
+    let (dest, renamed) = match out_folder(&top_ref, &archive_name) {
+        None => {
+            let it = items.remove(0);
+            let (name, is_dir) = top[0].clone();
+            let r = move_out(&it, outdir, &name, is_dir)?;
+            stage.finish()?;
+            r
+        }
+        Some(folder) => {
+            // the private staging folder itself becomes the archive's folder (one rename)
+            let p = stage.path.clone();
+            let r = move_out(&p, outdir, &folder, true)?;
+            stage.finish()?;
+            r
+        }
     };
     let mut msg = tf("eng.dec_done", &[&dest.display(), &if renamed { t("eng.renamed") } else { "" }]);
+    msg += &done.notes();
     if let Some(w) = motw_warn {
         msg += &format!(" · {w}");
     }

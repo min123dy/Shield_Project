@@ -3,7 +3,8 @@
 //! * The password is never stored. Argon2id (128 MiB, t = 3, p = 4, random 16-byte salt) gives a
 //!   64-byte key; HKDF-SHA3-512 turns it into a verifier (stored) and the MAC key.
 //! * The MAC (HMAC-SHA3-512) covers the canonical text of the protected values
-//!   (`Settings::protected_text`, which includes salt and verifier). The MAC key is kept next to
+//!   (`Settings::mac_text`: the 3.0.0 `protected_text`, which includes salt and verifier, plus
+//!   protected values added later while they differ from their defaults). The MAC key is kept next to
 //!   the settings in `settings.key`: sealed with DPAPI on Windows; a 0600 file on Linux (weaker:
 //!   any program running as the same user can read it - documented).
 //! * At start-up a missing or wrong MAC (or a key file without password entries) means the file
@@ -15,8 +16,12 @@
 //!   together with `settings.key` gives the defaults and the warning, never values someone wrote
 //!   into the file (security review 2026-11-08). A 2.x file (schema 1, no settings password
 //!   existed) going back to the defaults is the 3.0 migration and is not reported.
+//! * Not detected: putting back an older copy of the settings file (and `settings.key`) that was
+//!   valid with the same settings password - its MAC still checks (rollback). Same-user programs
+//!   can read `settings.key` (Linux) or unseal it (Windows DPAPI) and write a valid MAC.
 //! * Wrong passwords: the delay before the next try doubles (1 s .. 30 s) within the process; the
-//!   real protection is the Argon2id cost.
+//!   real protection is the Argon2id cost. Counters or delays on disk would not stop an attacker
+//!   with the same user rights (they can reset them), so none are added (3.1.0 #7).
 //! * Forgotten password: "delete settings file" resets everything (containers are not affected).
 
 use crate::i18n::coded;
@@ -119,14 +124,16 @@ fn mac_over(key: &[u8; 32], label: &[u8], text: &str) -> [u8; 64] {
 }
 
 fn mac_of(key: &[u8; 32], s: &Settings) -> [u8; 64] {
-    mac_over(key, b"SHIELD-SET-MAC-v2\n", &s.protected_text())
+    mac_over(key, b"SHIELD-SET-MAC-v2\n", &s.mac_text())
 }
 
 /// MAC written by 3.0.0 before `lock_on_focus_loss` became protected (accepted on load; the next
 /// save writes the v2 MAC). That option is then not covered until the next save; switching it
-/// off gives its default.
+/// off gives its default. Built from `mac_text`: a value added after 3.0.0 that is not at its
+/// default (a line 3.0.0 never wrote) makes a v1 MAC fail, so such a value edited into a 3.0.0
+/// file is noticed (`wipe_needs_settings_pw = false` could otherwise be added unseen).
 fn mac_of_v1(key: &[u8; 32], s: &Settings) -> [u8; 64] {
-    let text = s.protected_text().replace(&format!("lock_on_focus_loss={}\n", s.lock_on_focus_loss), "");
+    let text = s.mac_text().replace(&format!("lock_on_focus_loss={}\n", s.lock_on_focus_loss), "");
     mac_over(key, b"SHIELD-SET-MAC-v1\n", &text)
 }
 
@@ -134,8 +141,18 @@ pub fn key_path(settings: &Path) -> PathBuf {
     settings.with_file_name("settings.key")
 }
 
+/// Largest settings.key accepted: a flag byte and a 32-byte key, or a sealed (DPAPI) blob of it,
+/// which is a few hundred bytes. Read with this limit on the open handle (3.1.0 review 3).
+pub const MAX_KEY_FILE: u64 = 4096;
+
 fn read_key(settings: &Path) -> Option<Zeroizing<[u8; 32]>> {
-    let b = std::fs::read(key_path(settings)).ok()?;
+    // 3.1.0 final (review D): on Linux the key file must be this user's own 0600 file, checked on
+    // the opened handle; one that is not is not used (the protected values then fail their check)
+    let f = shield_platform::bounded::open_read(&key_path(settings)).ok()?;
+    if !shield_platform::fs::private_file_ok(&f, true) {
+        return None;
+    }
+    let b = Zeroizing::new(shield_platform::bounded::read_open_limited(&f, MAX_KEY_FILE).ok()?);
     let (flag, blob) = b.split_first()?;
     let raw = Zeroizing::new(if *flag == 1 { shield_platform::sys::unseal(blob).ok()? } else { blob.to_vec() });
     (raw.len() == 32).then(|| {
@@ -257,7 +274,7 @@ pub fn authorize(s: &Settings, p: &Path, u: Option<&Unlocked>) -> Result<(), Str
     // unchanged, or back to the (safe) defaults: no password needed
     let mut safe = Settings::default();
     safe.auth.clone_from(&disk.auth);
-    if s.auth == disk.auth && (disk.protected_text() == s.protected_text() || safe.protected_text() == s.protected_text()) {
+    if s.auth == disk.auth && (disk.mac_text() == s.mac_text() || safe.mac_text() == s.mac_text()) {
         return Ok(());
     }
     Err(coded(C_NEED_PW, if disk.auth.is_some() { "set.pw_needed" } else { "set.pw_setup_needed" }))

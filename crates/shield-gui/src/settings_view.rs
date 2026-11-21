@@ -24,7 +24,10 @@ fn combo<T: PartialEq + Copy>(ui: &mut egui::Ui, id: &str, label: &str, cur: &mu
 
 pub fn view(ui: &mut egui::Ui, sh: &mut Shell) {
     ui.heading(t("set.title"));
-    hint(ui, tf("set.where", &[&settings_path().display()]));
+    match settings_path() {
+        Ok(p) => hint(ui, tf("set.where", &[&p.display()])),
+        Err(e) => warn(ui, e),
+    }
     ui.add_space(4.0);
     ui.horizontal_top(|ui| {
         ui.vertical(|ui| {
@@ -206,6 +209,10 @@ fn security_protected(ui: &mut egui::Ui, s: &mut Settings) {
         hint(ui, t("set.recent_hint"));
         ui.checkbox(&mut s.strict_motw, t("set.strict_motw"));
         hint(ui, t("set.motw_hint"));
+    });
+    section(ui, t("set.wipe_section"), |ui| {
+        ui.checkbox(&mut s.wipe_needs_pw, t("set.wipe_pw"));
+        hint(ui, t("set.wipe_pw_hint"));
     });
 }
 

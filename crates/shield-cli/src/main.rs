@@ -4,6 +4,8 @@
 //!
 //! Signals: the first Ctrl+C / SIGTERM / SIGHUP cancels the running job (temporary files and
 //! keys are dropped and wiped on the normal path); a second one wipes the entropy pool and exits.
+// tests read the files they made themselves; product code reads through `bounded` (clippy.toml)
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 pub use shield_core::*;
 
@@ -14,6 +16,7 @@ mod cred;
 mod out;
 mod secret;
 mod tools;
+mod wipe_cmd;
 
 use out::{code, Out};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,11 +43,16 @@ fn gui(items: &[String]) -> i32 {
     let rest = || items.iter().skip(1).map(std::path::PathBuf::from);
     let start = match items.first().map(String::as_str) {
         None => Start::Default,
-        Some("encrypt") => Start::Encrypt(rest().collect()),
+        Some("encrypt") => Start::Encrypt { items: rest().collect(), dropped: 0 },
         Some("decrypt") => Start::Decrypt(rest().next()),
         Some("explorer") => Start::Explorer(rest().next()),
         Some("settings") => Start::Settings,
         Some("open") if items.len() == 2 => Start::Explorer(rest().next()),
+        // the window scans and asks the three confirmations; nothing is deleted from here
+        Some("wipe") => {
+            let (items, dropped) = shield_gui::absolute_items(&rest().collect::<Vec<_>>());
+            Start::Wipe { items, dropped }
+        }
         Some(_) => {
             eprintln!("{} {}", i18n::t("cli.error"), i18n::t("cli.gui_usage"));
             return code::USAGE;
@@ -64,13 +72,25 @@ fn real_main(mut argv: Vec<String>) -> i32 {
     if let Some(c) = shield_platform::sys::elevated_helper(&argv) {
         return c;
     }
+    // privileged update helper (3.1.0 #1; Linux `pkexec /usr/bin/shield update-install <4 files>`).
+    // Not a user command (not in the tables or the help): it refuses to run unless started as
+    // root by pkexec, and only installs copies it verified itself.
+    if argv.first().map(String::as_str) == Some(shield_platform::sys::UPDATE_HELPER_ARG) {
+        return update::helper_main(&argv[1..]);
+    }
     harden::harden_process();
     let set = settings::Settings::load();
     i18n::set_lang(set.effective_lang());
     // the windows start this program again with their launcher flags (`--open x.shd` ...)
     #[cfg(feature = "gui")]
-    if argv.first().is_some_and(|a| ["--open", "--manager", "--encrypt", "--encrypt-multi", "--decrypt", "--explorer", "--settings"].contains(&a.as_str())) {
-        return shield_gui::run(shield_gui::parse_args(&argv));
+    if argv.first().is_some_and(|a| ["--open", "--manager", "--encrypt", "--encrypt-multi", "--decrypt", "--explorer", "--settings", "--wipe"].contains(&a.as_str())) {
+        return shield_gui::run(match shield_gui::parse_args(&argv) {
+            shield_gui::Start::Wipe { items, .. } => {
+                let (items, dropped) = shield_gui::absolute_items(&items);
+                shield_gui::Start::Wipe { items, dropped }
+            }
+            s => s,
+        });
     }
     let parsed = args::parse(&argv);
     // the command named in an error hint (`shield <command> --help`); only a known name
@@ -148,6 +168,10 @@ fn real_main(mut argv: Vec<String>) -> i32 {
         "update" => tools::update(&mut cx),
         "entropy" => tools::entropy(&mut cx),
         "version" => tools::version(&mut cx),
+        "wipe" => match wipe_cmd::wipe(&mut cx) {
+            Ok(c) => return finish(c),
+            Err(e) => Err(e),
+        },
         _ => unreachable!("parser accepts only known commands"),
     };
     finish(match r {

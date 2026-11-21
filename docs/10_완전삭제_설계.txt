@@ -1,0 +1,230 @@
+SHIELD 3.1.0 - 완전삭제(Secure Delete) 설계
+==========================================
+English: docs\en\10_secure_delete_design.txt
+코드: shield-core/src/secure_delete.rs (상태 기계·계획·실행), wipe.rs (덮어쓰기 루프·TRIM·스냅숏 경고),
+      shield-platform/src/{windows,linux}/erase.rs (링크를 따라가지 않는 조회·열기, 보호 경로, 경고 감지),
+      shield-gui/src/wipe_view.rs (GUI 탭), shield-cli/src/wipe_cmd.rs (shield wipe)
+테스트: shield-core/src/secure_delete_tests.rs, shield-core/tests/wipe_cancel.rs, shield-cli/src/cli_tests.rs,
+        release_tests.rs (우클릭 등록), installer/linux/tests/nautilus_scripts_test.sh
+
+용어: 이 문서와 UI·도움말은 "완전삭제"(덮어쓴 다음 삭제)로 통일합니다. "원본 파쇄"는 암호화 뒤 원본을 지우는
+기존 옵션의 이름으로만 씁니다. 두 기능은 같은 덮어쓰기 루프(wipe::overwrite_with)를 씁니다.
+
+
+1. 목적과 진입점
+----------------
+Shield 컨테이너(.shd)가 아닌 일반 파일·폴더도 덮어쓴 다음 지우는 독립 기능입니다.
+  (a) GUI 암호화 창의 "완전삭제" 탭: 드래그 앤 드롭, [파일 추가], [폴더 추가]
+  (b) 콘솔: shield wipe [--passes 3|7] [-r|--recursive] [--dry-run] <경로...>
+  (c) 우클릭: Windows 클래식 메뉴 "SHIELD로 완전삭제"(파일·폴더 모두, .shd 포함), Linux Nautilus 스크립트,
+      Nemo 액션, Dolphin 서비스 메뉴, Thunar 사용자 지정 동작
+우클릭 경로는 아무것도 지우지 않습니다. GUI를 --wipe로 열기만 하며, 대상은 GUI에서 다시 해석·검사되고 세 단계
+확인을 거칩니다(6절).
+
+덮어쓰기 횟수는 설정의 3회/7회를 따릅니다(shield wipe --passes로 바꿀 수 있음). 3회: 0x00, 0xFF, 난수.
+7회: 0x00, 0xFF, 난수, 0x55, 0xAA, 난수, 난수. 난수는 OS CSPRNG로 시드한 생성기입니다. 컨테이너 키 부분(옛 키 슬롯,
+교체된 컨테이너의 헤더, 키 파일)을 7회로 고정하는 기존 규칙은 그대로입니다(wipe::KEY_PASSES).
+
+
+2. 흐름 (GUI·콘솔·우클릭 공통)
+------------------------------
+  scan(대상) ──> Plan ──> Confirmation(1단계 → 2단계 → 3단계) ──> ConfirmedWipePlan ──> execute ──> Report
+                                └ 스크립트: --dry-run 토큰 + --i-understand-irreversible ─┘
+
+2-1. scan: 계획 확정
+  - 각 대상을 절대 경로로 만들고(상대 경로는 현재 폴더 기준), 파일·폴더는 링크를 풀어 실제 경로로 바꿉니다.
+    직접 고른 링크·정션은 링크 자체가 대상입니다(가리키는 대상은 건드리지 않음).
+  - 차단 목록(4절)에 걸리면 계획 전체를 거부합니다(오류 코드 E_WIPE_REFUSED, 이유 표시).
+  - 같은 대상을 두 번 고르거나, 고른 폴더 안의 항목을 또 고르면 거부합니다.
+  - 폴더는 열어 둔 폴더 핸들 기준으로 하위 항목을 읽습니다(Linux fstatat/openat, Windows 핸들). 링크·정션·
+    reparse point는 따라가지 않고 링크로만 기록합니다. 볼륨(장치 번호)이 다르거나 마운트 지점인 폴더는 내려가지
+    않고 "남긴 항목"으로 기록합니다. 장치·FIFO·소켓도 남깁니다(그 폴더는 비지 않으므로 남습니다).
+  - 항목마다 경로, 종류, 파일 ID(Windows: 볼륨 일련번호 + 파일 인덱스, Linux: dev + inode), 링크 수,
+    크기, 수정 시각을 기록합니다. 폴더 안 항목이 폴더보다 먼저 오도록 정렬합니다(안쪽부터 삭제).
+  - 항목이 MAX_ITEMS(200,000)를 넘으면 거부하고 나눠 실행하라고 안내합니다(메모리 고갈 방지).
+  - 경고에 쓸 정보를 모읍니다: 하드 링크 수, 압축·스파스·EFS·클라우드·네트워크·쓰기 시 복사(COW)·tmpfs(5절),
+    저장 장치 종류(SSD/알 수 없음), 볼륨 섀도 복사본·btrfs/ZFS/LVM/Timeshift/Snapper 스냅숏.
+
+2-2. 확인 상태 기계 (secure_delete::Confirmation, shield-core에 하나만)
+  일반 파일·폴더: 3단계를 모두 차례대로 통과해야 합니다.
+   1단계 경고: 대상 목록(최대 LIST_MAX=20개, 나머지는 "... 외 N개"), 해석된 실제 경로, 파일·폴더·링크 수,
+               총 용량, "되돌릴 수 없고 복구할 수 없습니다"(빨간색). 링크는 "링크만 지웁니다"를 표시.
+               폴더가 있거나 1 GiB 이상 또는 100개 이상이면 강조 문구(sd.w_big)를 더합니다.
+               [이해했습니다, 계속]
+   2단계 한계: 아래를 모두 표시하고 확인란 체크를 요구합니다(체크 없이 [계속]은 거부).
+               - Shield로 만든 파일이 아니며 삭제 후 복구 수단이 없음(실행 취소·휴지통 없음)
+               - SSD/NVMe/USB 메모리, 스냅숏(VSS, btrfs, ZFS, LVM), 쓰기 시 복사 파일 시스템, 클라우드 동기화,
+                 백업, 휴지통 사본, 임시 파일·스왑에는 이전 데이터가 남을 수 있음
+               - 하드 링크: 덮어쓰면 다른 이름의 데이터도 바뀜(개수 표시)
+               - 감지된 저장 위치 경고(5절)와 스냅숏 검사 결과
+   3단계 코드: CSPRNG(OS 시드)로 6자 코드(혼동 문자 0/O/1/I/L 제외: ABCDEFGHJKMNPQRSTUVWXYZ23456789).
+               - 표시 후 CODE_WAIT(3초)가 지나기 전에는 확인이 거부됩니다(GUI는 버튼 비활성 + 남은 초 표시).
+               - 틀리면 새 코드로 바뀌고, MAX_FAILS(3)번 틀리면 확인 전체가 끝납니다(처음부터 다시).
+               - 대소문자와 공백은 무시합니다. 비교는 상수 시간(password::ct_eq).
+  .shd 컨테이너만 고른 경우: 1단계 경고 + 3단계 코드(2단계 생략, 총 2단계).
+  어느 단계에서든 취소하면 확인이 끝나며, 이전 실행의 코드·확인 상태는 다시 쓰지 않습니다(계획마다 새 코드).
+  대상 목록이 바뀌면(추가·삭제) 확인과 검사 결과를 버리고 처음(검사)부터 다시 합니다. 창이 잠기면(유휴·최소화·
+  포커스 잃음) 진행 중인 확인도 버립니다.
+  "다시 묻지 않기", "항상 코드 생략" 같은 약화 옵션은 설정에 없습니다(release_tests가 설정 키를 검사).
+
+2-3. 구조적 강제: ConfirmedWipePlan
+  - execute()는 ConfirmedWipePlan만 받습니다. 이 타입은 공개 생성자와 공개 필드가 없고 비공개 표지(Seal)를
+    가지므로, secure_delete 모듈 밖(GUI·CLI·우클릭 경로)에서는 만들 수 없습니다.
+  - 만드는 길은 둘뿐입니다: Confirmation::finish()(모든 단계 통과 후), confirm_with_token()(스크립트용, 2-4).
+  - compile_fail 문서 테스트 2개: 모듈 밖에서 ConfirmedWipePlan을 만들기, Plan을 execute에 넘기기가 컴파일되지
+    않음을 확인합니다(cargo test가 doc-test로 실행).
+  - execute()는 WipePermit도 받습니다(2-5). 같은 방식으로 봉인되어 있고(compile_fail 문서 테스트) 실행마다 새로
+    만들어야 합니다.
+
+2-5. 설정 비밀번호 (3.1.0 최종 이후 추가)
+  - 설정 > 보안 > 완전삭제 "완전삭제 전에 설정 비밀번호 묻기"(settings 키 wipe_needs_settings_pw, 기본 켜짐).
+    설정 비밀번호가 있을 때만 적용됩니다. 보호 설정이라 끄려면 설정 비밀번호가 필요하고, "보안 기본값으로 되돌리기"는
+    켜는 쪽으로만 바꿉니다(기본값이 켜짐이므로 비밀번호 없이 끄는 길이 없음).
+  - 흐름: 3단계(코드)를 통과한 뒤, 삭제 직전에 설정 비밀번호를 묻습니다. secure_delete::permit이 settings_auth::unlock
+    (Argon2id 128 MiB, 오답 시 지연 1-30초)으로 확인하고 WipePermit을 돌려줍니다. 잠금 해제 결과(MAC 키)는 곧바로
+    버립니다. 설정 창의 잠금 해제 상태는 쓰지 않습니다: 완전삭제마다 다시 입력합니다.
+  - 판단: 지금 창/명령의 설정과 디스크의 설정 파일 중 하나라도 요구하면 묻습니다(다른 창에서 켠 것도 반영).
+    둘 다 요구하면 파일의 비밀번호로 확인합니다.
+  - GUI: 코드 다음 모달(설정 비밀번호 입력란, 붙여넣기 허용 여부는 다른 비밀번호 입력란과 같음). 확인은 작업 스레드에서
+    합니다. 3번 틀리면 확인 전체를 버립니다. 목록이 바뀌거나 창이 잠기면(유휴·최소화·포커스) 버립니다.
+  - 콘솔(shield wipe): 대화형·토큰 실행 모두 삭제 직전에 터미널에서 에코 없이 입력받습니다(최대 3회). 터미널이
+    없으면 거부합니다(종료 코드 8). 인자·환경 변수·파이프로는 받지 않으므로 스크립트가 이 단계를 건너뛸 수 없습니다.
+    --dry-run은 이 단계가 있는지 알리고 JSON에 "settings_password": true/false를 넣습니다.
+  - 설정 MAC: 3.0.0의 protected_text는 그대로 두고, 이 값은 기본값이 아닐 때(꺼짐)만 MAC 입력(mac_text)에
+    "wipe_needs_settings_pw=false" 줄로 들어갑니다. 그래서 3.0.0·이전 3.1.0 파일의 MAC은 그대로 맞습니다.
+    3.0.0 형식(v1) MAC도 mac_text에서 계산하므로, v1 MAC 파일에 "= false"를 써 넣으면 변조로 감지됩니다.
+  - 한계: 같은 사용자 권한의 프로그램은 Shield 없이 파일을 지울 수 있고, 설정 파일을 지우면(비밀번호 분실 복구)
+    다음 실행부터 이 단계가 없어집니다. 이 기능은 잠기지 않은 PC 앞의 다른 사람이 Shield로 지우는 것을 막기 위한
+    것이지, 같은 계정의 악성 프로그램을 막는 장치가 아닙니다(docs/09 R-1). 이 값을 끈 설정 파일은 3.0.0으로
+    되돌아가면 "Shield 밖에서 바뀜"으로 표시되고 보호 설정이 기본값이 됩니다.
+
+2-4. 스크립트(비대화형) 경로
+  - shield wipe --dry-run <경로...>: 계획을 만들고 경고와 한계를 stderr에 출력한 뒤 확인 토큰을 발급합니다.
+    토큰 = SHA3-256("SHIELD-WIPE-PLAN-v1" ‖ 횟수 ‖ 항목마다 종류·경로·파일 ID·크기·수정 시각)의 앞 16바이트(hex).
+  - 실행: --confirm-token <토큰> --i-understand-irreversible 둘 다 있고, 지금 다시 만든 계획의 토큰과 같을 때만.
+    무엇이든 바뀌면(파일 추가·교체·크기·시각·횟수) 토큰이 달라져 거부(종료 코드 8)됩니다.
+  - 비대화형에서도 경고는 stderr에 두 번 나옵니다(토큰 확인 전, 그리고 삭제 직전).
+  - 전역 --yes는 wipe의 어떤 확인도 대신하지 못합니다(무시하고 cli.wipe_yes_ignored를 출력).
+  - 터미널이 없고 토큰도 없으면 경고를 출력하고 거부합니다(종료 코드 8).
+
+
+3. 실행 (execute)
+-----------------
+항목 순서대로(폴더는 안쪽부터) 처리하고, 하나가 실패해도 나머지를 계속합니다.
+ 파일:
+  1) 링크를 따라가지 않고 쓰기로 엽니다. Windows: FILE_FLAG_OPEN_REPARSE_POINT, 공유 모드 0(독점), DELETE 권한.
+     Linux: O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 일반 파일인지 핸들로 확인.
+  2) 열린 핸들의 파일 ID·종류·크기·수정 시각을 계획과 대조합니다. 다르면 "검사 후 바뀜"으로 건너뜁니다(TOCTOU).
+  3) 읽기 전용이면(확인을 모두 통과한 뒤에만) 속성을 풉니다. 먼저 속성만 바꿀 수 있는 핸들로 열어 같은 파일인지
+     확인한 다음 그 핸들로 바꿉니다(Windows SetFileInformationByHandle, Linux fchmod).
+  4) 추가 스트림: Windows ADS(:Zone.Identifier 등), Linux user.* 확장 속성을 같은 패턴으로 덮어쓴 뒤 지웁니다.
+  5) 지정 횟수만큼 덮어씁니다: 1 MiB 버퍼 하나로 스트리밍(파일 크기만큼 메모리를 잡지 않음), 패스마다 flush +
+     FlushFileBuffers/fsync. 쓰기 오류나 0바이트 쓰기는 그 패스의 실패이며 "일부만 덮어써짐"으로 보고합니다.
+  6) 길이 0으로 자르고 동기화 → 같은 폴더 안에서 무작위 이름으로 RENAMES(3)번 이름 변경(매번 같은 파일인지
+     확인) → 링크를 따라가지 않는 핸들로 열어 같은 파일인지 확인하고 그 핸들로 삭제합니다.
+ 링크: 같은 링크인지 확인하고 링크 자체만 지웁니다.
+ 폴더: 같은 폴더이고 비어 있으면 무작위 이름으로 바꾼 다음 지웁니다. 남은 항목이 있으면(건너뛴 파일, 마운트 지점,
+       특수 파일) 그 폴더는 원래 이름으로 남깁니다.
+ 컨테이너: 지우는 .shd에는 배타 잠금을 잡습니다. 다른 Shield 작업이 열고 있으면 "사용 중"으로 건너뜁니다.
+ 마무리: 취소되지 않았으면 SSD·알 수 없는 볼륨에 기존 TRIM 요청(Windows: 필요하면 UAC, Linux: fstrim 등)을 하고,
+       스냅숏 경고는 기존 방식대로 표시합니다.
+ 결과: 항목마다 완료 / 일부(덮어썼지만 지우지 못함, 패스 도중 취소, 스트림 실패) / 건너뜀(바뀜, 없음, 사용 중,
+       취소) / 실패와 이유. 하나라도 완료가 아니면 "완료"라고만 표시하지 않습니다(GUI 결과 목록, CLI 종료 코드 7).
+ 취소: 파일 사이에서는 즉시(남은 항목은 "취소됨, 건드리지 않음"), 파일 도중에는 현재 패스가 끝난 뒤 멈추고 그
+       파일은 "N/M회 덮어쓴 뒤 취소, 삭제 안 됨"으로 표시합니다(tests/wipe_cancel.rs).
+ 기록: 파일 이름·경로는 디스크 로그에 쓰지 않습니다. 계획과 결과는 메모리에만 있습니다.
+
+
+4. 차단 목록 (확인 절차와 상관없이 거부)
+---------------------------------------
+선택한 항목이 아래 경로이거나 그 안에 있으면(subtree), 또는 아래 경로를 품고 있으면(exact) 거부합니다.
+ 공통: 드라이브 루트·볼륨 루트·마운트 지점, 경로 길이 3자 이하(C:\ 등), 지금 실행 중인 Shield 실행 파일,
+       AppImage 파일($APPIMAGE), Shield 데이터 폴더(설정·settings.key·잠금 파일·저널), 포터블 데이터 폴더,
+       장치·FIFO·소켓 등 특수 파일(직접 고른 경우)
+ Shield 데이터 폴더는 양방향으로 검사합니다. 폴더 자체나 이를 포함하는 상위 경로뿐 아니라 settings, settings.key,
+ 저널·잠금 파일 등 데이터 폴더 내부의 파일과 하위 폴더를 직접 선택해도 거부합니다.
+ Windows (알려진 폴더 API로 조회):
+   그 안의 모든 것: %SystemRoot%(Windows), Program Files, Program Files (x86), System32의 상위 폴더
+   그 폴더 자체(와 그것을 품은 상위 폴더): ProgramData, 사용자 프로필 루트(C:\Users), 현재 사용자 프로필
+   Shield 설치 폴더는 Program Files 아래라 보호됩니다(포터블은 실행 파일과 데이터 폴더가 보호됨).
+ Linux:
+   그 안의 모든 것: /bin /sbin /lib /lib32 /lib64 /libx32 /usr /etc /boot /dev /proc /sys /run /snap /efi
+   그 폴더 자체: / /home /root /var /opt /srv /media /mnt /tmp /var/tmp /lost+found, 현재 사용자 홈
+   Shield 설치 경로(/usr/bin, /usr/share/shield)는 /usr 아래라 보호됩니다.
+ 폴더 하위: 마운트 경계와 reparse point(정션·심볼릭 링크)를 따라 내려가지 않습니다(2-1).
+ 직접 고른 심볼릭 링크·정션: 링크 자체만 지우고, 1단계 경고에 "링크만 지웁니다"를 표시합니다.
+ 테스트: protected_paths_are_refused_in_both_directions, shield_data_folder_children_are_protected_in_both_directions,
+        links_are_removed_but_never_followed,
+        duplicates_overlaps_missing_and_empty_are_refused, relative_items_are_resolved_to_the_real_path
+
+
+5. 플랫폼별 경고와 한계 (UI·문서에 항상 표시)
+-------------------------------------------
+덮어쓰기와 TRIM은 같은 물리 위치를 지운다는 보장이 없습니다. 2단계와 [덮어쓰기 횟수] 옆 안내에 항상 표시합니다.
+ - SSD/NVMe/USB 메모리: 웨어 레벨링과 예비 블록 때문에 프로그램이 닿지 않는 곳에 옛 데이터가 남을 수 있습니다.
+   TRIM 요청은 하지만 실제 처리는 드라이브가 정합니다. 몇 번을 덮어써도 마찬가지입니다.
+ - 스냅숏·백업: Windows 볼륨 섀도 복사본(이전 버전, 시스템 복원), btrfs/ZFS/LVM 스냅숏, Timeshift/Snapper,
+   백업 프로그램, 휴지통 사본. Shield는 스냅숏을 지우지 않고 발견하면 경고합니다.
+ - 감지되면 항목별 경고(WipeNote):
+   NTFS 압축(압축 데이터가 옮겨질 수 있음), 스파스(실제로 저장된 부분만 덮어씀), EFS(평문 임시 사본 가능),
+   클라우드 폴더(OneDrive/Dropbox/Google Drive 등: 서비스가 버전·휴지통 보관; Windows는 클라우드 파일 속성도 확인),
+   네트워크 드라이브(서버가 쓰기 방식 결정), 쓰기 시 복사·로그 구조 파일 시스템(btrfs, ZFS, bcachefs, F2FS,
+   NILFS, ReFS 등: 새 블록에 쓰임), 메모리 기반 파일 시스템(tmpfs: 메모리·스왑에만 있었음).
+ - 하드 링크: 다른 이름의 파일 내용도 함께 덮어써지고, 다른 이름은 남습니다(개수 경고).
+ - GUI 코드 입력란의 붙여넣기: 입력 이벤트에서 Paste를 버려 막습니다(egui). 다른 입력기·접근성 도구로 들어오는
+   글자까지 막지는 못하며, 이 단계의 목적은 "의도적으로 읽고 입력하기"입니다(보안 경계가 아님).
+ - 콘솔: 코드는 터미널에 보이고 직접 입력합니다. 붙여넣기는 막을 수 없습니다(터미널이 처리).
+ - 같은 사용자 권한으로 실행되는 악성 프로그램은 확인 절차와 상관없이 그 사용자의 파일을 지울 수 있습니다.
+   확인 절차는 실수 방지 장치입니다.
+ - 실기 미검증: 실제 SSD에서 데이터가 남는지, 실제 VSS·btrfs 스냅숏 감지, 탐색기·Nautilus 실기 동작.
+
+
+6. 우클릭 연동
+--------------
+ Windows: HKCU/HKLM\Software\Classes\*\shell\Shield.Wipe, Directory\shell\Shield.Wipe(클래식 메뉴, Windows 11은
+   "추가 옵션 표시"). 명령 "\"<설치 폴더>\shield-gui.exe\" --wipe \"%1\""(실행 파일과 항목 모두 따옴표). MSI가
+   설치·제거 때 등록·정리(구성 요소 ShellWipe), 포터블은 설정에서 등록·해제. 탐색기는 항목마다 프로세스를
+   하나씩 띄우므로 spool로 한 창에 모읍니다(완전삭제 전용 spool_wipe 폴더, 암호화와 섞이지 않음).
+ Linux: Nautilus 스크립트 "Secure delete with SHIELD"(integrate.sh가 사용자 폴더에 설치), Nemo/Dolphin/Thunar
+   항목은 shield-gui --wipe %F. Nautilus 스크립트는 $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS가 인자와 1:1로 맞을
+   때만 그 목록을 쓰고, 아니면(이름에 줄바꿈 등) 인자를 현재 폴더 기준 절대 경로로 바꿉니다(docs/08 F).
+ spool: 경로만 담습니다(NUL 구분, UTF-8이 아닌 이름은 버리고 개수 표시). 사용자 전용 폴더가 아니면 쓰지 않습니다.
+   spool 내용은 신뢰하지 않는 입력입니다: GUI가 경로를 다시 정규화하고, 완전삭제 탭은 다시 검사(scan)하고 세 단계
+   확인을 거칩니다. 쓸 수 없었던 항목 수는 탭에 표시합니다(sd.dropped).
+ 테스트: secure_delete_verb_is_registered_everywhere_and_only_opens_the_window(--yes·--confirm-token 없음),
+        nautilus_scripts_share_the_absolute_path_block, spool::names_with_newlines_stay_one_item
+
+
+7. 콘솔 종료 코드 (shield wipe)
+-------------------------------
+  0 전부 완료   7 일부 실패·건너뜀(PARTIAL)   8 거부(차단 목록, 확인 실패·없음, 토큰 불일치, 설정 비밀번호
+  없음·3회 오답·터미널 없음; REFUSED)
+  5 취소        2 사용법 오류(폴더에 -r 없음 등)
+ shield help wipe 와 shield -h 에 모두 설명합니다(cli_help 테스트가 모든 옵션의 설명을 확인).
+
+
+8. 테스트 대응표 (2-8)
+----------------------
+ 단계 건너뛰기 불가            every_step_is_needed_in_order
+ 3초 이전 확인 불가            code_waits_three_seconds_and_ignores_case_and_spaces
+ 오답 3회 중단·새 코드          wrong_codes_get_a_new_code_and_three_abort_everything, every_plan_gets_its_own_random_code
+ 취소·목록 변경 시 초기화       cancel_at_any_step_ends_the_confirmation, (GUI) wipe_view의 목록 변경 처리
+ 컨테이너만: 2단계             containers_only_skip_the_limits_step
+ ConfirmedWipePlan 없이 불가   compile_fail 문서 테스트 2개
+ 토큰 바인딩·확인 필요          token_binds_the_plan_and_needs_the_acknowledgement
+ 차단 목록                     protected_paths_are_refused_in_both_directions
+ 링크·정션 비추종               links_are_removed_but_never_followed (Windows는 정션, Linux는 심볼릭 링크)
+ 파일 교체(TOCTOU)              a_file_changed_after_the_confirmation_is_not_touched, a_file_replaced_after_the_confirmation_is_not_touched
+ 하드 링크 경고                 hard_links_are_counted_and_named_in_the_limits
+ 스트리밍·메모리 일정           every_pass_covers_the_whole_file_and_is_synced (버퍼 하나, 마지막 쓰기 크기)
+ 쓰기 실패 주입                 a_failing_or_short_write_fails_the_pass
+ 항목 수 상한                   more_than_max_items_is_refused
+ 취소                          tests/wipe_cancel.rs (파일 사이 즉시, 파일 도중 패스 뒤, 다음 파일 미변경)
+ CLI: --yes 무시·토큰 불일치·dry-run·종료 코드   cli_tests::wipe_* (shield wipe 비대화형)
+ 설정 비밀번호 단계(2-5)        the_settings_password_is_needed_only_when_set_and_asked_for,
+                               the_file_password_counts_when_both_ask, settings_auth::the_secure_delete_password_switch_is_protected,
+                               switching_secure_delete_off_by_editing_the_file_is_noticed, WipePermit compile_fail
+ 링크의 상위 폴더 해석(S-11)     a_selected_link_is_checked_and_shown_where_it_really_is
+ 읽기 전용                      read_only_files_are_removed_too
+ 터미널 출력 안전               shown_paths_are_safe_for_terminals
+ 큰 희소 파일(수 GB) 실측은 하지 않았습니다: 덮어쓰기 루프가 버퍼 하나만 쓰는 것은 코드와 위 테스트로 확인했습니다.

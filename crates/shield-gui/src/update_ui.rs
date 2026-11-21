@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc};
 
 enum Msg {
     Checked(Result<Check, String>),
-    Fetched(Result<Downloaded, String>),
+    Fetched(Result<Box<Downloaded>, String>),
 }
 
 #[derive(Default)]
@@ -67,7 +67,7 @@ impl Updater {
                 },
                 &|| c.load(Ordering::Relaxed),
             );
-            let _ = tx.send(Msg::Fetched(res));
+            let _ = tx.send(Msg::Fetched(res.map(Box::new)));
         });
     }
 
@@ -97,7 +97,7 @@ impl Updater {
             Msg::Checked(Err(e)) => self.note = if self.manual { e } else { String::new() },
             Msg::Fetched(Ok(d)) => {
                 self.note = tf("upd.verified", &[&d.version, &d.signer.fingerprint]);
-                self.ready = Some(d);
+                self.ready = Some(*d);
                 self.ask_install = true;
             }
             Msg::Fetched(Err(e)) => self.note = e,
@@ -234,6 +234,10 @@ pub fn about(ui: &mut egui::Ui, note: &mut String) {
     match crate::buildinfo::fingerprint() {
         Some(f) => {
             ui.label(egui::RichText::new(tf("upd.fingerprint", &[&f])).monospace());
+            // 3.1.0 #3: the offline backup key, when this build embeds one
+            if let Some(b) = crate::buildinfo::backup_fingerprint() {
+                ui.label(egui::RichText::new(tf("upd.backup_key", &[&b])).monospace());
+            }
             hint(ui, t("upd.fingerprint_hint"));
         }
         None => warn(ui, t("upd.no_key")),

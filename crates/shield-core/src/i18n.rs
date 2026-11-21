@@ -43,12 +43,13 @@ pub fn system_lang() -> Lang {
 
 pub type Table = &'static [(&'static str, &'static str)];
 
-/// Areas: core (engine), ui (GUI screens), v3 (3.0 additions shared by GUI and console), cli.
-pub fn tables(l: Lang) -> [Table; 4] {
+/// Areas: core (engine), ui (GUI screens), v3 (3.0 additions shared by GUI and console), cli,
+/// sd (secure delete, 3.1.0 final).
+pub fn tables(l: Lang) -> [Table; 5] {
     use crate::lang::*;
     match l {
-        Lang::Ko => [ko_core::T, ko_ui::T, ko_v3::T, ko_cli::T],
-        Lang::En => [en_core::T, en_ui::T, en_v3::T, en_cli::T],
+        Lang::Ko => [ko_core::T, ko_ui::T, ko_v3::T, ko_cli::T, ko_sd::T],
+        Lang::En => [en_core::T, en_ui::T, en_v3::T, en_cli::T, en_sd::T],
     }
 }
 

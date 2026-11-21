@@ -1,0 +1,10 @@
+[Nemo Action]
+Name=Open in SHIELD
+Name[ko]=SHIELD에서 열기
+Comment=Open a container (any file name)
+Comment[ko]=컨테이너 열기 (파일 이름과 상관없이)
+Exec=shield-gui --open %F
+Icon-Name=shield
+Selection=s
+Extensions=any;
+Quote=double

@@ -196,12 +196,33 @@ pub fn wipe_free_space(dir: &Path) -> R<String> {
     }
 }
 
-/// Writes `len` bytes from offset `from` with every pattern, syncing after each pass.
-fn overwrite(f: &mut File, from: u64, len: u64, pats: &[Option<u8>], progress: bool) -> Result<(), String> {
+/// Size of the one buffer every overwrite streams through (memory use does not depend on the file
+/// size; secure delete and the shredding of originals share it).
+pub const BUF: usize = 1 << 20;
+
+/// Where the overwrite passes go (a file; tests use a writer that counts or fails).
+pub(crate) trait Sink: Write + Seek {
+    fn sync(&mut self) -> std::io::Result<()>;
+}
+impl Sink for File {
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.sync_all()
+    }
+}
+
+/// The one overwrite loop (3.1.0 final 2-1: the shredding of originals, old container data and
+/// secure delete all use it). Writes `len` bytes from offset `from` with every pattern (fixed bytes
+/// and OS-seeded random data) through one `BUF` buffer, flushing and syncing after each pass. A
+/// write error or a short write fails (that pass does not count). `stop_between`: when the job was
+/// cancelled, stop after a finished pass (secure delete). Returns the number of finished passes.
+pub(crate) fn overwrite_with(f: &mut dyn Sink, from: u64, len: u64, pats: &[Option<u8>], progress: bool, stop_between: bool) -> Result<usize, String> {
     let s = |x: std::io::Error| x.to_string();
     let mut rng = bulk_rng()?;
-    let mut buf = vec![0u8; 1 << 20];
-    for p in pats {
+    let mut buf = vec![0u8; BUF];
+    for (done, p) in pats.iter().enumerate() {
+        if stop_between && done > 0 && crate::progress::cancelled() {
+            return Ok(done);
+        }
         f.seek(SeekFrom::Start(from)).map_err(s)?;
         let mut left = len;
         while left > 0 {
@@ -217,9 +238,14 @@ fn overwrite(f: &mut File, from: u64, len: u64, pats: &[Option<u8>], progress: b
             }
         }
         f.flush().map_err(s)?;
-        f.sync_all().map_err(s)?;
+        f.sync().map_err(s)?;
     }
-    Ok(())
+    Ok(pats.len())
+}
+
+/// `overwrite_with` for the shredding of originals and old container data (no stop between passes).
+fn overwrite(f: &mut File, from: u64, len: u64, pats: &[Option<u8>], progress: bool) -> Result<(), String> {
+    overwrite_with(f, from, len, pats, progress, false).map(|_| ())
 }
 
 pub enum ShredSkip {

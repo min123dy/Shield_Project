@@ -9,10 +9,13 @@
 //!
 //! Each OS has its own module (`windows/`, `linux/`), selected with `cfg(target_os)`. A service an
 //! OS cannot provide returns [`PlatformError::Unsupported`]; nothing is silently skipped.
+// tests read the files they made themselves; product code reads through `bounded` (clippy.toml)
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 mod types;
 pub use types::*;
 
+pub mod bounded;
 pub mod cpu;
 
 #[cfg(windows)]
@@ -55,7 +58,10 @@ pub trait Platform: Send + Sync {
     /// Opens an already validated https URL in the default browser.
     fn open_url(&self, url: &str) -> PResult<()>;
     /// Per-user folder for settings, journal and locks.
-    fn config_dir(&self) -> PathBuf;
+    /// Folder for settings, keys, locks and the staging journal. An error when the OS gives none
+    /// (Linux without $XDG_CONFIG_HOME and without a home folder): no fallback to a shared folder
+    /// such as /tmp (3.1.0 final, external review D).
+    fn config_dir(&self) -> PResult<PathBuf>;
     /// Per-user temporary folder (private where the OS offers one).
     fn temp_dir(&self) -> PathBuf;
     /// Adds the file manager entries for `exe` (GUI binary) for the current user. Returns what was written.
@@ -88,7 +94,7 @@ mod tests {
     #[test]
     fn folders_exist_or_can_be_named() {
         let p = platform();
-        assert!(p.config_dir().is_absolute());
+        assert!(p.config_dir().unwrap().is_absolute());
         assert!(p.temp_dir().is_absolute());
     }
 }

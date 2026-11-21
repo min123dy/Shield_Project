@@ -3371,6 +3371,7 @@ dependencies = [
  "cpufeatures",
  "opaque-debug",
  "universal-hash",
+ "zeroize",
 ]
 
 [[package]]
@@ -3984,7 +3985,7 @@ dependencies = [
 
 [[package]]
 name = "shield-cli"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "crossterm",
  "ctrlc",
@@ -3998,7 +3999,7 @@ dependencies = [
 
 [[package]]
 name = "shield-core"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "ab_glyph",
  "argon2",
@@ -4010,6 +4011,7 @@ dependencies = [
  "hkdf",
  "hmac 0.12.1",
  "pgp",
+ "poly1305",
  "rand",
  "rand_chacha",
  "serde_json",
@@ -4025,7 +4027,7 @@ dependencies = [
 
 [[package]]
 name = "shield-gui"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "ab_glyph",
  "eframe",
@@ -4039,7 +4041,7 @@ dependencies = [
 
 [[package]]
 name = "shield-platform"
-version = "3.0.0"
+version = "3.1.0"
 dependencies = [
  "dirs",
  "libc",

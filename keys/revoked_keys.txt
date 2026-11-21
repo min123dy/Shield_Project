@@ -1,0 +1,4 @@
+# Revoked release signing keys (3.1.0 final, review B; docs/07).
+# One primary key fingerprint per line: 40 upper-case hex digits, no spaces. Every v2 release
+# manifest lists them as "revoked_key"; Shield 3.1.0 final and later then refuse signatures by
+# these keys for good. Lines starting with # are comments. Empty: nothing revoked.

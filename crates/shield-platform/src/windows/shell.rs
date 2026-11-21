@@ -91,42 +91,67 @@ fn reg_set(key: &str, name: Option<&str>, val: &str) -> PResult<()> {
     Ok(())
 }
 
-const KEYS: [&str; 4] = [
+pub(crate) const KEYS: [&str; 6] = [
     r"Software\Classes\*\shell\Shield.Encrypt",
     r"Software\Classes\Directory\shell\Shield.Encrypt",
     r"Software\Classes\SystemFileAssociations\.shd\shell\Shield.Decrypt",
-    r"Software\Classes\SystemFileAssociations\.shd\shell\Shield.Open",
+    // 3.1.0 #14: on every file, one at a time
+    r"Software\Classes\*\shell\Shield.Open",
+    // 3.1.0 final: secure delete of files and folders; it only opens the window, which scans the
+    // items and asks the three confirmations (nothing is deleted from the menu itself)
+    r"Software\Classes\*\shell\Shield.Wipe",
+    r"Software\Classes\Directory\shell\Shield.Wipe",
 ];
+
+/// Entries of earlier versions that are removed on register and unregister (3.0.0's .shd-only
+/// "Open in SHIELD").
+pub(crate) const OLD_KEYS: [&str; 1] = [r"Software\Classes\SystemFileAssociations\.shd\shell\Shield.Open"];
+
+/// Explorer's MultiSelectModel per entry: encrypt gathers many items, open takes exactly one.
+pub(crate) const MULTI: [&str; 6] = ["Player", "Player", "Player", "Single", "Player", "Player"];
+
+fn reg_delete_tree(k: &str) -> PResult<bool> {
+    use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
+    let w = super::fs::wstr(k);
+    match unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, w.as_ptr()) } {
+        0 => Ok(true),
+        2 => Ok(false), // ERROR_FILE_NOT_FOUND: not registered
+        n => Err(std::io::Error::from_raw_os_error(n as i32).into()),
+    }
+}
 
 /// Per-user (HKCU) classic context menu entries pointing at `exe`.
 pub fn register(exe: &Path) -> PResult<Vec<PathBuf>> {
     let ko = super::sys::system_lang_is_korean();
-    let labels = if ko { ["Shield로 암호화", "Shield로 암호화", "Shield로 복호화", "SHIELD에서 열기"] } else { ["Encrypt with Shield", "Encrypt with Shield", "Decrypt with Shield", "Open in SHIELD"] };
-    let args = ["--encrypt-multi", "--encrypt-multi", "--decrypt", "--open"];
+    let labels = if ko {
+        ["Shield로 암호화", "Shield로 암호화", "Shield로 복호화", "SHIELD에서 열기", "SHIELD로 완전삭제", "SHIELD로 완전삭제"]
+    } else {
+        ["Encrypt with Shield", "Encrypt with Shield", "Decrypt with Shield", "Open in SHIELD", "Secure delete with SHIELD", "Secure delete with SHIELD"]
+    };
+    let args = ["--encrypt-multi", "--encrypt-multi", "--decrypt", "--open", "--wipe", "--wipe"];
     let e = exe.display().to_string();
     if e.contains('"') {
         return Err(PlatformError::Failed("quote in path".into()));
     }
-    for ((k, l), a) in KEYS.iter().zip(labels).zip(args) {
+    for k in OLD_KEYS {
+        reg_delete_tree(k)?;
+    }
+    for (((k, l), a), m) in KEYS.iter().zip(labels).zip(args).zip(MULTI) {
         reg_set(k, None, l)?;
         reg_set(k, Some("Icon"), &e)?;
-        // one Explorer call per selected item; the GUI collects them (see the core `collect` module)
-        reg_set(k, Some("MultiSelectModel"), "Player")?;
+        // encrypt: one Explorer call per selected item, the GUI collects them (core `spool`);
+        // open: shown for a single item only
+        reg_set(k, Some("MultiSelectModel"), m)?;
         reg_set(&format!(r"{k}\command"), None, &format!("\"{e}\" {a} \"%1\""))?;
     }
     Ok(KEYS.iter().map(|k| PathBuf::from(format!(r"HKEY_CURRENT_USER\{k}"))).collect())
 }
 
 pub fn unregister() -> PResult<Vec<PathBuf>> {
-    use windows_sys::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
     let mut gone = Vec::new();
-    for k in KEYS {
-        let w = super::fs::wstr(k);
-        let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, w.as_ptr()) };
-        match rc {
-            0 => gone.push(PathBuf::from(format!(r"HKEY_CURRENT_USER\{k}"))),
-            2 => {} // ERROR_FILE_NOT_FOUND: not registered
-            n => return Err(std::io::Error::from_raw_os_error(n as i32).into()),
+    for k in KEYS.iter().chain(OLD_KEYS.iter()) {
+        if reg_delete_tree(k)? {
+            gone.push(PathBuf::from(format!(r"HKEY_CURRENT_USER\{k}")));
         }
     }
     Ok(gone)

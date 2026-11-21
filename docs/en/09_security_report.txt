@@ -1,0 +1,304 @@
+SHIELD 3.1.0 final - Security analysis report
+============================================
+한국어: docs\09_보안_분석_보고서.txt
+Subject: 3.1.0 final and the follow-up source fixes dated 2026-11-11 (four crates, installer definitions, build scripts, CI workflow).
+Written 2026-11-11.
+
+0. What this report is (read first)
+-----------------------------------
+- No independent third-party security audit was done. This is an internal review in which the developer and AI tools
+  read the source and wrote tests.
+- It is mainly static analysis (reading the source, grep, checking type structure) and automated tests. Some items could
+  not be checked on real devices or environments; they are marked "not verified on real systems" (section 7).
+- It does not mean "there are no vulnerabilities". What was not found is stated as not found.
+- Grades: high (confidentiality/integrity broken remotely or without authentication) / medium (conditions apply, real
+  damage possible) / low (limited conditions or impact) / info (not a vulnerability but fixed, or a statement of fact).
+
+1. Scope and method
+-------------------
+- Input boundaries: container header, metadata and archive (7z/LZMA2/Zstd), settings file and settings.key, spool,
+  update manifests (v1/v2) and signatures, command line and environment, drag and drop and file manager arguments.
+- Privilege boundaries: Windows UAC update and TRIM helpers, Linux pkexec helper, MSI registrations, context menus.
+- New code: secure delete (secure_delete, wipe_view, wipe_cmd, erase.rs), written against the section 4 criteria from
+  the start.
+- Supply chain: Cargo.lock (cargo audit 0.22.2, cargo deny 0.20.2), build.rs, build.ps1/build.sh, release.yml.
+- Tools: cargo test (Windows 10, Docker Linux container), cargo clippy -D warnings (both OSes), clippy.toml
+  disallowed-methods, hand-written regression tests. No fuzzing tool (cargo-fuzz) was used; only the random mutation
+  tests of fuzz_tests.rs exist.
+
+2. Rechecking the earlier review items (A-J)
+---------------------------------------------
+These are review items collected during project development; they are not an independent third-party audit. Each item
+was checked against the source. The historical changes and this follow-up are distinguished in docs/08 and section 8.
+
+ ID  Verdict      Evidence and action
+ A   confirmed    Found in the source: sigverify read_pair read the whole signature before the 64 KiB check; tools.rs --key
+                  and settings.key were read without limit. Unified as shield_platform::bounded (open -> type and size on
+                  the handle -> take(max+1)): signatures 64 KiB, public keys 1 MiB, settings.key 4 KiB, signed data
+                  verified streaming (at most 2 GiB); clippy.toml forbids unbounded reads. Every read of the same kind
+                  replaced (settings, spool, journal, manifest, Thunar uca.xml, /proc files, fonts, Zone.Identifier).
+                  Tests: release_tests::no_unbounded_file_reads_in_product_code, limit tests in sigverify, settings_auth, cli.
+ B   confirmed    The v1 manifest has no issue time, expiry, minimum version, release ID or revoked keys. Manifest v2
+     (follow-up)  rejects expired/future manifests, versions below the minimum, revoked keys and rollback. In addition to
+                  per-user update_seen.txt, the elevated installer stores and checks a machine-wide rollback floor under
+                  protected Windows ProgramData / Linux /var/lib/shield/update. A cross-process lock serializes the
+                  privileged check, state write and installation. 3.0.0 and earlier 3.1.0 builds read only v1, so v1 stays published.
+ C   confirmed    The bundled key's shape (primary [SC], no expiry, no [S] subkey, one [E] subkey, personal email) is not
+                  cryptographically invalid. The later-added gate that required a specific key topology has been removed
+                  from build and tag checks. A parseable valid public key is required; a signed release also needs a
+                  signing-capable secret key matching it. A signing subkey, expiry, project ID and backup key are optional
+                  operational recommendations.
+ D   confirmed    linux/mod.rs used /tmp/shield without an owner check when XDG_CONFIG_HOME and HOME were unset. /tmp
+                  fallback removed; config folder forced to 0700, own, not a link; settings file and settings.key checked
+                  for owner and mode (key 0600) on the open handle. Tests added now (S-10): no HOME/XDG, relative XDG,
+                  loose mode, link, file, other owner (when root).
+ E   confirmed    engine.rs: minimum length 0 at the default PIM or higher; cred.rs: --yes passed weak password warnings.
+                  Added --allow-weak; --yes does not pass; non-interactive + weak + no --allow-weak = error. One rule
+                  set: password::check_new.
+ F   confirmed    nautilus-encrypt.sh "$@" passed relative names, the spool dropped non-absolute paths. Scripts, GUI and
+                  spool all make paths absolute and the dropped count is shown. Also found and fixed the spool newline
+                  split (S-01).
+ G   confirmed    No rust-toolchain, windows-latest, ${{ vars.* }} inserted into shell code. Toolchain pinned to 1.99.1,
+                  windows-2022 / ubuntu-24.04(-arm) pinned, attest-build-provenance + gh attestation verify before
+                  signing, values through env:, appimagetool SHA-256 pinned, audit/deny job. Now also every ${{ }} removed
+                  from run: (S-04), path remapping (S-05). GitHub settings (environment reviewers, tag protection) cannot
+                  be enforced by files: docs/07 checklist. The workflow has never run on GitHub (not verified).
+ H   confirmed    is_control only filtered Cc, duplicates used to_lowercase, the Zstd window was not checked. Cf/Co/
+                  noncharacters and misplaced variation selectors refused and escaped, dup_key (NFKC + case + normalisation
+                  + invisible characters removed), Zstd frame headers checked before the decoder (window at most 32 MiB,
+                  block count limit).
+ I   confirmed    Checked again with cargo audit: rsa (RUSTSEC-2023-0071), crypto-bigint 0.5.5 (RUSTSEC-2026-0387),
+                  webbrowser 0.8 (RUSTSEC-2026-0257) and 5 more (paste, ttf-parser, zbus_names / zvariant /
+                  zvariant_derive). Why they cannot be upgraded and their impact paths are written in .cargo/audit.toml
+                  and deny.toml with review-by 2027-05-10; CI fails after that date. rustls-webpki and webpki-roots in the
+                  current Cargo.lock are not affected (audit passes). egui 0.27 / rfd 0.14 / pgp 0.21 not upgraded this
+                  time (docs/08 section 9).
+ J   confirmed    Limits shown in the UI (secure delete step 2, passes note, settings protection note) and the docs
+                  (docs/01 section 7, 03, 04, 10). No MSI Authenticode signature and no third-party audit stated as facts.
+ No item was judged "not applicable" (all were confirmed in the source).
+
+3. Section 4 analysis - newly found and fixed
+---------------------------------------------
+ ID    Grade CWE        Location                                Description / action / test                           Status
+ S-01  low   CWE-706    shield-core/src/spool.rs                Spool entries separated paths by newlines. "/home/u/a<LF>b"  fixed
+                                                                split into "/home/u/a" (another file that may exist) and
+                                                                "b", so a wrong item could enter the secure delete or
+                                                                encryption list (mitigated: step 1 shows the real paths).
+                                                                Now NUL-terminated; non-UTF-8 names are not altered but
+                                                                dropped and counted.
+                                                                Test: spool::names_with_newlines_stay_one_item
+ S-02  low   CWE-248    shield-gui/src/main.rs                  std::env::args() panics on non-UTF-8 arguments (a Linux      fixed
+                                                                file manager passing a Latin-1 name: the window never
+                                                                opened). Now args_os; such an argument becomes empty =
+                                                                counted as an unusable item.
+                                                                No automated test (binary entry point); code review only.
+ S-03  info  CWE-223    shield-gui/src/main.rs, enc_app.rs      Context menu encryption did not pass the spool's dropped     fixed
+                                                                count to the window (F's "never drop silently" was
+                                                                missing). Start::Encrypt { items, dropped }.
+                                                                Test: unusable_selection_items_are_reported_in_the_encrypt_window
+ S-04  info  CWE-78     .github/workflows/release.yml           ${{ github.repository }} and ${{ matrix.runner }} were still  fixed
+                                                                inside run: (trusted values, but against G's rule). Now
+                                                                GITHUB_REPOSITORY and env:; a test forbids any ${{ in run:.
+                                                                Test: release_workflow_is_pinned_and_checks_provenance_before_signing
+ S-05  info  CWE-497    build.ps1, build.sh                     Locally built programs kept C:\Users\<account>\.cargo\       fixed
+                                                                registry\... and the project's absolute path as panic
+                                                                locations (account name exposed; including the MSI and
+                                                                portable exe in the earlier dist). --remap-path-prefix
+                                                                (home -> ~, CARGO_HOME, RUSTUP_HOME, repository root) is
+                                                                applied through a generated cargo config file (--config).
+                                                                It first used CARGO_ENCODED_RUSTFLAGS; that variable dropped
+                                                                crt-static and linked vcruntime140.dll as a DLL again, which
+                                                                the existing test windows_programs_load_dlls_from_system32_only
+                                                                caught in the Linux run, so it was changed (never shipped).
+                                                                Tests: builds_remap_local_paths_out_of_the_programs, a string
+                                                                scan of the built programs (docs/05)
+ S-06  info  -          shield-core/src/wipe.rs, secure_delete  Secure delete and shredding had separate overwrite loops     fixed
+                                                                with the same logic (2-1 "same engine"). Merged into
+                                                                wipe::overwrite_with. Write errors and zero-byte writes are
+                                                                failures in both.
+                                                                Test: a_failing_or_short_write_fails_the_pass
+ S-07  info  -          secure_delete_tests                     Missing 2-8 tests (injected write failure, cancelling, item  fixed
+                                                                limit, hard links). Added a_failing_or_short_write_fails_the_pass,
+                                                                hard_links_are_counted_and_named_in_the_limits,
+                                                                more_than_max_items_is_refused, tests/wipe_cancel.rs
+ S-08  info  -          release_tests                           No test guarded "no weakening option" (2-2).                 fixed
+                                                                Test: no_setting_skips_the_secure_delete_confirmation
+ S-09  low   CWE-150    shield-core/src/ui_fmt.rs               Control characters and ESC in file names could reach the     fixed
+                                                                console unchanged (terminal escape injection), and very long
+                                                                names could stall the window. path_shown: control
+                                                                characters as \u{..}, spoofing characters as <U+XXXX>, 400
+                                                                character limit (secure delete screens, console path output
+                                                                of shield wipe, verify ...).
+                                                                Test: shown_paths_are_safe_for_terminals
+ S-10  info  CWE-379    shield-core/src/lock.rs, settings.rs    Not a separate vulnerability but part of the D fix. The old  fixed
+                                                                data_dir() could not fail, so locks, settings and spool used
+                                                                whatever location the platform gave (including the Linux /tmp
+                                                                fallback). data_dir() now returns a Result, so an unusable
+                                                                data folder is an error for every caller. D had no tests
+                                                                before; they were added now.
+                                                                Tests (added now, Linux): config_folder_has_no_fallback,
+                                                                data_folder_must_be_own_private_real_folder,
+                                                                settings_files_must_be_own_and_not_writable_by_others
+
+4. Section 4 results by area (nothing to fix found, or existing measures checked again)
+--------------------------------------------------------------------------------------
+4-1 Input validation and resources
+ - KDF parameters are not read from the header. Argon2id m=256 MiB, p=4, t=3+PIM are code constants (the header has no
+   plaintext magic bytes or algorithm IDs); the PIM is user input limited by MAX_PIM=64. No DoS by raising the KDF cost
+   through the header.
+ - Archives: MAX_FILES entries, depth 64, 1024-character paths, 255-byte components, ratio 10,000, LZMA2 dictionary and
+   Zstd window limits. fuzz_tests (randomly mutated containers, broken 7z) are refused without panics. Memory and CPU use
+   inside the 7z/Zstd libraries was not verified; the limits above only fence them from outside.
+ - Settings, spool, journal, manifests, signatures and key files all apply a size limit to the open handle (A). Spool at
+   most 10,000 entries, secure delete plans at most 200,000.
+ - Integer conversions: chunk counts and offsets are u64 with checked/saturating arithmetic (earlier review, docs/05); the
+   new code (progress, size totals) uses saturating_add/mul.
+4-2 Cryptographic implementation
+ - Per-chunk nonce = per-container random prefix + kind marker + chunk number (with a last-chunk marker); the AAD binds the
+   metadata tag and format marker. Reuse, reordering and truncation are covered by existing tests (container_tests,
+   fuzz_tests).
+ - Comparisons: key slot DEK, settings MAC and verifier, manifest hashes, secure delete code and token all use
+   password::ct_eq (constant time).
+ - Decryption failures give one message that does not tell causes apart (err.bad / err.open_bad).
+ - Randomness: the OS CSPRNG is always the base; collected entropy is only mixed in (entropy/). Failures are errors, never
+   a weaker fallback.
+ - zeroize: password input (SecretBuf), Cred, keys and settings keys are Zeroizing. Copies in registers, stack, swap or
+   hibernation files cannot be checked (stated in docs/01 section 7).
+ - Memory protection: VirtualLock/mlock; Windows error dialogs off, DLL search limited to System32, image load policy;
+   Linux RLIMIT_CORE=0, PR_SET_DUMPABLE=0. Failures go through harden::degraded to the user, who must confirm.
+4-3 File system and races
+ - Secure delete: no-follow opens, handle-based folder listing (fstatat/openat), file IDs compared again, deletion through
+   the handle after renaming (docs/10).
+ - Temp files: sectemp (private folder, O_EXCL/CREATE_NEW, 0600/owner ACL), journal cleanup after a crash (existing).
+ - Spool: not used unless the folder is private; entries older than a minute and malformed entries dropped; the GUI checks
+   the content again (untrusted).
+ - Reserved device names, 8.3 names, \\?\ paths, ADS, case: archive name checks and dup_key, path_key in secure delete.
+4-4 Installation and privilege boundaries
+ - Windows: SetDefaultDllDirectories (System32); registry commands quote both the program and %1 (tested); the MSI removes
+   earlier versions (pinned UpgradeCode, release_tests). The MSI creates %ProgramData%\Shield with an administrators-only ACL.
+ - Linux: pkexec only by absolute path; helper arguments only regular files owned by PKEXEC_UID; polkit auth_admin (not
+   remembered).
+ - External processes: absolute path candidates only (xdg-open, pkexec, apt-get, dpkg, icacls, msiexec), never a shell.
+4-5 Updates and network
+ - HTTPS only (redirects included), rustls certificate checks, 5 redirects, 10 s connect / 20 s response timeouts,
+   installers at most 512 MiB and small-file limits, fixed allowed file names, the helper verifies its copy again (two
+   stages). Manifest v2 (B).
+ - A server giving false answers: bad signature -> nothing installed (link only); an old, correctly signed release ->
+   refused by expiry and rollback (v2 clients).
+4-6 GUI and console
+ - Console password arguments are off by default (setting allow_arg_secrets) and warned about when on. Input without echo.
+ - Control and spoofing characters and long names in file names: S-09. The GUI shows spoofing characters as <U+XXXX>
+   (glyphs::code_only).
+ - The limits of clipboard clearing and the environment error display of capture protection stay as in 3.0.0 (docs/01).
+4-7 Supply chain and build
+ - build.rs: no network; a secret key in the public key file stops the build; the repository URL format is checked.
+ - Source zip: stops on a secret key block; secret keys in keys/ and .env excluded (release_tests). Path remapping (S-05).
+4-8 Secure delete itself
+ - Path resolution errors and relative paths: made absolute and the real path shown
+   (relative_items_are_resolved_to_the_real_path).
+ - Privilege bypass: nothing above the user's own rights is used (no UAC/pkexec). Read-only flags cleared only after the
+   confirmation, through the handle.
+ - Getting around the challenge: ConfirmedWipePlan sealed (compile_fail), 3 s / 3 tries / new code, no weakening setting,
+   --yes ignored.
+ - Reporting failure as success: failed passes, zero-byte writes, failed deletes and failed streams are all "partial /
+   failed" (S-06, S-07).
+ - Memory: one 1 MiB buffer, plans limited to 200,000 entries.
+
+5. Remaining risks and why they are accepted
+--------------------------------------------
+ R-1 Malware running as the same user can get around the settings key (on Linux a 0600 file), the per-user update_seen.txt
+     and the confirmation. The elevated update rollback floor is stored separately under administrator/root-only access
+     and serialized with a lock. Administrators/root, the kernel and attackers with the same elevated rights remain outside
+     the threat model (accepted; docs/01 section 7).
+ R-2 SSD/NVMe, snapshots, COW, cloud: overwriting and TRIM cannot guarantee physical erasure (accepted; always shown in
+     the UI). Remedy: use encrypted volumes or containers from the start.
+ R-3 Operational key hardening: the current bundled key has no separate signing subkey, expiry, project-specific user ID
+     or backup key. These are recommendations, not cryptographic validity or build prerequisites. A signed release still
+     requires a signing-capable secret key matching the embedded public key. A dedicated signing subkey and offline
+     backup key are recommended to reduce operational risk (docs/07).
+ R-4 The MSI and the programs have no Authenticode signature: SmartScreen warns, and users have to check the GPG .sig
+     (docs/04). Not done this time because of certificate cost and handling (accepted).
+ R-5 8 advisory exceptions from the old GUI stack (egui 0.27, rfd 0.14) and pgp 0.21: by impact path analysis they are
+     features Shield does not use (rsa secret-key operations, webbrowser - links blocked), dependencies not built for
+     Windows/Linux (paste: metal for macOS), or advisories whose fixed versions need a GUI stack upgrade (ttf-parser, the
+     zbus family). The reason for each is in .cargo/audit.toml. This judgement is the developer's analysis and has not
+     been independently verified. Review by 2027-05-10.
+ R-6 3.0.0 and earlier-3.1.0 clients read only the v1 manifest and get no replay/rollback protection. It takes effect once
+     they are on 3.1.0 final (docs/08 B).
+ R-7 rustfmt: cargo fmt --check reports 1,473 differences (the code base was never formatted with rustfmt). No effect on
+     behaviour; a mass reformat is hard to review and was not done this time.
+
+6. Recommended follow-up
+------------------------
+ - Where practical, use an offline certify-only primary, a time-limited signing subkey and an offline backup key
+   (docs/07). Publish the fingerprint outside the repository too; these remain recommendations, not build gates.
+ - Apply the GitHub settings checklist, then try a tag release (a dry-run tag).
+ - An external third-party security audit; long fuzzing of the archive and container parsers with cargo-fuzz.
+ - Upgrade egui/eframe, rfd and pgp (removing the advisory exceptions); consider Authenticode signing.
+ - The real-system checks in section 7.
+
+7. Not verified on real systems (no environment to run them)
+------------------------------------------------------------
+ - Windows: UAC-elevated update install and TRIM, MSI install/upgrade/uninstall and the context menu entries (secure
+   delete included) in practice, SmartScreen behaviour, secure delete of a real user folder with junctions and ADS, the
+   warning on a volume with VSS.
+ - Linux: pkexec and polkit dialogs, deb and AppImage install and update, the real Nautilus / Nemo / Dolphin / Thunar menus
+   (the Nautilus scripts were tested with a fake shield-gui in 47 cases under dash and bash), btrfs/ZFS snapshot detection.
+ - Storage: whether data remains on a real SSD/NVMe (no measuring equipment).
+ - CI: release.yml has never run on GitHub (attestations, environment approval, arm runners, the release gate).
+
+
+8. Follow-up fixes dated 2026-11-11
+-----------------------------------
+- License: the root LICENSE, Cargo workspace metadata and all four Rust crates now declare Apache-2.0. deny.toml allows Apache-2.0; the workspace's GPL-3.0-or-later declaration was removed.
+- Secure-delete guard: Guard::check now compares selected and protected paths in both directions. A selected Shield data-directory descendant (including settings, settings.key and journal files) is refused, as are the directory itself and its ancestors. A regression test covers files, nested folders, the protected root, an ancestor and an unrelated sibling.
+- Update rollback: the elevated installer now checks and persists a protected machine-wide state under ProgramData /var/lib. Corrupt, invalid UTF-8 or non-canonical state fails closed. A separate OS lock serializes the check, persistence and installation so concurrent helpers cannot replace a higher rollback floor with an older one.
+- Release key policy: the tag/build gate for a particular signing subkey, expiry, project-specific user ID and backup public key, plus the source-pinned fingerprint assertion, were removed. A valid parseable public key remains required; signed releases still require a matching signing-capable secret key.
+- Documentation: previous 3.1.0 final change-log references to the release-key gate describe the historical version at that time. Current README, build and key-operation documents clarify that these key-shape attributes are not mandatory.
+- Verification limit: cargo/rustc are not installed in the current editing environment, so the new Rust code and tests could not be rebuilt or rerun. No claim is made that the new tests pass. Shell syntax and static source/document checks are performed separately; full Windows/Linux workspace tests and clippy must run in CI with the Rust toolchain. GitHub Actions, UAC/pkexec, and real MSI/deb/AppImage installation were not verified here.
+
+
+9. Follow-up review 2026-11-21 (with the settings password for secure delete)
+---------------------------------------------------------------------------
+Scope: secure delete (secure_delete, wipe_view, wipe_cmd, platform erase), settings password and MAC (settings,
+settings_auth), the elevated update helper (update::helper_main, parse_helper_args, copy_inputs, verify_copies,
+linux/install.rs), archive extraction (archive::extract, make_dirs). Source reading and regression tests; not an
+external audit.
+
+ ID    Level   CWE        Where                                  What / fix / test                                    State
+ S-11  low     CWE-59     shield-core/src/secure_delete.rs       A link selected directly was used as given, unresolved. A path   fixed
+                                                                 whose folder is a link (~/x/name with ~/x -> /usr/lib) passed
+                                                                 the blocklist as that string, and the first warning showed it
+                                                                 instead of what really goes (/usr/lib/name), against the "real
+                                                                 paths are shown" rule. As a normal user that folder is not
+                                                                 writable, but from a sudo / administrator console a link in a
+                                                                 system folder could be removed. The link's folder is now
+                                                                 canonicalized (its own name kept), and the resolved path must
+                                                                 still be the same link (file ID).
+                                                                 Test: a_selected_link_is_checked_and_shown_where_it_really_is
+ S-12  medium  CWE-284    shield-core/src/settings_auth.rs        Two bypasses a new protected value would have had if added the   prevented
+               CWE-354    settings.rs                            usual way were designed out. (1) "Back to the safe defaults
+                                                                 needs no password": with the switch off by default, one click
+                                                                 on [Reset security] would have switched the protection off
+                                                                 without the password -> on by default. (2) The 3.0.0 v1 MAC
+                                                                 path does not cover values 3.0.0 did not know: "= false"
+                                                                 written into a file with a v1 MAC would have passed -> the v1
+                                                                 MAC is computed over mac_text (with the new value) too.
+                                                                 protected_text (3.0.0's MAC input) is unchanged.
+                                                                 Tests: the_secure_delete_password_switch_is_protected,
+                                                                 switching_secure_delete_off_by_editing_the_file_is_noticed,
+                                                                 compat_tests (3.0.0 MAC input unchanged)
+
+Threat model of the new feature: asking for the settings password before secure delete stops someone else at an
+unlocked PC from deleting files with Shield. Programs running as the same user (R-1) can delete files without Shield,
+and deleting the settings file (forgotten-password recovery) removes the step from the next start on; neither is
+prevented (said in the settings screen and docs/10 2-5).
+Structure: execute() needs a sealed WipePermit (compile_fail doc test) that only permit() makes, new for every run.
+The console reads it on the terminal only, so scripts cannot skip it.
+
+Looked at again, nothing to fix found: the update helper (argument owner / link / size checks, only the copies are
+verified and installed, rollback floor under a lock), archive extraction (private staging folder, entry_ok and dup_key,
+create_new, declared size limit), the settings key file (owner and mode checked on the handle), secure delete execution
+(checks on the handle, delete after renames). A small race remains: remove_link and remove_dir check the file ID, then
+delete by path. Swapping in another object under that name needs write access to that folder (whoever has it can delete
+there anyway), so it is accepted.

@@ -1,0 +1,262 @@
+SHIELD 3.1.0 최종 - 보안 분석 보고서
+===================================
+English: docs\en\09_security_report.txt
+대상: 3.1.0 최종 및 2026-11-11 후속 수정 소스(4개 크레이트, 설치 파일 정의, 빌드 스크립트, CI 워크플로). 작성 2026-11-11.
+
+0. 이 보고서의 성격 (먼저 읽으십시오)
+------------------------------------
+- 독립적인 제3자 보안 감사를 받지 않았습니다. 개발 과정에서 개발자와 AI 도구가 소스를 읽고 테스트를 만들어
+  확인한 내부 점검입니다.
+- 정적 분석(소스 읽기, grep, 타입 구조 확인)과 자동 테스트 중심입니다. 실제 장비·환경에서 확인하지 못한 항목이
+  있으며 "실기 미검증"으로 표시했습니다(7절).
+- "취약점이 없다"는 뜻이 아닙니다. 찾지 못한 것은 찾지 못했다고 적었습니다.
+- 등급: 상(원격·무인증으로 기밀성·무결성 침해) / 중(조건이 있지만 실제 피해 가능) / 하(제한된 조건·영향) /
+  정보(취약점은 아니지만 고쳐 둔 것, 또는 사실 고지).
+
+1. 범위와 방법
+--------------
+- 입력 경계: 컨테이너 헤더·메타데이터·아카이브(7z/LZMA2/Zstd), 설정 파일·settings.key, spool, 업데이트
+  매니페스트(v1/v2)와 서명, 명령줄·환경 변수, 드래그 앤 드롭·파일 관리자 인자.
+- 권한 경계: Windows UAC 업데이트 헬퍼·TRIM 헬퍼, Linux pkexec 헬퍼, MSI 등록 항목, 우클릭 메뉴.
+- 새 코드: 완전삭제(secure_delete, wipe_view, wipe_cmd, erase.rs) - 처음부터 4장 기준을 적용했습니다.
+- 공급망: Cargo.lock(cargo audit 0.22.2, cargo deny 0.20.2), build.rs, build.ps1/build.sh, release.yml.
+- 도구: cargo test(Windows 10, Docker Linux 컨테이너), cargo clippy -D warnings(양쪽 OS), clippy.toml
+  disallowed-methods, 직접 작성한 회귀 테스트. 퍼징 도구(cargo-fuzz)는 쓰지 않았고 fuzz_tests.rs의 무작위 변형
+  테스트만 있습니다.
+
+2. 이전 검토 항목(A-J) 재확인
+----------------------------
+이 항목들은 프로젝트 검토 과정에서 수집한 점검 목록입니다. 독립적인 제3자 감사 결과로 간주하지 않습니다.
+각 항목을 소스에서 다시 확인했으며, 이전 기록과 이번 후속 수정의 구분은 docs/08 및 10절에 적었습니다.
+
+ ID  판정        근거와 조치
+ A   확인됨      sigverify read_pair가 서명을 전부 읽은 뒤 64KiB 검사, tools.rs --key·settings.key 무제한 읽기를
+                 소스에서 확인. shield_platform::bounded(열기 -> 핸들로 종류·크기 -> take(최대+1))로 통일, 서명 64KiB,
+                 공개키 1MiB, settings.key 4KiB, 서명 대상은 스트리밍 검증(최대 2GiB), clippy.toml이 무제한 읽기 금지.
+                 같은 유형 전수 교체(설정, spool, 저널, 매니페스트, Thunar uca.xml, /proc 파일, 글꼴, Zone.Identifier).
+                 테스트: release_tests::no_unbounded_file_reads_in_product_code, sigverify·settings_auth·cli 한도 테스트.
+ B   확인됨      v1 매니페스트에 발행·만료·최소 버전·릴리스 ID·폐기 키가 없음을 확인. manifest v2 추가(전체 서명 대상),
+     (후속 보강) 클라이언트가 만료·미래 발행(허용 24시간)·최소 버전·폐기 키·롤백을 거부합니다. 일반 앱의 사용자 영역
+                 update_seen.txt와 별개로 권한 상승 설치 헬퍼는 Windows ProgramData / Linux /var/lib/shield/update에
+                 보호된 시스템 공용 롤백 기준을 보관하고, 권한 상승 상태 검사·저장·설치를 파일 잠금으로 직렬화합니다.
+                 기존 3.0.0·이전 3.1.0은 v1만 읽으므로 v1은 계속 같이 게시합니다.
+ C   확인됨      keys/release_key.asc의 구성(주 키 [SC], 만료 없음, [S] 부키 없음, [E] 부키, 개인 이메일)은
+                 암호학적으로 허용되지 않는 상태가 아닙니다. 특정 키 모양을 강제했던 릴리스 게이트는 후속 수정에서
+                 빌드·태그 검사에서 제거했습니다. 유효한 공개키와, 서명 릴리스의 경우 이에 일치하는 서명 가능한 비밀키만
+                 필수입니다. 전용 서명 부키·만료·프로젝트 ID·백업 키는 운영상 권고입니다.
+ D   확인됨      linux/mod.rs가 XDG_CONFIG_HOME·HOME이 없으면 /tmp/shield를 소유자 확인 없이 사용. /tmp 폴백 삭제,
+                 설정 폴더 0700·소유자·링크 아님 강제, 설정 파일·settings.key는 열린 핸들로 소유자·권한(키 0600) 확인.
+                 테스트는 이번에 추가(S-10): HOME/XDG 없음, 상대 XDG, 느슨한 권한, 링크, 파일, 다른 소유자(root일 때).
+ E   확인됨      engine.rs: 기본 PIM 이상이면 최소 길이 0, cred.rs: --yes가 약한 비밀번호 경고 통과. --allow-weak 추가,
+                 --yes는 통과시키지 못함, 비대화형 + 약함 + --allow-weak 없음 = 오류. 기준은 password::check_new 하나.
+ F   확인됨      nautilus-encrypt.sh "$@"가 상대 이름, spool이 절대 경로 아니면 버림. 스크립트·GUI·spool 모두 절대화,
+                 버린 개수 표시. 추가로 spool의 줄바꿈 분리 문제를 찾아 고침(S-01).
+ G   확인됨      rust-toolchain 없음, windows-latest, ${{ vars.* }} 셸 삽입 확인. 툴체인 1.99.1 고정, windows-2022 /
+                 ubuntu-24.04(-arm) 고정, attest-build-provenance + 서명 전 gh attestation verify, env: 전달,
+                 appimagetool SHA-256 고정, audit/deny 잡. 이번에 run: 안의 모든 ${{ }} 제거(S-04), 경로 재매핑(S-05).
+                 GitHub 설정(environment 리뷰어, 태그 보호)은 파일로 강제할 수 없어 docs/07 체크리스트.
+                 워크플로는 GitHub에서 실행된 적이 없습니다(실기 미검증).
+ H   확인됨      is_control은 Cc만 거름, 중복 판정 to_lowercase, Zstd 윈도 미검사 확인. Cf/Co/비문자·잘못 놓인 변형
+                 선택자 거부·이스케이프, dup_key(NFKC + 대소문자 + 정규화 + 보이지 않는 문자 제거), Zstd 프레임 헤더를
+                 디코더 전에 검사(윈도 최대 32MiB, 블록 수 상한).
+ I   확인됨      cargo audit로 재확인: rsa(RUSTSEC-2023-0071), crypto-bigint 0.5.5(RUSTSEC-2026-0387), webbrowser
+                 0.8(RUSTSEC-2026-0257)과 나머지 5건(paste, ttf-parser,
+                 zbus_names·zvariant·zvariant_derive). 올릴 수 없는 이유와 영향 경로를 .cargo/audit.toml·deny.toml에
+                 적고 review-by 2027-05-10, 지나면 CI 실패. rustls-webpki·webpki-roots는 현재 Cargo.lock에서 권고
+                 대상이 아님(audit 통과). egui 0.27/rfd 0.14/pgp 0.21 업그레이드는 이번에 하지 않음(docs/08 9절).
+ J   확인됨      한계 고지를 UI(완전삭제 2단계·횟수 안내, 설정 보호 안내)와 문서(docs/01 7절, 03, 04, 10)에 반영.
+                 MSI Authenticode 서명 없음, 제3자 감사 없음을 사실대로 적음.
+ "비해당"으로 판정한 항목은 없습니다(전부 소스에서 확인됨).
+
+3. 4장 분석 결과 - 이번에 새로 찾아 고친 것
+-------------------------------------------
+ ID    등급  CWE        위치                                   설명 / 조치 / 테스트                                  상태
+ S-01  하    CWE-706    shield-core/src/spool.rs               spool 항목 파일이 경로를 줄바꿈으로 구분. "/home/u/a<LF>b"가    수정
+                                                               "/home/u/a"(다른, 실재할 수 있는 파일)와 "b"로 나뉘어 완전삭제·
+                                                               암호화 목록에 엉뚱한 항목이 들어갈 수 있었음(1단계 경고에 실제
+                                                               경로가 보여 완화됨). NUL 구분으로 변경, UTF-8이 아닌 이름은
+                                                               바꾸지 않고 버린 뒤 개수 표시.
+                                                               테스트: spool::names_with_newlines_stay_one_item
+ S-02  하    CWE-248    shield-gui/src/main.rs                 std::env::args()는 UTF-8이 아닌 인자에서 panic(Linux 파일       수정
+                                                               관리자가 Latin-1 이름을 넘기면 창이 뜨지 않고 종료). args_os로
+                                                               바꾸고 그런 인자는 빈 값 = "쓸 수 없는 항목"으로 집계.
+                                                               자동 테스트 없음(바이너리 진입점), 코드 확인만.
+ S-03  정보  CWE-223    shield-gui/src/main.rs, enc_app.rs     우클릭 암호화에서 spool이 버린 항목 수를 창에 전하지 않음(F의    수정
+                                                               "조용히 버리지 않기" 누락). Start::Encrypt { items, dropped }.
+                                                               테스트: unusable_selection_items_are_reported_in_the_encrypt_window
+ S-04  정보  CWE-78     .github/workflows/release.yml          run: 안에 ${{ github.repository }}·${{ matrix.runner }}가 남아   수정
+                                                               있었음(값은 신뢰 가능하지만 G의 원칙 위반). GITHUB_REPOSITORY·
+                                                               env:로 바꾸고 테스트가 run: 안의 모든 ${{ 를 금지.
+                                                               테스트: release_workflow_is_pinned_and_checks_provenance_before_signing
+ S-05  정보  CWE-497    build.ps1, build.sh                    로컬 빌드의 실행 파일에 C:\Users\<계정>\.cargo\registry\... 와  수정
+                                                               프로젝트 절대 경로가 panic 위치로 남음(계정 이름 노출; 이전
+                                                               dist의 MSI·포터블 포함). --remap-path-prefix(홈 → ~, CARGO_HOME,
+                                                               RUSTUP_HOME, 저장소 루트)를 생성한 cargo 설정 파일(--config)로
+                                                               적용. 처음에는 CARGO_ENCODED_RUSTFLAGS로 넣었다가 그 변수가
+                                                               crt-static을 지워 vcruntime140.dll을 다시 DLL로 링크하는 것을
+                                                               기존 테스트(windows_programs_load_dlls_from_system32_only)가
+                                                               Linux 실행에서 잡아 바꿈(배포 산출물에는 들어가지 않음).
+                                                               테스트: builds_remap_local_paths_out_of_the_programs, 빌드 후
+                                                               바이너리 문자열 검사(docs/05)
+ S-06  정보  -          shield-core/src/wipe.rs, secure_delete  완전삭제와 원본 파쇄가 같은 로직의 덮어쓰기 루프를 따로 가짐   수정
+                                                               (2-1 "같은 엔진"). wipe::overwrite_with 하나로 합침. 쓰기 실패·
+                                                               0바이트 쓰기는 두 기능 모두 실패로 보고.
+                                                               테스트: a_failing_or_short_write_fails_the_pass
+ S-07  정보  -          secure_delete_tests                    2-8 테스트 누락(쓰기 실패 주입, 취소, 항목 수 상한, 하드 링크).  수정
+                                                               추가: a_failing_or_short_write_fails_the_pass,
+                                                               hard_links_are_counted_and_named_in_the_limits,
+                                                               more_than_max_items_is_refused, tests/wipe_cancel.rs
+ S-08  정보  -          release_tests                          "약화 옵션 없음"(2-2)을 지키는 테스트가 없었음.                  수정
+                                                               테스트: no_setting_skips_the_secure_delete_confirmation
+ S-09  하    CWE-150    shield-core/src/ui_fmt.rs              파일 이름의 제어 문자·ESC가 콘솔에 그대로 출력될 수 있고(터미널   수정
+                                                               제어 시퀀스 주입), 매우 긴 이름이 창을 멈추게 할 수 있었음.
+                                                               path_shown: 제어 문자 \u{..}, 위장 문자 <U+XXXX>, 400자 상한
+                                                               (완전삭제 화면, shield wipe·verify 등 콘솔 경로 출력).
+                                                               테스트: shown_paths_are_safe_for_terminals
+ S-10  정보  CWE-379    shield-core/src/lock.rs, settings.rs   별도 취약점이 아니라 D 수정의 연장입니다. 이전 data_dir()는      수정
+                                                               실패할 수 없는 함수라 플랫폼이 준 위치(Linux /tmp 폴백 포함)를
+                                                               잠금·설정·spool이 그대로 썼습니다. data_dir()가 Result를 돌려
+                                                               주게 바꿔 쓸 수 없는 데이터 폴더는 모든 호출자에서 오류가 됩니다.
+                                                               D에는 이전에 테스트가 없어 이번에 추가했습니다.
+                                                               테스트(이번에 추가, Linux): config_folder_has_no_fallback,
+                                                               data_folder_must_be_own_private_real_folder,
+                                                               settings_files_must_be_own_and_not_writable_by_others
+
+4. 4장 점검 항목별 결과 (고칠 것을 찾지 못했거나 기존 대책을 다시 확인한 것)
+---------------------------------------------------------------------------
+4-1 입력 검증·자원
+ - KDF 매개변수는 헤더에서 읽지 않습니다. Argon2id m=256MiB, p=4, t=3+PIM은 코드 상수이고(헤더에 마법 바이트·
+   알고리즘 ID가 평문으로 없음), PIM은 사용자 입력이며 MAX_PIM=64로 제한됩니다. 헤더로 KDF 비용을 키우는 DoS 없음.
+ - 아카이브: 항목 수 MAX_FILES, 깊이 64, 경로 1024자, 구성 요소 255바이트, 압축률 10,000배, LZMA2 사전·Zstd
+   윈도 상한. fuzz_tests(무작위 변형 컨테이너, 깨진 7z)는 panic 없이 거부. 7z/Zstd 라이브러리 내부의 메모리·CPU
+   사용은 검증한 것이 아니며, 위 상한으로 바깥에서 막을 뿐입니다.
+ - 설정·spool·저널·매니페스트·서명·키 파일은 모두 크기 상한을 열린 핸들에 적용(A). spool 항목 10,000개, 완전삭제
+   계획 200,000개.
+ - 정수 변환: 청크 수·오프셋은 u64 + checked/saturating 연산(이전 점검 docs/05), 이번 새 코드(진행률·용량 합계)는
+   saturating_add/mul.
+4-2 암호 구현
+ - 청크마다 nonce = 컨테이너별 무작위 접두 + 종류 표지 + 청크 번호(마지막 청크 표지 포함), AAD에 메타데이터 태그와
+   형식 표지가 묶입니다. 재사용·순서 바꾸기·잘라내기는 기존 테스트(container_tests, fuzz_tests)로 확인.
+ - 비교: 키 슬롯 DEK, 설정 MAC·검증자, 매니페스트 해시, 완전삭제 코드·토큰 모두 password::ct_eq(상수 시간).
+ - 복호화 실패 메시지는 원인을 구분하지 않는 한 문장(err.bad / err.open_bad).
+ - 난수: OS CSPRNG가 항상 기반이고 수집 엔트로피는 섞기만 합니다(entropy/). 실패 시 약해지지 않고 오류.
+ - zeroize: 비밀번호 입력(SecretBuf), Cred, 키, 설정 키는 Zeroizing. 레지스터·스택·스왑·최대 절전 파일에 남는
+   사본은 확인할 수 없습니다(docs/01 7절 고지).
+ - 메모리 보호: VirtualLock/mlock, Windows 오류 대화 상자 끄기·DLL 검색 System32 한정·이미지 로드 정책,
+   Linux RLIMIT_CORE=0·PR_SET_DUMPABLE=0. 실패하면 harden::degraded로 사용자에게 알리고 확인을 받습니다.
+4-3 파일 시스템·경쟁
+ - 완전삭제: 링크 비추종 열기, 핸들 기준 폴더 목록(fstatat/openat), 파일 ID 재대조, 이름 변경 후 핸들로 삭제(docs/10).
+ - 임시 파일: sectemp(사용자 전용 폴더, O_EXCL/CREATE_NEW, 0600/소유자 ACL), 비정상 종료 뒤 저널 정리(기존).
+ - spool: 사용자 전용 폴더가 아니면 쓰지 않음, 1분 넘은 항목·잘못된 항목 버림, 내용은 GUI가 다시 검사(신뢰 안 함).
+ - 예약 장치 이름·8.3 이름·\\?\ 경로·ADS·대소문자: archive 이름 검사와 dup_key, 완전삭제의 경로 키(path_key).
+4-4 설치·권한 경계
+ - Windows: SetDefaultDllDirectories(System32), 레지스트리 명령은 실행 파일과 %1 모두 따옴표(테스트),
+   MSI가 이전 버전 정리(UpgradeCode 고정, release_tests). %ProgramData%\Shield는 MSI가 관리자 전용 ACL로 생성.
+ - Linux: pkexec는 절대 경로로만, 헬퍼 인자는 일반 파일·PKEXEC_UID 소유만, polkit auth_admin(기억 안 함).
+ - 외부 프로세스: 절대 경로 후보만(xdg-open, pkexec, apt-get, dpkg, icacls, msiexec), 셸을 거치지 않음.
+4-5 업데이트·네트워크
+ - HTTPS 전용(리다이렉트 포함), rustls 인증서 검증, 리다이렉트 5회, 연결 10초·응답 20초 시간 제한, 설치 파일
+   512MiB·작은 파일 상한, 허용 파일 이름 고정, 헬퍼가 사본을 다시 검증(2단계). 매니페스트 v2(B).
+ - 서버가 거짓 응답을 주면: 서명 실패 -> 설치 안 함(링크만), 오래된 정상 서명본 -> 만료·롤백으로 거부(v2 클라이언트).
+4-6 GUI·콘솔
+ - 콘솔 비밀번호를 인자로 받는 기능은 기본 꺼짐(설정 allow_arg_secrets), 켜면 경고. 입력은 에코 없이.
+ - 파일 이름의 제어 문자·위장 문자·긴 이름: S-09. GUI는 위장 문자를 <U+XXXX>로 표시(glyphs::code_only).
+ - 클립보드 자동 삭제의 한계와 화면 캡처 방지의 환경 오류 표시는 3.0.0 방식 유지(docs/01).
+4-7 공급망·빌드
+ - build.rs: 네트워크 없음, 공개키 파일에 비밀키가 섞이면 빌드 중단, 저장소 URL 형식 검사.
+ - 소스 zip: 비밀키 블록이 보이면 중단, keys/의 비밀키·.env 제외(release_tests). 경로 재매핑(S-05).
+4-8 완전삭제 자체
+ - 경로 해석 오류·상대 경로: 절대화 + 실제 경로 표시(relative_items_are_resolved_to_the_real_path).
+ - 권한 우회: 같은 사용자 권한 이상은 쓰지 않음(UAC/pkexec 없음). 읽기 전용 해제는 확인 뒤, 핸들로.
+ - 캡차 우회: ConfirmedWipePlan 봉인(compile_fail), 3초·3회·새 코드, 약화 설정 없음, --yes 무시.
+ - 실패를 성공으로 보고: 패스 실패·0바이트 쓰기·삭제 실패·스트림 실패 모두 "일부/실패"(S-06, S-07).
+ - 메모리: 버퍼 1MiB 하나, 계획 200,000개 상한.
+
+5. 남은 위험과 수용 사유
+------------------------
+ R-1 같은 사용자 권한의 악성 프로그램: 설정 키(Linux는 0600 파일), 사용자 영역 update_seen.txt, 확인 절차를 우회할
+     수 있습니다. 권한 상승 업데이트의 롤백 기준은 별도의 관리자/root 전용 파일과 잠금으로 보호되지만 관리자/root,
+     커널 및 동일한 높은 권한의 공격자는 위협 모델 밖입니다(수용, docs/01 7절).
+ R-2 SSD/NVMe·스냅숏·COW·클라우드: 덮어쓰기와 TRIM으로 물리적 소거를 보장할 수 없습니다(수용, UI 상시 고지).
+     대책: 처음부터 암호화한 볼륨·컨테이너를 쓰는 것.
+ R-3 번들 릴리스 키의 운영상 하드닝: 현재 키에는 별도 서명 부키·만료·프로젝트 사용자 ID·백업 키가 없습니다.
+     이는 권고 사항이지 암호학적 유효성이나 빌드의 필수 조건은 아닙니다. 서명된 릴리스에는 내장 공개키와 일치하는
+     서명 가능한 비밀키가 필요합니다. 전용 서명 부키와 오프라인 백업 키는 위험 감소를 위해 권장합니다(docs/07).
+ R-4 MSI·실행 파일에 Authenticode 서명이 없습니다: SmartScreen 경고가 나오고, 사용자는 GPG .sig로 확인해야 합니다
+     (docs/04). 인증서 비용·관리 문제로 이번에 하지 않음(수용).
+ R-5 오래된 GUI 스택(egui 0.27, rfd 0.14)과 pgp 0.21에서 오는 권고 예외 8건: 영향 경로 분석상 Shield가 쓰지 않는
+     기능(rsa 비밀키 연산, webbrowser - 링크 차단), Windows·Linux 빌드에 들어가지 않는 의존성(paste: macOS용 metal),
+     또는 고칠 수 있는 버전이 GUI 스택 업그레이드를 요구하는 것(ttf-parser, zbus 계열)입니다. 각 항목의 이유는
+     .cargo/audit.toml에 있습니다. 이 판단은 개발 중 분석이며 독립 검증을 받지 않았습니다. 2027-05-10까지 재검토.
+ R-6 3.0.0·이전 3.1.0 클라이언트는 v1 매니페스트만 읽어 재생·롤백 보호를 받지 못합니다. 3.1.0 최종으로 올라온
+     뒤부터 효력(docs/08 B).
+ R-7 rustfmt: cargo fmt --check가 1,473곳 차이를 보고합니다(코드 베이스가 rustfmt로 정리된 적 없음). 동작과 무관하며
+     일괄 정리는 리뷰가 어려워 이번에 하지 않았습니다.
+
+6. 후속 권장
+------------
+ - 가능하면 오프라인 인증 전용 주 키 + 만료 설정 서명 부키로 운영하고, 오프라인 백업 키를 추가(docs/07).
+   지문은 저장소 밖 채널에도 공개하되, 이 권고를 빌드 필수 조건으로 만들지 않습니다.
+ - GitHub 저장소 설정 체크리스트 적용 후 태그 릴리스 시험 실행(드라이런 태그).
+ - 외부 제3자 보안 감사, cargo-fuzz로 아카이브·컨테이너 파서 장시간 퍼징.
+ - egui/eframe·rfd·pgp 업그레이드(권고 예외 제거), Authenticode 서명 검토.
+ - 실기 검증(7절) 항목.
+
+7. 실기 미검증 (실행 환경이 없어 확인하지 못한 것)
+-------------------------------------------------
+ - Windows: UAC 승격 업데이트 설치·TRIM, MSI 설치·업그레이드·제거와 우클릭 항목(완전삭제 포함) 실제 동작,
+   SmartScreen 동작, 정션·ADS가 있는 실제 사용자 폴더 완전삭제, VSS가 있는 볼륨 경고.
+ - Linux: pkexec·polkit 대화 상자, deb·AppImage 설치·업데이트, 실제 Nautilus·Nemo·Dolphin·Thunar 메뉴
+   (Nautilus 스크립트는 가짜 shield-gui로 47개 경우를 dash·bash에서 시험), btrfs/ZFS 스냅숏 감지.
+ - 저장 장치: 실제 SSD/NVMe에서 데이터가 남는지(측정 장비 없음).
+ - CI: release.yml을 GitHub에서 실행한 적이 없습니다(attestation, environment 승인, arm 러너, 서명 비밀키 주입).
+
+
+8. 2026-11-11 후속 수정 기록
+----------------------------
+- 라이선스: 루트 LICENSE와 Cargo workspace 및 네 하위 크레이트의 license.workspace 메타데이터를 Apache-2.0으로 통일했습니다. deny.toml의 허용 목록도 Apache-2.0을 포함하며 GPL-3.0-or-later 선언은 제거했습니다.
+- 완전삭제 보호: Guard::check가 선택 경로와 보호 경로를 양방향으로 비교하도록 수정했습니다. Shield 데이터 폴더 자체·조상뿐 아니라 settings, settings.key, 저널 등 내부 파일과 하위 폴더를 직접 선택하는 것도 거부하는 회귀 테스트를 추가했습니다.
+- 업데이트 롤백: 권한 상승 설치 헬퍼가 ProgramData /var/lib의 보호된 시스템 공용 상태를 검사하고 저장합니다. 시스템 상태는 비정상 UTF-8·깨진 레코드·비정규 형식을 fail-closed로 거부합니다. 별도 잠금 파일로 롤백 상태 확인·저장·설치를 직렬화하여 동시 실행이 오래된 상태로 덮어쓰지 못하게 했습니다.
+- 릴리스 키 정책: 특정 서명 부키, 만료일, 프로젝트 사용자 ID, 백업 공개키를 강제하는 태그 릴리스 게이트와 고정 지문 테스트를 제거했습니다. 유효한 공개키는 계속 필수이고, 서명된 배포에는 일치하는 서명 가능한 비밀키가 필요합니다.
+- 문서: 기존 3.1.0 최종 변경 기록의 릴리스 키 게이트 설명은 당시 이력입니다. 이 후속 수정으로 현재 필수 게이트가 아님을 README, 빌드 안내, 키 운영 문서에 명시했습니다. 라이선스와 보안 보장 범위도 동기화했습니다.
+- 검증 한계: 이번 작업 환경에는 cargo/rustc가 없어 새 Rust 코드와 테스트를 재빌드·재실행하지 못했습니다. 따라서 새 테스트가 통과했다고 주장하지 않습니다. 셸 문법·정적 문자열/문서 대조는 별도로 수행하고, 최종 Windows/Linux 전체 테스트와 clippy는 Rust 도구가 있는 CI에서 실행해야 합니다. GitHub Actions, UAC/pkexec, 실제 MSI/deb/AppImage 설치도 이 환경에서 실기 검증하지 않았습니다.
+
+
+9. 2026-11-21 후속 점검 (완전삭제 설정 비밀번호 추가와 함께)
+-----------------------------------------------------------
+범위: 완전삭제(secure_delete, wipe_view, wipe_cmd, 플랫폼 erase), 설정 비밀번호·MAC(settings, settings_auth),
+권한 상승 업데이트 헬퍼(update::helper_main·parse_helper_args·copy_inputs·verify_copies, linux/install.rs),
+아카이브 풀기(archive::extract·make_dirs). 방법은 소스 읽기와 회귀 테스트이며 외부 감사가 아닙니다.
+
+ ID    등급  CWE        위치                                   설명 / 조치 / 테스트                                  상태
+ S-11  하    CWE-59     shield-core/src/secure_delete.rs       링크를 직접 고르면 그 경로를 해석하지 않고 썼습니다. 상위 폴더가   수정
+                                                               링크인 경로(~/x/name, ~/x -> /usr/lib)는 차단 목록 검사를 그
+                                                               문자열로 통과했고, 1단계 경고에도 실제로 지워지는 위치
+                                                               (/usr/lib/name)가 아닌 경로가 보였습니다("실제 경로 표시" 원칙
+                                                               위반). 일반 사용자 권한이면 그 폴더를 쓸 수 없어 피해가 작지만,
+                                                               sudo/관리자 콘솔에서는 시스템 폴더의 링크를 지울 수 있었습니다.
+                                                               링크의 상위 폴더를 canonicalize하고 이름만 유지, 해석한 경로가
+                                                               같은 링크(파일 ID)인지 다시 확인.
+                                                               테스트: a_selected_link_is_checked_and_shown_where_it_really_is
+ S-12  중    CWE-284    shield-core/src/settings_auth.rs        새 보호 값을 기존 방식대로 넣었다면 생겼을 우회 두 가지를 설계에서  예방
+             CWE-354    settings.rs                            막았습니다. (1) "보호 값을 안전한 기본값으로 되돌리기는 비밀번호
+                                                               없이 허용" 규칙: 기본값을 꺼짐으로 했다면 [보안 초기화] 한 번으로
+                                                               비밀번호 없이 보호를 끌 수 있었음 -> 기본값 켜짐. (2) 3.0.0 v1 MAC
+                                                               호환 경로는 3.0.0이 몰랐던 값을 검사하지 않음: v1 MAC 파일에
+                                                               "= false"를 써 넣어도 통과했을 것 -> v1 MAC도 mac_text(새 값
+                                                               포함)로 계산. protected_text(3.0.0 MAC 입력)는 바꾸지 않음.
+                                                               테스트: the_secure_delete_password_switch_is_protected,
+                                                               switching_secure_delete_off_by_editing_the_file_is_noticed,
+                                                               compat_tests(3.0.0 MAC 입력 그대로)
+
+새 기능의 위협 모델: 완전삭제 전에 설정 비밀번호를 묻는 것은 잠기지 않은 PC 앞의 다른 사람이 Shield로 파일을 지우는
+것을 막습니다. 같은 사용자 권한의 프로그램(R-1)은 Shield 없이 파일을 지울 수 있고, 설정 파일을 지우면(비밀번호 분실
+복구) 다음 실행부터 이 단계가 없어집니다. 이 둘은 막지 않습니다(설정 화면과 docs/10 2-5에 고지).
+구조: execute()가 봉인된 WipePermit을 요구하고(compile_fail 문서 테스트) permit()만 만들며, 실행마다 새로 필요합니다.
+콘솔은 터미널 입력만 받아 스크립트가 건너뛸 수 없습니다.
+
+다시 확인했지만 고칠 것을 찾지 못한 곳: 업데이트 헬퍼(인자 소유자·링크·크기 검사, 사본만 검증·설치, 롤백 기준 잠금),
+아카이브 풀기(사용자 전용 준비 폴더, entry_ok·dup_key, create_new, 선언 크기 상한), 설정 키 파일(핸들로 소유자·권한
+확인), 완전삭제 실행(핸들 기준 재확인·이름 변경 후 삭제). 남은 작은 경쟁 조건: remove_link·remove_dir는 파일 ID를
+확인한 뒤 경로로 지웁니다. 그 사이 같은 이름을 바꿔 넣으려면 그 폴더에 쓸 수 있어야 하므로(그 사람은 직접 지울 수
+있음) 수용합니다.

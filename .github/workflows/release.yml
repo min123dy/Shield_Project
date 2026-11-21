@@ -1,14 +1,36 @@
-# Shield release build: Windows (MSI, portable, console) and Linux x86_64 / aarch64 (deb, AppImage,
-# static console), one signed release manifest, GitHub release on a vX.Y.Z tag.
+# Shield release build (3.1.0 #2): building and signing are separate jobs.
 #
-# Repository secrets (Settings > Secrets and variables > Actions), never files in the repository:
-#   SHIELD_GPG_KEY         armored secret SIGNING SUBKEY only (gpg --export-secret-subkeys --armor <fpr>!)
-#   SHIELD_GPG_PASSPHRASE  its passphrase
-# Repository variables (optional):
-#   APPIMAGETOOL_URL / APPIMAGETOOL_SHA256   pinned appimagetool; without both no AppImage is built
-# The key is imported into a throwaway GNUPGHOME under RUNNER_TEMP and deleted at the end of each
-# job; the passphrase only reaches gpg through a 0600 file in that folder. Nothing secret is echoed
-# (GitHub also masks secret values in logs). Without the secrets the build runs unsigned.
+#   audit           cargo audit --deny warnings, cargo deny (no secrets); signing-key topology is
+#                   optional hardening, not a build/release prerequisite (docs/07)
+#   build-*         tests, clippy and cargo builds, programs uploaded with a build
+#                   provenance attestation (no secrets, no signing)
+#   sign-binaries   checks each program's attestation (gh attestation verify: built by this
+#                   workflow in this repository, same SHA-256), then detached signatures
+#                   (environment release-signing; no cargo, no package installs, no third-party
+#                   actions)
+#   package-*       MSI / portable / deb / AppImage / console from the uploaded programs and their
+#                   .sig files, per-platform manifest lines (no secrets, no cargo build)
+#   sign-release    release manifests v1 ("Shield release manifest 1", what 3.0.0 reads) and v2
+#                   (3.1.0 final: release_id, issued_at, expires_at = +365 days,
+#                   min_allowed_version, revoked keys from keys/revoked_keys.txt), signatures of
+#                   every package and manifest, SHA256SUMS (environment release-signing)
+#   publish         GitHub release from the signed files (contents: write; no secrets),
+#                   provenance attestation of the published files
+#
+# Secrets live only in the environment "release-signing" (Settings > Environments; add required
+# reviewers and restrict it to v* tags there):
+#   SHIELD_GPG_KEY         armored secret key material for the public key in keys/release_key.asc;
+#                          a dedicated signing subkey is recommended but not required
+#   SHIELD_GPG_PASSPHRASE  its passphrase (reaches gpg on file descriptor 0, never a file)
+# The offline backup key (docs/07) is never given to CI.
+# Repository variables (optional): APPIMAGETOOL_URL / APPIMAGETOOL_SHA256 (pinned appimagetool);
+# SHIELD_ATTESTATIONS=off only where artifact attestations are unavailable (private repository
+# without GitHub Enterprise Cloud), which also drops the check before signing (docs/07).
+# Variables reach scripts only through env:, never as ${{ vars.* }} inside run: (injection).
+# Runner images are pinned (windows-2022, ubuntu-24.04[-arm]); the Rust toolchain is pinned by
+# rust-toolchain.toml.
+# workflow_dispatch builds and packages unsigned and publishes nothing.
+# Actions are pinned to commit SHAs (dependabot proposes updates); the tag is in the comment.
 name: release
 on:
   push:
@@ -18,115 +40,272 @@ permissions:
   contents: read
 
 jobs:
-  windows:
-    runs-on: windows-latest
-    env:
-      HAS_KEY: ${{ secrets.SHIELD_GPG_KEY != '' }}
+  audit:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Import signing key
-        if: ${{ env.HAS_KEY == 'true' }}
-        shell: pwsh
-        env:
-          KEY: ${{ secrets.SHIELD_GPG_KEY }}
-          PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: cargo audit / cargo deny (pinned tool versions)
         run: |
-          $h = Join-Path $env:RUNNER_TEMP "gnupg"; New-Item -ItemType Directory $h | Out-Null
-          [IO.File]::WriteAllText("$h\pp", $env:PASS)
-          [IO.File]::WriteAllText("$h\gpg.conf", "pinentry-mode loopback`npassphrase-file $($h -replace '\\','/')/pp`n")
-          $env:KEY | gpg --homedir $h --batch --import 2>&1 | Out-Null
-          "GPG_HOME=$h" >> $env:GITHUB_ENV
-          "SIGN=-Sign" >> $env:GITHUB_ENV
-      - name: Build
-        shell: pwsh
+          cargo install --locked cargo-audit --version 0.22.2
+          cargo install --locked cargo-deny --version 0.20.2
+          cargo audit --deny warnings
+          cargo deny --locked check advisories bans sources licenses
+      - name: Advisory exceptions are not past their review date
         run: |
-          $sign = if ($env:SIGN) { @{ Sign = $true; GpgHome = $env:GPG_HOME } } else { @{ NoSign = $true } }
-          .\build.ps1 -RepoUrl "https://github.com/${{ github.repository }}" -Variants msi,portable,console -NoUpx @sign
-      - name: Remove key
-        if: always()
-        shell: pwsh
-        run: if ($env:GPG_HOME) { gpgconf --homedir $env:GPG_HOME --kill gpg-agent; Remove-Item -Recurse -Force $env:GPG_HOME }
-      - uses: actions/upload-artifact@v4
-        with: { name: windows, path: dist/ }
+          set -euo pipefail
+          today=$(date -u +%F); n=0
+          for id in $(grep -oE '^ *"RUSTSEC-[0-9]{4}-[0-9]{4}"' .cargo/audit.toml | tr -d ' "'); do
+            d=$(grep -E "\"$id\"" .cargo/audit.toml | grep -oE 'review-by [0-9]{4}-[0-9]{2}-[0-9]{2}' | cut -d' ' -f2)
+            [ -n "$d" ] || { echo "$id: no review-by date" >&2; exit 1; }
+            [[ "$d" > "$today" ]] || { echo "$id: review date $d has passed (.cargo/audit.toml, deny.toml)" >&2; exit 1; }
+            n=$((n + 1))
+          done
+          echo "$n exceptions within their review date"
 
-  linux:
+
+  build-windows:
+    needs: audit
+    runs-on: windows-2022
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: clippy (warnings are errors)
+        run: cargo clippy --workspace --release --locked --all-targets -- -D warnings
+      - name: Build (tests, programs)
+        shell: pwsh
+        run: .\build.ps1 -Stage build -NoSign -RepoUrl "https://github.com/$env:GITHUB_REPOSITORY" -Variants msi,portable,console -BinDir "$env:RUNNER_TEMP\bin"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ github.event_name == 'push' && vars.SHIELD_ATTESTATIONS != 'off' }}
+        with: { subject-path: "${{ runner.temp }}/bin/*.exe" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: bin-windows, path: "${{ runner.temp }}/bin/", if-no-files-found: error }
+
+  build-linux:
+    needs: audit
     strategy:
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
-    env:
-      HAS_KEY: ${{ secrets.SHIELD_GPG_KEY != '' }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libgtk-3-dev libxkbcommon-dev libwayland-dev libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libgl1-mesa-dev musl-tools dpkg-dev file
           rustup target add "$(uname -m)-unknown-linux-musl"
+      - name: clippy (warnings are errors; Linux-only code)
+        run: cargo clippy --workspace --release --locked --all-targets -- -D warnings
+      - name: Build (tests, programs, icons, static console)
+        run: ./build.sh --stage build --no-sign --repo "https://github.com/$GITHUB_REPOSITORY" --variants deb,appimage,console --bin-dir "$RUNNER_TEMP/bin"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ github.event_name == 'push' && vars.SHIELD_ATTESTATIONS != 'off' }}
+        with: { subject-path: "${{ runner.temp }}/bin/shield*" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: "bin-linux-${{ matrix.runner }}", path: "${{ runner.temp }}/bin/", if-no-files-found: error }
+
+  sign-binaries:
+    needs: [build-windows, build-linux]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: release-signing
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with: { sparse-checkout: keys, sparse-checkout-cone-mode: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: "bin-*", path: bins }
+      - name: Check the build attestations (before any secret is loaded)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTEST: ${{ vars.SHIELD_ATTESTATIONS }}
+        run: |
+          set -euo pipefail
+          [ "${ATTEST:-on}" = off ] && { echo "attestations off (SHIELD_ATTESTATIONS)"; exit 0; }
+          n=0
+          for f in bins/*/shield bins/*/shield-gui bins/*/shield.exe bins/*/shield-gui.exe; do
+            [ -f "$f" ] || continue
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" >/dev/null
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "no programs to check" >&2; exit 1; }
+      - name: Sign the programs
+        env:
+          KEY: ${{ secrets.SHIELD_GPG_KEY }}
+          PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          h="$RUNNER_TEMP/gnupg"; v="$RUNNER_TEMP/verify"; mkdir -m 700 "$h" "$v"
+          trap 'gpgconf --homedir "$h" --kill gpg-agent || true; rm -rf "$h" "$v"' EXIT
+          printf '%s\n' "$KEY" | gpg --homedir "$h" --batch --import >/dev/null 2>&1
+          gpg --homedir "$v" --batch --import keys/release_key.asc >/dev/null 2>&1
+          fpr=$(gpg --homedir "$v" --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print $10; exit}')
+          mkdir sigs
+          for d in bins/*; do
+            p=$(basename "$d"); mkdir -p "sigs/$p"
+            for f in "$d"/shield "$d"/shield-gui "$d"/shield.exe "$d"/shield-gui.exe; do
+              [ -f "$f" ] || continue
+              printf '%s' "$PASS" | gpg --homedir "$h" --batch --pinentry-mode loopback --passphrase-fd 0 \
+                  --local-user "$fpr" --digest-algo SHA512 --detach-sign --output "sigs/$p/$(basename "$f").sig" "$f"
+              gpg --homedir "$v" --batch --status-fd 1 --verify "sigs/$p/$(basename "$f").sig" "$f" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG .*$fpr"
+            done
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: sigs, path: sigs/, if-no-files-found: error }
+
+  package-windows:
+    needs: [build-windows, sign-binaries]
+    if: ${{ !cancelled() && needs.build-windows.result == 'success' && needs.sign-binaries.result != 'failure' }}
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: bin-windows, path: "${{ runner.temp }}/bin" }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: ${{ needs.sign-binaries.result == 'success' }}
+        with: { name: sigs, path: "${{ runner.temp }}/sigs" }
+      - name: Package and manifest lines
+        shell: pwsh
+        run: |
+          $s = Join-Path $env:RUNNER_TEMP "sigs\bin-windows"
+          if (Test-Path $s) { Copy-Item "$s\*.sig" "$env:RUNNER_TEMP\bin\" }
+          .\build.ps1 -Stage package -NoSign -RepoUrl "https://github.com/$env:GITHUB_REPOSITORY" -Variants msi,portable,console -NoUpx -BinDir "$env:RUNNER_TEMP\bin"
+          .\build.ps1 -Stage manifest -NoSign -RepoUrl "https://github.com/$env:GITHUB_REPOSITORY" -Variants msi,portable,console -BinDir "$env:RUNNER_TEMP\bin"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: dist-windows, path: dist/, if-no-files-found: error }
+
+  package-linux:
+    needs: [build-linux, sign-binaries]
+    if: ${{ !cancelled() && needs.build-linux.result == 'success' && needs.sign-binaries.result != 'failure' }}
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: "bin-linux-${{ matrix.runner }}", path: "${{ runner.temp }}/bin" }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: ${{ needs.sign-binaries.result == 'success' }}
+        with: { name: sigs, path: "${{ runner.temp }}/sigs" }
+      - name: Packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev file
       - name: appimagetool (pinned)
         if: ${{ vars.APPIMAGETOOL_URL != '' && vars.APPIMAGETOOL_SHA256 != '' }}
+        env:
+          URL: ${{ vars.APPIMAGETOOL_URL }}
+          SHA: ${{ vars.APPIMAGETOOL_SHA256 }}
         run: |
-          curl -fsSL --proto '=https' -o "$RUNNER_TEMP/appimagetool" "${{ vars.APPIMAGETOOL_URL }}"
-          echo "${{ vars.APPIMAGETOOL_SHA256 }}  $RUNNER_TEMP/appimagetool" | sha256sum -c -
+          set -euo pipefail
+          case "$URL" in https://*) ;; *) echo "APPIMAGETOOL_URL must be https" >&2; exit 1 ;; esac
+          printf '%s' "$SHA" | grep -Eq '^[0-9a-f]{64}$' || { echo "APPIMAGETOOL_SHA256: 64 lower-case hex digits" >&2; exit 1; }
+          curl -fsSL --proto '=https' --proto-redir '=https' -o "$RUNNER_TEMP/appimagetool" "$URL"
+          echo "$SHA  $RUNNER_TEMP/appimagetool" | sha256sum -c -
           chmod 0755 "$RUNNER_TEMP/appimagetool"
           echo "APPIMAGETOOL=$RUNNER_TEMP/appimagetool" >> "$GITHUB_ENV"
           echo "VARIANTS=deb,appimage,console" >> "$GITHUB_ENV"
-      - name: Import signing key
-        if: ${{ env.HAS_KEY == 'true' }}
+      - name: Package and manifest lines
+        env:
+          MATRIX_RUNNER: ${{ matrix.runner }}
+        run: |
+          s="$RUNNER_TEMP/sigs/bin-linux-$MATRIX_RUNNER"
+          [ -d "$s" ] && cp "$s"/*.sig "$RUNNER_TEMP/bin/"
+          chmod 0755 "$RUNNER_TEMP/bin/"shield* || true
+          r="https://github.com/$GITHUB_REPOSITORY"
+          ./build.sh --stage package --no-sign --repo "$r" --variants "${VARIANTS:-deb,console}" --bin-dir "$RUNNER_TEMP/bin"
+          ./build.sh --stage manifest --no-sign --repo "$r" --variants "${VARIANTS:-deb,console}" --bin-dir "$RUNNER_TEMP/bin"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: "dist-linux-${{ matrix.runner }}", path: dist/, if-no-files-found: error }
+
+  sign-release:
+    needs: [package-windows, package-linux]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with: { sparse-checkout: keys, sparse-checkout-cone-mode: false }
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { pattern: "dist-*", path: parts }
+      - name: One manifest for all packages
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"; mkdir out
+          for d in parts/*; do for f in "$d"/*; do
+            case "$(basename "$f")" in Shield_v*_release.txt*|Shield_v*_release_v2.txt*|SHA256SUMS.txt|VERIFY.txt|*.sig) ;; *) cp -n "$f" out/ ;; esac
+          done; done
+          # format unchanged (3.0.0 clients parse it): header, version, then only "sha256 <hex> <name>"
+          { echo "Shield release manifest 1"; echo "version $v"
+            cat parts/*/Shield_v"${v}"_release.txt | grep -E '^sha256 [0-9a-f]{64} [^[:space:]]+$' | sort -u | sort -k3,3; } > "out/Shield_v${v}_release.txt"
+          [ "$(tail -n +3 "out/Shield_v${v}_release.txt" | awk '{print $3}' | sort | uniq -d)" = "" ] || { echo "one name, two hashes" >&2; exit 1; }
+          # every listed hash must match the file that is published
+          (cd out && tail -n +3 "Shield_v${v}_release.txt" | awk '{print $2"  "$3}' | sha256sum -c -)
+          # v2 (3.1.0 final, update::manifest2): same hash lines, plus validity and revocation
+          rev=keys/revoked_keys.txt
+          if [ -f "$rev" ]; then
+            ! grep -Ev '^([0-9A-F]{40})?$|^#' "$rev" | grep -q . || { echo "$rev: one 40-digit upper-case fingerprint per line" >&2; exit 1; }
+          fi
+          now=$(date -u +%s)
+          { echo "Shield release manifest 2"; echo "version $v"; echo "release_id $now"; echo "issued_at $now"
+            echo "expires_at $((now + 365 * 86400))"; echo "min_allowed_version $v"
+            [ -f "$rev" ] && grep -E '^[0-9A-F]{40}$' "$rev" | sort -u | sed 's/^/revoked_key /'
+            tail -n +3 "out/Shield_v${v}_release.txt"; } > "out/Shield_v${v}_release_v2.txt"
+          [ "$(grep '^sha256 ' "out/Shield_v${v}_release_v2.txt")" = "$(tail -n +3 "out/Shield_v${v}_release.txt")" ]
+      - name: Sign packages and manifest
         env:
           KEY: ${{ secrets.SHIELD_GPG_KEY }}
           PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
         run: |
-          h="$RUNNER_TEMP/gnupg"; mkdir -m 700 "$h"
-          ( umask 077; printf '%s' "$PASS" > "$h/pp"; printf 'pinentry-mode loopback\npassphrase-file %s/pp\n' "$h" > "$h/gpg.conf" )
+          set -euo pipefail
+          h="$RUNNER_TEMP/gnupg"; vh="$RUNNER_TEMP/verify"; mkdir -m 700 "$h" "$vh"
+          trap 'gpgconf --homedir "$h" --kill gpg-agent || true; rm -rf "$h" "$vh"' EXIT
           printf '%s\n' "$KEY" | gpg --homedir "$h" --batch --import >/dev/null 2>&1
-          echo "GPG_HOME=$h" >> "$GITHUB_ENV"
-      - name: Build
-        run: |
-          s=--no-sign; [ -n "${GPG_HOME:-}" ] && s="--sign --gpg-home $GPG_HOME"
-          SHIELD_VARIANTS=${VARIANTS:-deb,console} ./build.sh --repo "https://github.com/${{ github.repository }}" $s
-      - name: Remove key
-        if: always()
-        run: '[ -z "${GPG_HOME:-}" ] || { gpgconf --homedir "$GPG_HOME" --kill gpg-agent || true; rm -rf "$GPG_HOME"; }'
-      - uses: actions/upload-artifact@v4
-        with: { name: "linux-${{ matrix.runner }}", path: dist/ }
+          gpg --homedir "$vh" --batch --import keys/release_key.asc >/dev/null 2>&1
+          fpr=$(gpg --homedir "$vh" --batch --with-colons --fingerprint | awk -F: '/^fpr:/ {print $10; exit}')
+          for f in out/*; do
+            printf '%s' "$PASS" | gpg --homedir "$h" --batch --pinentry-mode loopback --passphrase-fd 0 \
+                --local-user "$fpr" --digest-algo SHA512 --detach-sign --output "$f.sig" "$f"
+            gpg --homedir "$vh" --batch --status-fd 1 --verify "$f.sig" "$f" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG .*$fpr"
+          done
+          cp keys/release_key.asc out/
+          { echo "Shield ${GITHUB_REF_NAME}: signing key (primary) fingerprint $fpr"
+            echo "Compare it with the fingerprint the developer published elsewhere."
+            echo "Verify:  shield verify <file> <file>.sig --key release_key.asc"
+            echo "   or:   gpg --import release_key.asc && gpg --verify <file>.sig <file>"; } > out/VERIFY.txt
+          (cd out && sha256sum * > SHA256SUMS.txt)
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with: { name: release, path: out/, if-no-files-found: error }
 
-  release:
-    needs: [windows, linux]
-    if: startsWith(github.ref, 'refs/tags/v')
+  publish:
+    needs: sign-release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
-        with: { path: parts }
-      - name: One manifest for all packages
-        run: |
-          v="${GITHUB_REF_NAME#v}"; mkdir out
-          for d in parts/*; do for f in "$d"/*; do
-            case "$(basename "$f")" in Shield_v*_release.txt*|SHA256SUMS.txt|VERIFY.txt) ;; *) cp -n "$f" out/ ;; esac
-          done; done
-          { echo "Shield release manifest 1"; echo "version $v"
-            cat parts/*/Shield_v"${v}"_release.txt | grep '^sha256 ' | sort -u -k3; } > "out/Shield_v${v}_release.txt"
-          # every listed hash must match the file that is published
-          (cd out && grep '^sha256 ' "Shield_v${v}_release.txt" | awk '{print $2"  "$3}' | sha256sum -c -)
-      - name: Sign the manifest
-        env:
-          KEY: ${{ secrets.SHIELD_GPG_KEY }}
-          PASS: ${{ secrets.SHIELD_GPG_PASSPHRASE }}
-        run: |
-          v="${GITHUB_REF_NAME#v}"
-          [ -n "$KEY" ] || { echo "no signing key: release without manifest signature (updates will refuse it)" >&2; exit 0; }
-          h="$RUNNER_TEMP/gnupg"; mkdir -m 700 "$h"
-          ( umask 077; printf '%s' "$PASS" > "$h/pp" )
-          printf '%s\n' "$KEY" | gpg --homedir "$h" --batch --import >/dev/null 2>&1
-          gpg --homedir "$h" --batch --pinentry-mode loopback --passphrase-file "$h/pp" --digest-algo SHA512 \
-              --detach-sign --output "out/Shield_v${v}_release.txt.sig" "out/Shield_v${v}_release.txt"
-          gpgconf --homedir "$h" --kill gpg-agent || true; rm -rf "$h"
-      - name: Checksums and release
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { name: release, path: out }
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        if: ${{ vars.SHIELD_ATTESTATIONS != 'off' }}
+        with: { subject-path: "out/*" }
+      - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          (cd out && sha256sum * > SHA256SUMS.txt)
-          gh release create "$GITHUB_REF_NAME" out/* --repo "${{ github.repository }}" --title "Shield ${GITHUB_REF_NAME}" --notes "Verify: shield verify <file> <file>.sig  (see VERIFY.txt in each build)"
+          gh release create "$GITHUB_REF_NAME" out/* --repo "$GITHUB_REPOSITORY" \
+            --title "Shield ${GITHUB_REF_NAME}" \
+            --notes "Verify: shield verify <file> <file>.sig  (fingerprint: shield version)"

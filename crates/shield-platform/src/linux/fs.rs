@@ -2,7 +2,8 @@
 //! (RENAME_NOREPLACE), replace-and-keep-the-old-fd, checked unlink, lock files, and user extended
 //! attributes as the counterpart of NTFS streams (`user.xdg.origin.url` = download mark).
 
-use crate::{FileId, MotwReport, PResult, PlatformError, Retained, Stream};
+pub use super::erase::{clear_readonly, ensure_data_dir, open_attrs, entry_info, entry_info_at, entry_info_of, is_mount_point, is_reparse_other, mount_points, open_exclusive, private_file_ok, protected, wipe_notes};
+use crate::{FileId, MotwReport, NOREPLACE_DIR_REFUSED, PResult, PlatformError, Retained, Stream};
 use std::{
     ffi::CString,
     fs::{self, File, OpenOptions},
@@ -58,6 +59,101 @@ pub fn final_path(f: &File) -> io::Result<PathBuf> {
     fs::read_link(format!("/proc/self/fd/{}", f.as_raw_fd()))
 }
 
+fn cname(name: &std::ffi::OsStr) -> io::Result<CString> {
+    let b = name.as_bytes();
+    if b.is_empty() || b == b"." || b == b".." || b.contains(&b'/') {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a single entry name"));
+    }
+    CString::new(b).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in name"))
+}
+
+/// Names in the folder behind the held handle `dir` (fdopendir on a duplicate of its fd), so the
+/// folder read is the one that was checked, whatever happens to its path (3.1.0 #10). `_path` is
+/// unused here (Windows lists by path while the held folder can't be renamed).
+pub fn list_dir_held(dir: &File, _path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::{ffi::OsStringExt, io::AsRawFd};
+    let fd = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let d = unsafe { libc::fdopendir(fd) };
+    if d.is_null() {
+        let x = io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(x);
+    }
+    // the duplicate shares the read position with `dir`: start from the beginning
+    unsafe { libc::rewinddir(d) };
+    let mut out = Vec::new();
+    let res = loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let ent = unsafe { libc::readdir(d) };
+        if ent.is_null() {
+            let x = io::Error::last_os_error();
+            break if x.raw_os_error().unwrap_or(0) == 0 { Ok(()) } else { Err(x) };
+        }
+        let n = unsafe { std::ffi::CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+        if n != b"." && n != b".." {
+            out.push(std::ffi::OsString::from_vec(n.to_vec()));
+        }
+    };
+    unsafe { libc::closedir(d) }; // also closes fd
+    res.map(|()| out)
+}
+
+/// Kind of the entry `name` of the held folder `dir`, without following a link (fstatat
+/// AT_SYMLINK_NOFOLLOW relative to the handle).
+pub fn entry_kind_at(dir: &File, name: &std::ffi::OsStr, _path: &Path) -> io::Result<crate::EntryKind> {
+    use std::os::unix::io::AsRawFd;
+    let c = cname(name)?;
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(match st.st_mode & libc::S_IFMT {
+        libc::S_IFLNK => crate::EntryKind::Link,
+        libc::S_IFDIR => crate::EntryKind::Dir,
+        libc::S_IFREG => crate::EntryKind::File,
+        _ => crate::EntryKind::Other,
+    })
+}
+
+fn open_at(dir: &File, name: &std::ffi::OsStr, flags: libc::c_int) -> io::Result<File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    let c = cname(name)?;
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Opens and holds the sub-folder `name` of the held folder `dir` (openat O_DIRECTORY|O_NOFOLLOW).
+pub fn open_dir_at(dir: &File, name: &std::ffi::OsStr, _path: &Path) -> io::Result<File> {
+    open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY)
+}
+
+/// Opens the file `name` of the held folder `dir` for reading (openat O_NOFOLLOW|O_NONBLOCK, so a
+/// FIFO put in its place can't block) and refuses anything that is not a regular file.
+pub fn open_file_at(dir: &File, name: &std::ffi::OsStr, _path: &Path) -> io::Result<File> {
+    let f = open_at(dir, name, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
+/// Opens `p` for reading as a regular file only: O_NOFOLLOW|O_NONBLOCK (a FIFO can't block the
+/// open), then fstat on the handle. Folders, devices, FIFOs, sockets and links are refused
+/// (3.1.0 #14: "open in Shield" now receives any path).
+pub fn open_regular(p: &Path) -> io::Result<File> {
+    let f = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p)?;
+    if !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
+}
+
 pub fn create_private_file(p: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(p)
 }
@@ -89,8 +185,7 @@ fn sync_dir(p: &Path) {
 }
 
 /// rename(2) that fails with AlreadyExists instead of replacing (renameat2 RENAME_NOREPLACE).
-/// File systems without renameat2 fall back to link + unlink for files; folders then use a
-/// checked rename (small race, documented).
+/// File systems without renameat2 fall back to `rename_noreplace_fallback`.
 pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let (a, b) = (cpath(from)?, cpath(to)?);
     let r = unsafe { libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_NOREPLACE) };
@@ -102,14 +197,40 @@ pub fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     if !matches!(x.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOSYS)) {
         return Err(x);
     }
-    if fs::symlink_metadata(to).is_ok() {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
-    }
+    rename_noreplace_fallback(from, to)
+}
+
+/// Whether a folder may be moved with a plain rename(2) into a folder with this owner and mode
+/// (3.1.0 #11). Between "does the name exist" and rename(2) nobody else may be able to create the
+/// name: so only into a folder owned by this user that neither group nor others can write.
+pub fn dir_fallback_ok(parent_uid: u32, parent_mode: u32, euid: u32) -> bool {
+    parent_uid == euid && parent_mode & 0o022 == 0
+}
+
+/// Without renameat2: files are hard-linked to the new name (link(2) fails with EEXIST, so it
+/// never replaces) and then unlinked; folders only where `dir_fallback_ok` allows, otherwise the
+/// move is refused with `NOREPLACE_DIR_REFUSED`.
+pub fn rename_noreplace_fallback(from: &Path, to: &Path) -> io::Result<()> {
     if fs::symlink_metadata(from)?.is_dir() {
+        let parent = match to.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        let pm = fs::metadata(parent)?;
+        if !dir_fallback_ok(pm.uid(), pm.mode(), unsafe { libc::geteuid() }) {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, NOREPLACE_DIR_REFUSED));
+        }
+        if fs::symlink_metadata(to).is_ok() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "destination exists"));
+        }
         fs::rename(from, to)?;
     } else {
         fs::hard_link(from, to)?;
-        fs::remove_file(from)?;
+        if let Err(x) = fs::remove_file(from) {
+            // keep exactly one name: undo the link rather than leave two
+            let _ = fs::remove_file(to);
+            return Err(x);
+        }
     }
     sync_dir(to);
     Ok(())

@@ -31,6 +31,9 @@ pub const ST_REPLACE: u8 = 13;
 pub const ST_SCAN: u8 = 14;
 pub const ST_LOCK: u8 = 15;
 pub const ST_ADS: u8 = 16;
+/// Secure delete of files and folders (3.1.0 final). Cancellable: between files at once, inside a
+/// file after the current pass.
+pub const ST_WIPE: u8 = 17;
 
 pub const C_CANCELLED: &str = "E_CANCELLED";
 
@@ -75,6 +78,7 @@ pub fn stage_label(n: u8) -> &'static str {
         ST_SCAN => "stage.scan",
         ST_LOCK => "stage.lock",
         ST_ADS => "stage.ads",
+        ST_WIPE => "stage.wipe",
         _ => "stage.prepare",
     })
 }
@@ -96,6 +100,7 @@ pub fn stage_short(n: u8) -> &'static str {
         ST_SCAN => "stage_s.scan",
         ST_LOCK => "stage_s.lock",
         ST_ADS => "stage_s.ads",
+        ST_WIPE => "stage_s.wipe",
         _ => "stage_s.none",
     })
 }
@@ -128,5 +133,50 @@ impl KdfGuard {
 impl Drop for KdfGuard {
     fn drop(&mut self) {
         KDF_BUSY.store(false, Ordering::Relaxed);
+    }
+}
+
+/// Warnings from cleanup that ran in a Drop (a temporary file that could not be removed, or was
+/// left because something else had taken its name; 3.1.0 #12). Drop never panics or waits for the
+/// user; the job runners add these to the task's error message.
+#[cfg(not(test))]
+static CLEANUP_WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(not(test))]
+fn with_queue<T>(f: impl FnOnce(&mut Vec<String>) -> T) -> Option<T> {
+    CLEANUP_WARNINGS.lock().ok().map(|mut v| f(&mut v))
+}
+
+// tests run in parallel: one queue per test thread, so no test drains another's warnings
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_WARNINGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn with_queue<T>(f: impl FnOnce(&mut Vec<String>) -> T) -> Option<T> {
+    CLEANUP_WARNINGS.try_with(|v| v.try_borrow_mut().ok().map(|mut v| f(&mut v))).ok().flatten()
+}
+
+pub fn cleanup_warning(w: String) {
+    with_queue(|v| {
+        if v.len() < 32 {
+            v.push(w);
+        }
+    });
+}
+
+pub fn take_cleanup_warnings() -> Vec<String> {
+    with_queue(std::mem::take).unwrap_or_default()
+}
+
+/// `r` with the pending cleanup warnings added to an error (an Ok result leaves them queued).
+pub fn with_cleanup_warnings<T>(r: R<T>) -> R<T> {
+    match r {
+        Err(x) => {
+            let w = take_cleanup_warnings();
+            Err(if w.is_empty() { x } else { format!("{x} · {}", w.join(" · ")) })
+        }
+        ok => ok,
     }
 }

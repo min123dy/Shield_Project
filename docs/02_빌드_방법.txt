@@ -1,10 +1,10 @@
-SHIELD 3.0.0 - 빌드 방법
+SHIELD 3.1.0 - 빌드 방법
 ========================
 English: docs\en\02_build.txt
 
 1. 폴더 구조
 ------------
-Cargo.toml                워크스페이스(shield-platform, shield-core, shield-gui, shield-cli), 버전 3.0.0
+Cargo.toml                워크스페이스(shield-platform, shield-core, shield-gui, shield-cli), 버전 3.1.0
 crates\                   크레이트 4개 (01 문서 3절)
 keys\release_key.asc      내장할 릴리스 공개키 (공개키만. 비밀키는 절대 저장소에 넣지 않음)
 installer\windows\        installer.wxs, installer.ko-KR.wxl, installer.en-US.wxl
@@ -44,6 +44,8 @@ Linux     gcc, pkg-config, libgtk-3-dev, libxkbcommon-dev, libwayland-dev, libxc
   .\build.ps1                                    (모두 묻기)
   .\build.ps1 -RepoUrl https://github.com/o/r -NoSign -Variants msi,console
   .\build.ps1 -RepoUrl https://github.com/o/r -Sign -PublicKeyPath keys\release_key.asc
+  .\build.ps1 -Stage build -NoSign -RepoUrl ...  /  -Stage package  /  -Stage manifest   (CI처럼 단계별, 7절)
+  릴리스 빌드는 x86_64-pc-windows-msvc만 허용합니다(MinGW 등 다른 대상이면 중단: /DEPENDENTLOADFLAG가 MSVC 전용).
 순서: 입력 검사 -> (서명 시) 공개키 하나만 든 임시 키링, 로컬 키링에 비밀키가 있는지 확인 -> cargo test
 --workspace --release -> shield-gui.exe·shield.exe 빌드 -> 콘솔 전용 빌드(target\console) -> (서명 시)
 두 exe 서명(.sig, 설치 폴더에 함께 들어가 무결성 검사에 쓰임) -> MSI -> 포터블 -> 소스 zip -> 릴리스 매니페스트 ->
@@ -54,46 +56,115 @@ Linux     gcc, pkg-config, libgtk-3-dev, libxkbcommon-dev, libwayland-dev, libxc
   ./build.sh --repo https://github.com/o/r --no-sign
   ./build.sh --repo https://github.com/o/r --sign --variants deb,appimage,console
   ./build.sh --zig --arch aarch64 --variants console     (정적 콘솔만 교차 빌드)
+  ./build.sh --stage build --no-sign --repo ...  /  --stage package  /  --stage manifest   (단계별, 7절)
+sudo로 실행하지 마세요(루트 권한이 필요한 단계가 없음, deb는 --root-owner-group). sudo에서는 PATH·HOME이 root의 것이라
+rustup의 cargo를 찾지 못하고 target\이 root 소유가 됩니다. 3.1.0 최종의 build.sh는 sudo 실행을 처음에 거부하고,
+이전 sudo 실행이 남긴 파일이 있으면 sudo chown -R <사용자>: <폴더>를 안내하며, PATH에 없어도 ~/.cargo/bin의 cargo를
+찾습니다. root 계정 자체(컨테이너·CI)는 거부하지 않습니다.
 deb/AppImage/rpm은 이 컴퓨터의 아키텍처로만 만듭니다(GTK가 필요하므로). aarch64 패키지는 aarch64 컴퓨터나
 GitHub의 ubuntu-24.04-arm 러너에서 만듭니다. 패키지 트리: /usr/bin/shield, /usr/bin/shield-gui,
 /usr/share/applications(shield.desktop, shield-open.desktop), /usr/share/mime/packages/shield.xml,
 /usr/share/icons/hicolor/*/apps/shield.png, /usr/share/nemo/actions, /usr/share/kio/servicemenus(KF6),
 /usr/share/kservices5/ServiceMenus(KF5), /usr/share/shield(integrate.sh: 사용자별 Nautilus 스크립트·Thunar 동작),
-/usr/share/doc/shield. 서명 시 /usr/bin/shield.sig·shield-gui.sig.
+/usr/share/polkit-1/actions/com.shield.update.policy(업데이트 설치 도우미, 3.1.0 #1), /usr/share/doc/shield.
+서명 시 /usr/bin/shield.sig·shield-gui.sig. 3.1.0부터 Nemo·Dolphin·Nautilus·Thunar에 "SHIELD에서 열기"(모든 파일).
 
 6. 산출물 (dist\)
 -----------------
-  Shield_v3.0.0_x64.msi                  Windows 설치 파일 (shield-gui.exe + shield.exe, PATH 추가)
-  Shield_v3.0.0_x64_portable.exe         Windows 포터블 GUI
-  shield-console_v3.0.0_windows_x64.exe  Windows 콘솔 전용 (GUI 의존성 없음)
-  shield_v3.0.0_amd64.deb / _arm64.deb   Debian·Ubuntu 패키지
-  Shield_v3.0.0_x86_64.AppImage / _aarch64.AppImage
-  shield-console_v3.0.0_linux_x64 / _linux_arm64   musl 정적 콘솔
-  shield_v3.0.0_x86_64.rpm               선택
-  Shield_Project_v3_0_0.zip              소스 (target, dist, .git, 비밀키·.env 등 제외. 비밀키 블록이 보이면 중단)
-  Shield_v3.0.0_release.txt              릴리스 매니페스트 (업데이트가 검사)
+  Shield_v3.1.0_x64.msi                  Windows 설치 파일 (shield-gui.exe + shield.exe, PATH 추가)
+  Shield_v3.1.0_x64_portable.exe         Windows 포터블 GUI
+  shield-console_v3.1.0_windows_x64.exe  Windows 콘솔 전용 (GUI 의존성 없음)
+  shield_v3.1.0_amd64.deb / _arm64.deb   Debian·Ubuntu 패키지
+  Shield_v3.1.0_x86_64.AppImage / _aarch64.AppImage
+  shield-console_v3.1.0_linux_x64 / _linux_arm64   musl 정적 콘솔
+  shield_v3.1.0_x86_64.rpm               선택
+  Shield_Project_v3.1.0.zip              소스 (target, dist, .git, 비밀키·.env 등 제외. 비밀키 블록이 보이면 중단)
+  Shield_v3.1.0_release.txt              릴리스 매니페스트 v1 (3.0.0·이전 3.1.0 빌드가 읽음, 형식 고정)
+  Shield_v3.1.0_release_v2.txt           릴리스 매니페스트 v2 (3.1.0 최종 이상이 읽음, 3.1.0 최종에서 추가)
   각 파일의 .sig, 공개키 .asc, VERIFY.txt (서명 시), SHA256SUMS.txt (항상)
-매니페스트 형식 (LF, 업데이트가 정확히 이 형식만 받습니다):
+매니페스트 v1 형식 (LF, 3.0.0 파서가 정확히 이 형식만 받으므로 바꾸지 않습니다):
   Shield release manifest 1
-  version 3.0.0
+  version 3.1.0
   sha256 <64자 소문자 16진수> <파일 이름>
-업데이트는 매니페스트 서명 -> 버전(태그와 같고 현재보다 높아야 함) -> 패키지 SHA-256 -> 패키지 서명을 모두
-확인합니다. Windows와 Linux를 따로 빌드했다면 한쪽 매니페스트를 -MergeManifest/--merge-manifest로 넘겨
+매니페스트 v2 형식 (LF, 서명 대상은 파일 전체, update::manifest2):
+  Shield release manifest 2
+  version 3.1.0
+  release_id <정수, 릴리스마다 증가; 스크립트는 빌드 시각(초)>
+  issued_at <유닉스 초>
+  expires_at <유닉스 초; 스크립트는 +365일, 클라이언트 허용 최대 400일>
+  min_allowed_version 3.1.0
+  revoked_key <40자리 대문자 지문>   (keys\revoked_keys.txt의 줄마다, 없으면 생략, 최대 64개)
+  sha256 <64자 소문자 16진수> <파일 이름>
+업데이트(3.1.0 최종)는 v2 매니페스트 서명 -> 발행·만료(시계 허용 24시간) -> 버전(태그와 같고 현재보다 높고
+min_allowed_version 이상) -> 폐기 키 -> 롤백(update_seen.txt의 최고 release_id) -> 패키지 SHA-256 -> 패키지 서명을
+모두 확인합니다. v2가 없거나 하나라도 실패하면 설치하지 않고 릴리스 페이지 링크만 보여 줍니다. v2는 365일 뒤 만료되므로
+1년 안에 새 릴리스가 없으면 다시 만들어 서명해야 합니다(docs/07 5절).
+- 빌드 경로 재매핑(3.1.0 최종): build.ps1/build.sh는 target\remap-paths.toml(cargo 설정 파일)을 만들어 모든 cargo
+  build/test/run에 --config로 넘깁니다. --remap-path-prefix로 사용자 홈(~), CARGO_HOME(/cargo), RUSTUP_HOME(/rustup),
+  저장소 루트(/shield)를 바꿔 실행 파일의 panic 위치 문자열에 계정 이름·로컬 경로가 남지 않습니다(docs/09 S-05).
+  플래그 환경 변수를 쓰지 않는 이유: 그 변수는 .cargo\config.toml의 rustflags(crt-static)를 대신하므로 C 런타임이
+  다시 DLL(vcruntime140.dll)로 링크됩니다. cargo는 설정 파일끼리의 target.<cfg>.rustflags는 합칩니다. 스크립트 없이
+  cargo build만 하면 재매핑되지 않습니다.
+- 릴리스 키 점검(3.1.0 최종): build.ps1/build.sh는 테스트 뒤 기본 키 경로(keys\release_key.asc)일 때
+  공개키 형식·파싱·비밀키 포함 여부만 검사합니다. 특정 키 구성(서명 부키, 만료일, 사용자 ID, 백업 공개키)은 빌드
+  게이트가 아닙니다. 서명 빌드에는 내장 공개키와 일치하는 서명 가능한 비밀키가 필요합니다.
+- build.sh는 테스트 단계에서 installer/linux/tests/nautilus_scripts_test.sh(Nautilus 스크립트 경로 처리 47개)도
+  실행합니다. Windows와 Linux를 따로 빌드했다면 한쪽 매니페스트를 -MergeManifest/--merge-manifest로 넘겨
 한 매니페스트로 합친 뒤 서명하세요. GitHub 릴리스에는 업데이트용 파일 이름이 위 표와 같아야 합니다.
 
-7. GitHub Actions (.github\workflows\release.yml)
-------------------------------------------------
-- windows(windows-latest), linux(ubuntu-24.04, ubuntu-24.04-arm) 작업이 빌드하고, vX.Y.Z 태그일 때 release
-  작업이 매니페스트를 하나로 합쳐(모든 해시를 실제 파일과 대조) 서명한 뒤 gh release create로 올립니다.
-- 시크릿 사용 방식 (서명 개인키는 절대 저장소에 넣지 않습니다):
-  SHIELD_GPG_KEY         서명 부키만: gpg --armor --export-secret-subkeys <지문>!  (주 키 비밀키는 넣지 않음)
-  SHIELD_GPG_PASSPHRASE  그 비밀번호
-  각 작업은 RUNNER_TEMP 아래 임시 GNUPGHOME에 가져오고, 비밀번호는 그 폴더의 0600 파일로만 gpg에 전달하며,
-  작업 끝에 폴더를 지웁니다. 시크릿 값은 echo하지 않습니다(GitHub도 로그에서 가립니다).
-  시크릿이 없으면 서명 없이 빌드합니다(이 경우 업데이트가 그 릴리스를 거부합니다).
+7. GitHub Actions (.github\workflows\release.yml, 3.1.0 최종)
+-------------------------------------------------------------
+빌드와 서명을 다른 작업(job)으로 나눴습니다. 빌드 작업은 비밀 정보를 보지 못하고, 서명 작업은 빌드하지 않습니다.
+이 워크플로는 아직 GitHub에서 실행된 적이 없습니다(실기 미검증). 첫 태그 전에 workflow_dispatch로 시험하십시오.
+툴체인은 rust-toolchain.toml(1.99.1, clippy·rustfmt)로, 러너는 windows-2022 / ubuntu-24.04 / ubuntu-24.04-arm으로
+고정했습니다. run: 스크립트 안에는 ${{ }} 식을 넣지 않고 env:와 GITHUB_* 변수로만 값을 넘깁니다(release_tests가 검사).
+  audit           cargo audit --deny warnings, cargo deny --locked check (advisories bans sources licenses).
+                  도구 버전 고정(cargo-audit 0.22.2, cargo-deny 0.20.2). 무시 목록: .cargo\audit.toml = deny.toml.
+                  예외마다 review-by 날짜(2027-05-10)가 지나면 실패. 릴리스 키 구성은 별도 운영 권고이며 audit 잡의
+                  필수 게이트가 아님(서명 자체에는 내장 공개키와 일치하는 비밀키 필요)
+  build-windows   clippy -D warnings, build.ps1 -Stage build -NoSign: 테스트, shield-gui.exe·shield.exe·
+                  console\shield.exe. actions/attest-build-provenance로 프로그램의 출처 증명
+  build-linux     clippy -D warnings, build.sh --stage build --no-sign (ubuntu-24.04, ubuntu-24.04-arm): 테스트,
+                  프로그램, 아이콘, musl 정적 콘솔, 출처 증명. 결과는 artifact(bin-*)로 올림
+  sign-binaries   environment release-signing, v* 태그 push일 때만. 비밀 정보를 불러오기 전에 받은 프로그램마다
+                  gh attestation verify(이 저장소의 이 워크플로가 만든 같은 파일인지)를 하고, 프로그램의 분리
+                  서명(.sig)을 만들고 공개키로 다시 검증. cargo·패키지 설치·서드파티 액션 없음
+  package-*       build.ps1 -Stage package / build.sh --stage package로 올라온 프로그램(+.sig)에서 MSI·포터블·
+                  deb·AppImage·콘솔·소스 zip을 만들고 -Stage manifest로 매니페스트 줄을 씀. 비밀 정보 없음, 빌드 없음
+  sign-release    environment release-signing, 태그일 때만. 매니페스트를 하나로 합침(v1은 형식 그대로, v2는
+                  release_id·issued_at·expires_at(+365일)·min_allowed_version·revoked_key를 붙임), 모든 해시를 실제
+                  파일과 대조, 모든 패키지와 두 매니페스트를 서명·재검증, VERIFY.txt·SHA256SUMS.txt
+  publish         contents: write 권한만. 게시할 파일의 출처 증명을 만들고 gh release create (비밀 정보 없음)
+- 출처 증명은 공개 저장소(또는 GitHub Enterprise Cloud)에서만 됩니다. 쓸 수 없으면 저장소 변수
+  SHIELD_ATTESTATIONS=off로 끄며, 그러면 서명 전 출처 확인도 빠집니다.
+- 단계 옵션: build.ps1 -Stage all|build|package|manifest (-BinDir, 기본 target\stage\windows),
+  build.sh --stage all|build|package|manifest (--bin-dir, 기본 target/stage/linux-<arch>). 기본값 all은
+  예전처럼 한 번에 모두 합니다. package 단계는 서명하지 않으며, 프로그램의 .sig는 둘 다 있거나 둘 다 없어야 합니다.
+  스크립트와 워크플로의 모든 cargo build/test/run/install 호출은 --locked (release_tests가 검사).
+- environment 설정 (저장소 Settings > Environments > New environment "release-signing"):
+  1) Required reviewers에 배포 담당자 지정(서명 작업마다 승인 필요)
+  2) Deployment branches and tags: Selected -> 태그 규칙 v*만 허용
+  3) Environment secrets:
+     SHIELD_GPG_KEY         keys\release_key.asc와 일치하는 서명 가능한 비밀키 자료(전용 서명 부키 권장, 필수 아님)
+     SHIELD_GPG_PASSPHRASE  그 비밀번호
+  저장소 전체(Repository) 시크릿에는 넣지 않습니다. 백업 키(docs\07)는 CI에 넣지 않습니다. 주 키가 직접 서명
+  권한을 갖는 경우에도 해당 주 키 비밀 부분이 secret에 있으면 서명할 수 있지만, 전용 부키 사용을 권장합니다.
+- 비밀번호 전달: printf '%s' "$PASS" | gpg --batch --pinentry-mode loopback --passphrase-fd 0 ... 처럼 파일
+  디스크립터 0으로만 넘깁니다. 디스크에 비밀번호 파일을 만들지 않습니다(3.0.0의 0600 파일 방식 폐지).
+  키는 RUNNER_TEMP 아래 임시 GNUPGHOME에만 가져오고 작업 끝(trap)에 gpg-agent를 끄고 폴더를 지웁니다.
+- workflow_dispatch(수동 실행)는 서명 작업을 건너뛰고 서명 없는 패키지만 만들며, 아무것도 게시하지 않습니다.
+- 액션 고정: 모든 uses:는 40자리 커밋 SHA로 고정하고 주석에 태그를 적습니다(release_tests가 검사; SHA를 조회하지
+  못한 줄은 '# TODO-PIN'으로 표시해야 하며 지금은 없음). .github\dependabot.yml이 cargo와 github-actions
+  업데이트를 매주 PR로 제안합니다. PR을 합치기 전에 바뀐 SHA가 해당 액션 저장소의 태그와 같은지 확인하세요.
 - AppImage: 저장소 변수 APPIMAGETOOL_URL과 APPIMAGETOOL_SHA256을 둘 다 정하면 그 파일을 받아 해시를 확인한 뒤
-  씁니다. 고정되지 않은 도구는 받지 않습니다.
-- 권장: 태그 보호 규칙, 릴리스 작업에 environment 승인, 부키 만료일 설정.
+  씁니다. 없으면 AppImage를 만들지 않습니다(고정되지 않은 도구는 받지 않음).
+- 수동 설정(태그 보호, environment 리뷰어, Actions 권한 등)은 파일로 강제할 수 없습니다. docs/07 7절 체크리스트.
+- 서명 키 운영 권고(docs/07): 가능하면 주 키는 인증 전용으로 오프라인 보관하고, CI에는 만료가 설정된 전용 서명
+  부키만 둡니다. 이는 보안 권고이며 빌드·서명 검증의 키 구조 필수 조건은 아닙니다.
+- 선택 과제 (3.1.0 #9-D, 구현하지 않음): MSI Authenticode 서명. 인증서가 생기면 서명 순서는
+  MSI 빌드 -> Authenticode 서명(signtool 또는 서명 서비스, sign-release와 같은 environment 안에서만) ->
+  그 MSI의 해시를 매니페스트에 씀 -> OpenPGP 서명. 인증서 개인키도 CI 일반 작업이나 저장소에 두지 않습니다.
+  지금은 UAC 창에 "게시자를 알 수 없음"으로 보이며, 무결성은 OpenPGP 서명으로 확인합니다.
 
 8. OS별 확인 목록
 -----------------
@@ -102,13 +173,24 @@ Windows (설치 후)
   [ ] 탐색기에서 파일 여러 개 + 폴더 선택 -> Shield로 암호화 -> 창 하나, "하나로 묶기 / 각각 따로" 질문
   [ ] .shd 우클릭 복호화·열기, 설정 > 업데이트 > 프로그램 무결성 검사(서명 빌드면 "무결성 확인")
   [ ] 원본 파쇄: VSS 경고 표시, 3/7회 선택, 끝에 TRIM 결과(관리자 아니면 UAC)
+  [ ] 파일·폴더 우클릭 "SHIELD로 완전삭제" -> 완전삭제 탭: 경고 -> 한계 고지 확인란 -> 6자 코드, 취소하면 아무것도
+      지워지지 않음. C:\, C:\Windows, 사용자 폴더 루트는 거부(docs/10)
   [ ] 제거 후 PATH·우클릭 메뉴가 사라지는지
-  [ ] 2.1.0(한국어·영어 MSI 각각)이 설치된 상태에서 3.0.0 설치 -> 프로그램 목록에 Shield 하나, 우클릭 메뉴 하나,
+  [ ] 2.1.0(한국어·영어 MSI 각각)이 설치된 상태에서 3.1.0 설치 -> 프로그램 목록에 Shield 하나, 우클릭 메뉴 하나,
       PATH에 설치 폴더 한 번 (05_테스트_및_점검_기록.txt 8.4 표)
+  [ ] 3.0.0이 설치된 상태에서 3.1.0 설치(MSI, 앱 안 업데이트 각각) -> "SHIELD에서 열기"가 .shd에서 한 번만, 다른
+      파일에도 한 번 보이고(이전 .shd 전용 항목이 남지 않음), "암호화"·.shd 두 번 클릭 동작은 그대로
+  [ ] 앱 안 업데이트: UAC 확인 창이 한 번 뜨고(관리자 권한으로 설치 폴더의 shield.exe update-install 실행), 설치가 끝난 뒤 Shield를 다시 실행하면 새 버전
   [ ] 창을 옮기고 닫은 뒤 다시 열면 같은 위치, 모니터를 뺀 뒤에는 화면 안에서 열림
 Linux (deb 설치 후, GNOME·KDE·Xfce 등)
   [ ] 앱 메뉴 Shield, 터미널 shield version, .shd 두 번 클릭 -> 연결 프로그램
   [ ] Nemo·Dolphin 메뉴, /usr/share/shield/integrate.sh 실행 후 Nautilus 스크립트·Thunar 동작
+  [ ] Nautilus 스크립트(암호화·열기·완전삭제): 하위 폴더, 검색 결과, 이름에 공백·줄바꿈이 있는 파일을 골라도
+      같은 절대 경로가 창에 보이는지(자동 검사는 가짜 shield-gui로만 함)
+  [ ] SHIELD로 완전삭제 메뉴(Nemo·Dolphin·Thunar·Nautilus), /, /usr, ~ 는 거부
+  [ ] 아무 파일 우클릭 -> SHIELD에서 열기: 컨테이너면 열림, 아니면 "일반 파일이 아님/컨테이너가 아님" 안내.
+      이름에 공백·따옴표·$·백틱이 있는 파일도 같은 파일이 열림(Nemo Quote=double, docs/05 9-B)
+  [ ] deb 업데이트: pkexec 창이 com.shield.update.install로 뜨고 설치됨
   [ ] btrfs/ZFS/LVM/Timeshift/Snapper 볼륨에서 스냅숏 경고, ext4 SSD에서 FITRIM(root가 아니면 pkexec 안내)
   [ ] Wayland와 X11에서 창 크기가 Windows와 같은지(1040x700 논리 크기, 글자 크기), Xft.dpi가 없는 X11과
       잘못된 WINIT_X11_SCALE_FACTOR로도 시작되는지
@@ -120,12 +202,18 @@ Linux (deb 설치 후, GNOME·KDE·Xfce 등)
 
 9. 정식 배포 서명 점검 목록
 ---------------------------
-  [ ] Cargo.toml version = 3.0.0, 태그 v3.0.0, docs\06 머리말, MSI ProductVersion이 같음 (release_tests)
+  [ ] keys\release_key.asc의 지문을 독립된 채널로 확인하고, 서명 비밀키가 내장 공개키와 일치하는지 검증
+  [ ] 전용 서명 부키(만료 설정)와 오프라인 백업 키를 운영할지 검토(docs/07; 필수 게이트 아님)
+  [ ] Cargo.toml version = 3.1.0, 태그 v3.1.0, docs\06_3.1.0 머리말, MSI ProductVersion이 같음 (release_tests)
   [ ] UpgradeCode 6B1E5C0A-3D7F-4C52-9A1B-0F8E2D4C7A91 그대로, MajorUpgrade IgnoreLanguage="yes" (release_tests)
   [ ] SHIELD_REPO_URL(https://github.com/<owner>/<repo>)과 공개키(keys\release_key.asc, 비밀키 없음)를 넣고 빌드
-  [ ] build.ps1 -Sign / build.sh --sign: 두 exe의 .sig, 모든 배포 파일·매니페스트 서명, 임시 키링으로 다시 검증 통과
+  [ ] build.ps1 -Sign / build.sh --sign: 두 exe의 .sig, 모든 배포 파일·두 매니페스트(v1, v2) 서명, 임시 키링으로 다시
+      검증 통과. v2의 expires_at이 1년 뒤, revoked_key가 keys\revoked_keys.txt와 같음
   [ ] VERIFY.txt의 지문이 개발자가 공개한 지문과 같음, SHA256SUMS.txt와 실제 파일 일치
   [ ] 설치한 프로그램의 설정 > 업데이트 > 무결성 검사가 "무결성 확인"
   [ ] Linux에서 cargo test --workspace / clippy 경고 0 / build.sh (이번 패치의 Linux 코드는 Windows에서 컴파일하지 못함)
-  [ ] cargo audit: .cargo\audit.toml에 적은 3건 외에 새 취약점 없음
+  [ ] cargo audit --deny warnings와 cargo deny check 통과(.cargo\audit.toml·deny.toml에 적은 예외 외에 없음,
+      재검토일 2027-05-10 전)
+  [ ] 배포 실행 파일에 로컬 경로·계정 이름이 없음(build.ps1/build.sh로 빌드, docs/05 "3.1.0 최종")
+  [ ] environment release-signing: 승인자, v* 태그만, 시크릿 두 개가 저장소 시크릿이 아닌 environment에 있음
   [ ] 서명 비밀번호와 개인키는 저장소·로그·zip에 없음(소스 zip 비밀키 검사 통과)

@@ -35,21 +35,39 @@ fn main() {
     println!("cargo:rustc-env=SHIELD_REPO_URL={url}");
 
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let key = match std::env::var("SHIELD_PUBKEY_PATH") {
-        Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p.trim())),
-        _ => Some(manifest.join("../../keys/release_key.asc")).filter(|p| p.is_file()),
-    };
     println!("cargo:rerun-if-changed={}", manifest.join("../../keys").display());
-    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap()).join("release_key.asc");
-    let bytes = match &key {
-        Some(p) => {
-            println!("cargo:rerun-if-changed={}", p.display());
-            let b = std::fs::read(p).unwrap_or_else(|e| panic!("SHIELD_PUBKEY_PATH {}: {e}", p.display()));
-            assert!(b.starts_with(b"-----BEGIN PGP PUBLIC KEY BLOCK-----"), "{}: not an armored OpenPGP public key", Path::new(p).display());
-            assert!(!String::from_utf8_lossy(&b).contains("PRIVATE KEY"), "refusing to embed a private key");
-            b
-        }
-        None => Vec::new(),
-    };
-    std::fs::write(out, bytes).unwrap();
+    let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    // main release key (signs every release) and, since 3.1.0, an offline backup key that only
+    // signs an emergency release after the main key was lost or leaked (docs/07)
+    for (var, default, file) in [
+        ("SHIELD_PUBKEY_PATH", "release_key.asc", "release_key.asc"),
+        ("SHIELD_PUBKEY_BACKUP_PATH", "release_key_backup.asc", "release_key_backup.asc"),
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+        let key = match std::env::var(var) {
+            Ok(p) if !p.trim().is_empty() => Some(PathBuf::from(p.trim())),
+            _ => Some(manifest.join("../../keys").join(default)).filter(|p| p.is_file()),
+        };
+        let bytes = match &key {
+            Some(p) => {
+                println!("cargo:rerun-if-changed={}", p.display());
+                // build time, a key file chosen by the person building; a public key is a few KiB
+                let md = std::fs::metadata(p).unwrap_or_else(|e| panic!("{var} {}: {e}", p.display()));
+                assert!(md.len() <= 1 << 20, "{var} {}: larger than 1 MiB, not a public key", p.display());
+                #[allow(clippy::disallowed_methods)]
+                let b = std::fs::read(p).unwrap_or_else(|e| panic!("{var} {}: {e}", p.display()));
+                check_public(&b, p);
+                b
+            }
+            None => Vec::new(),
+        };
+        std::fs::write(out.join(file), bytes).unwrap();
+    }
+}
+
+/// Only armored public keys are embedded; anything that looks like secret key material stops the build.
+fn check_public(b: &[u8], p: &Path) {
+    assert!(b.starts_with(b"-----BEGIN PGP PUBLIC KEY BLOCK-----"), "{}: not an armored OpenPGP public key", p.display());
+    let s = String::from_utf8_lossy(b);
+    assert!(!s.contains("PRIVATE KEY") && !s.contains("SECRET KEY"), "refusing to embed a private key ({})", p.display());
 }

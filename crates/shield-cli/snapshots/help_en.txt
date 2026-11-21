@@ -31,22 +31,36 @@ COMMANDS
                             the result of the program integrity check.
   help [command]            Shows this help, or the help of one command.
   gui [encrypt [items...] | decrypt [file.shd] | explorer [file.shd] |
-    settings | open <file.shd>]
+    settings | open <file.shd> | wipe [items...]]
                             Opens a window (not available in the console-only
                             build).
+  wipe <items...>           Secure delete: overwrites files and folders, then
+                            deletes them (can't be recovered). Protected system
+                            paths are refused. On a terminal three confirmations
+                            (warning, limits, typed code); scripts: --dry-run
+                            first, then --confirm-token <token>
+                            --i-understand-irreversible. --yes does not confirm
+                            anything here. With a settings password and Settings
+                            > Security > Secure delete on, the settings password
+                            is asked right before deleting (needs a terminal,
+                            also with a token).
 
 GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
   -- ends the options: everything after it is a file name (also names that start
-  with -).
+  with -). A name that looks like an option and is also an existing file stops
+  the command, so put wildcards (*) after --.
 
 EXIT CODES
   0 done · 1 failed · 2 usage · 3 wrong password / key file / PIM or damaged
-  file · 4 signature not good · 5 cancelled · 6 file in use · 130 interrupted
+  file · 4 signature not good · 5 cancelled · 6 file in use · 7 wipe: not
+  everything removed · 8 wipe: refused (protected item, confirmation, token) ·
+  130 interrupted
 
   `shield help <command>` or `shield <command> --help` shows the options of a
   command.
@@ -62,14 +76,18 @@ OPTIONS
   -o, --output <path>       the container (with --separate: the folder for the
                             containers)
   --separate                one container per item
-  --shred                   overwrite and delete the originals afterwards (asks
-                            first)
+  --shred                   overwrite and delete the originals afterwards (lists
+                            up to 20 of them and asks first; without a terminal
+                            only with --yes)
   --passes 3|7              overwrite passes (default from the settings)
   --wipe-free               with --shred: also overwrite the free space of those
                             drives
   --strength auto|fast|balanced|max
                             compression
   --include-streams         also overwrite alternate data streams (Windows)
+  --allow-weak              use a new password even though it has warnings (too
+                            short, common, key file only); --yes does not do
+                            this
 
 CREDENTIALS
   -k, --keyfile <path>      key file (repeat for several)
@@ -85,7 +103,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== decrypt
@@ -111,7 +130,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== list
@@ -134,7 +154,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== add
@@ -166,7 +187,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== remove
@@ -194,7 +216,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== change-password
@@ -220,12 +243,16 @@ NEW CREDENTIALS
   --new-password <password>
                             new password as an argument (same rules as
                             --password)
+  --allow-weak              use a new password even though it has warnings (too
+                            short, common, key file only); --yes does not do
+                            this
 
 GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== rekey
@@ -253,12 +280,16 @@ NEW CREDENTIALS
   --new-password <password>
                             new password as an argument (same rules as
                             --password)
+  --allow-weak              use a new password even though it has warnings (too
+                            short, common, key file only); --yes does not do
+                            this
 
 GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== keyfile
@@ -274,7 +305,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== verify
@@ -291,7 +323,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== update
@@ -308,7 +341,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== entropy
@@ -326,7 +360,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== version
@@ -340,7 +375,8 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== help
@@ -353,12 +389,44 @@ GENERAL OPTIONS
   -q, --quiet               errors only
   --json                    results as JSON (never secrets)
   -y, --yes                 answer questions with yes (warnings are still
-                            printed)
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
   --lang ko|en              language of the output
 
 ===== gui
 USAGE
   shield gui [encrypt [items...] | decrypt [file.shd] | explorer [file.shd] |
-  settings | open <file.shd>]
+  settings | open <file.shd> | wipe [items...]]
 
   Opens a window (not available in the console-only build).
+
+===== wipe
+USAGE
+  shield wipe [options] <items...>
+
+  Secure delete: overwrites files and folders, then deletes them (can't be
+  recovered). Protected system paths are refused. On a terminal three
+  confirmations (warning, limits, typed code); scripts: --dry-run first, then
+  --confirm-token <token> --i-understand-irreversible. --yes does not confirm
+  anything here. With a settings password and Settings > Security > Secure
+  delete on, the settings password is asked right before deleting (needs a
+  terminal, also with a token).
+
+OPTIONS
+  -r, --recursive           folders too (with everything in them)
+  --passes 3|7              overwrite passes (default from the settings)
+  --dry-run                 only show what would be removed and the confirmation
+                            token; nothing is changed
+  --confirm-token <token>   the token printed by --dry-run of the same items
+                            (without a terminal)
+  --i-understand-irreversible
+                            states that the deletion can't be undone (needed
+                            with --confirm-token)
+
+GENERAL OPTIONS
+  -q, --quiet               errors only
+  --json                    results as JSON (never secrets)
+  -y, --yes                 answer questions with yes (warnings are still
+                            printed); not for weak passwords (--allow-weak) and
+                            never for wipe
+  --lang ko|en              language of the output

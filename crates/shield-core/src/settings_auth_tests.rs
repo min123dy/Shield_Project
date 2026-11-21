@@ -203,3 +203,82 @@ fn a_2_x_file_goes_to_the_defaults_quietly() {
     assert!(s.tampered && s.protected_is_default());
     let _ = std::fs::remove_dir_all(p.parent().unwrap());
 }
+
+// ---- 3.1.0 review 3: settings.key and the settings file are read with a limit ----
+
+#[test]
+fn oversized_key_and_settings_files_are_not_read() {
+    let p = file();
+    let s = Settings { ui_scale: 120, ..Default::default() };
+    s.save_to(&p).unwrap();
+    let kp = key_path(&p);
+    if kp.exists() {
+        assert!(std::fs::metadata(&kp).unwrap().len() <= MAX_KEY_FILE, "a real key file fits the limit");
+    }
+    // a huge settings.key (length without data) is "no usable key", found quickly
+    let _ = std::fs::remove_file(&kp);
+    std::fs::File::create(&kp).unwrap().set_len(512 << 20).unwrap();
+    let t = std::time::Instant::now();
+    assert!(read_key(&p).is_none());
+    // exactly at the limit is read (and is no valid key), one more byte is refused
+    std::fs::write(&kp, vec![0u8; MAX_KEY_FILE as usize]).unwrap();
+    assert!(read_key(&p).is_none());
+    // a huge settings file loads as "damaged" (defaults + load issue), it is not read
+    let _ = std::fs::remove_file(&kp);
+    std::fs::File::create(&p).unwrap().set_len(512 << 20).unwrap();
+    let back = Settings::load_from(&p);
+    assert!(!back.load_issues.is_empty() && back.ui_scale != 120, "{:?}", back.load_issues);
+    assert!(t.elapsed().as_secs() < 10, "nothing large was read");
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+}
+
+#[test]
+fn the_secure_delete_password_switch_is_protected() {
+    let (p, _) = protected_file();
+    let s = Settings::load_from(&p);
+    assert!(s.wipe_needs_pw && s.mac_text() == s.protected_text(), "on by default: the 3.0.0 MAC text is unchanged");
+    // switching it off is a protected change: refused without the password, also through
+    // "reset" (on is the default, so a reset can only switch it on)
+    let mut off = s.clone();
+    off.wipe_needs_pw = false;
+    assert!(has_code(&off.save_to(&p).unwrap_err(), C_NEED_PW));
+    let mut reset = off.clone();
+    reset.reset(crate::settings::Category::Security);
+    assert!(reset.wipe_needs_pw);
+    let u = unlock(&s, b"owner settings password").unwrap();
+    off.save_to_with(&p, Some(&u)).unwrap();
+    let back = Settings::load_from(&p);
+    assert!(!back.tampered && !back.wipe_needs_pw, "saved with the password");
+    // "reset security" (every protected value to its default) needs no password: it switches it on
+    let mut on = back.clone();
+    on.reset(crate::settings::Category::Security);
+    on.save_to(&p).unwrap();
+    assert!(Settings::load_from(&p).wipe_needs_pw);
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+}
+
+#[test]
+fn switching_secure_delete_off_by_editing_the_file_is_noticed() {
+    let (p, text) = protected_file();
+    assert!(text.contains("wipe_needs_settings_pw = true"));
+    std::fs::write(&p, text.replace("wipe_needs_settings_pw = true", "wipe_needs_settings_pw = false")).unwrap();
+    let t = Settings::load_from(&p);
+    assert!(t.tampered && t.wipe_needs_pw, "v2 MAC");
+    // nor with the 3.0.0 (v1) MAC, which never covered this value: a line 3.0.0 never wrote
+    // must not slip past it
+    std::fs::write(&p, &text).unwrap();
+    let s = Settings::load_from(&p);
+    let key = read_key(&p).unwrap();
+    let (old, new) = (hex(&mac_of_v1(&key, &s)), hex(&s.auth.as_ref().unwrap().mac));
+    let v1 = text.replace(&new, &old);
+    std::fs::write(&p, &v1).unwrap();
+    assert!(!Settings::load_from(&p).tampered, "the 3.0.0 MAC itself is accepted");
+    std::fs::write(&p, v1.replace("wipe_needs_settings_pw = true", "wipe_needs_settings_pw = false")).unwrap();
+    let t = Settings::load_from(&p);
+    assert!(t.tampered && t.wipe_needs_pw, "v1 MAC");
+    // a 3.0.0 file has no such line at all: it opens, and the switch is on
+    std::fs::write(&p, v1.lines().filter(|l| !l.starts_with("wipe_needs_settings_pw")).map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+    let t = Settings::load_from(&p);
+    assert!(!t.tampered && t.wipe_needs_pw && t.auth.is_some());
+    let _ = std::fs::remove_dir_all(p.parent().unwrap());
+}

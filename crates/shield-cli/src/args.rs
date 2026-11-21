@@ -14,7 +14,9 @@ pub const CRED: &[Opt] = &[
     Opt("password", true, None),
     Opt("allow-arg-secrets", false, None),
 ];
-pub const NEW_CRED: &[Opt] = &[Opt("new-keyfile", true, None), Opt("new-pim", true, None), Opt("new-password", true, None)];
+/// `--allow-weak` (3.1.0 final, review E): a new password with warnings is used without a terminal
+/// question. `--yes` no longer answers that question.
+pub const NEW_CRED: &[Opt] = &[Opt("new-keyfile", true, None), Opt("new-pim", true, None), Opt("new-password", true, None), Opt("allow-weak", false, None)];
 
 /// (command, own options, uses credentials, uses new credentials, min items, max items)
 pub struct Spec(pub &'static str, pub &'static [Opt], pub bool, pub bool, pub usize, pub usize);
@@ -30,6 +32,7 @@ pub const COMMANDS: &[Spec] = &[
             Opt("wipe-free", false, None),
             Opt("strength", true, None),
             Opt("include-streams", false, None),
+            Opt("allow-weak", false, None),
         ],
         true,
         false,
@@ -49,6 +52,21 @@ pub const COMMANDS: &[Spec] = &[
     Spec("version", &[], false, false, 0, 0),
     Spec("help", &[], false, false, 0, 1),
     Spec("gui", &[], false, false, 0, usize::MAX),
+    // 3.1.0 final: secure delete (wipe_cmd.rs); no credentials
+    Spec(
+        "wipe",
+        &[
+            Opt("recursive", false, Some('r')),
+            Opt("passes", true, None),
+            Opt("dry-run", false, None),
+            Opt("confirm-token", true, None),
+            Opt("i-understand-irreversible", false, None),
+        ],
+        false,
+        false,
+        1,
+        usize::MAX,
+    ),
 ];
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -91,6 +109,16 @@ fn opt_shown(x: &str) -> String {
 }
 
 pub fn parse(argv: &[String]) -> Result<Args, ParseErr> {
+    parse_with(argv, &|x| std::path::Path::new(x).symlink_metadata().is_ok())
+}
+
+/// `parse` with the "does a file of this name exist" check given (tests).
+///
+/// 3.1.0 #5: an argument that would be read as an option but is also the name of an existing file
+/// or folder (`shield encrypt *` in a folder holding a file called `--shred` or `-y`) is refused
+/// with `cli.ambiguous_arg` instead of silently becoming an option. Names after `--` are never
+/// options, so `shield encrypt -- *` is always safe.
+pub fn parse_with(argv: &[String], exists: &dyn Fn(&str) -> bool) -> Result<Args, ParseErr> {
     let Some(cmd) = argv.first() else { return Ok(Args { cmd: "help".into(), ..Default::default() }) };
     let cmd = match cmd.as_str() {
         "-h" | "--help" | "-help" | "-?" | "/?" => "help",
@@ -131,6 +159,9 @@ pub fn parse(argv: &[String]) -> Result<Args, ParseErr> {
         if x == "--" {
             only_items = true;
             continue;
+        }
+        if exists(x) {
+            return Err(("cli.ambiguous_arg", opt_shown(x)));
         }
         let (o, inline) = if let Some(long) = x.strip_prefix("--") {
             let (n, v) = match long.split_once('=') {
@@ -214,6 +245,29 @@ mod tests {
         assert_eq!(p(&["gui", "--help"]).unwrap().cmd, "help");
         assert_eq!(p(&["gui", "encrypt", "--help"]).unwrap().cmd, "gui");
         assert_eq!(p(&["frobnicate", "--help"]).unwrap_err().0, "cli.unknown_cmd");
+    }
+
+    #[test]
+    fn option_like_names_of_existing_files_are_refused() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let files = ["--shred", "-y", "-o", "--passes=7", "a.txt"];
+        let ex = |x: &str| files.contains(&x);
+        // `shield encrypt *` expanded by the shell in a folder with these files
+        for bad in [&["encrypt", "a.txt", "--shred"][..], &["encrypt", "-y", "a.txt"], &["encrypt", "a.txt", "-o", "x.shd"], &["encrypt", "a.txt", "--passes=7"]] {
+            let e = parse_with(&v(bad), &ex).unwrap_err();
+            assert_eq!(e.0, "cli.ambiguous_arg", "{bad:?}");
+        }
+        assert_eq!(parse_with(&v(&["encrypt", "a.txt", "--passes=7"]), &ex).unwrap_err().1, "--passes", "value never shown");
+        // after `--` they are names; options that are not files still work
+        let a = parse_with(&v(&["encrypt", "--separate", "--", "--shred", "-y", "a.txt"]), &ex).unwrap();
+        assert_eq!(a.items, ["--shred", "-y", "a.txt"]);
+        assert!(a.has("separate") && !a.has("shred") && !a.has("yes"));
+        // an option value that starts with '-' is a value, not an option
+        assert_eq!(parse_with(&v(&["decrypt", "x.shd", "--output", "-y"]), &ex).unwrap().val("output"), Some("-y"));
+        // "-" (stdin-like name) stays an item
+        assert_eq!(parse_with(&v(&["decrypt", "-"]), &|_| true).unwrap().items, ["-"]);
+        // `parse` checks the real file system: nothing named like this exists here
+        assert!(parse(&v(&["encrypt", "a", "--shred-zz-not-a-file"])).unwrap_err().0 == "cli.unknown_opt");
     }
 
     #[test]

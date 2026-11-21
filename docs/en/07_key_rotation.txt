@@ -1,0 +1,113 @@
+SHIELD 3.1.0 - Release signing key operation and rotation
+=========================================================
+Korean: docs\07_서명키_교체.txt
+
+0. Current state and build requirements
+---------------------------------------
+- `keys/release_key.asc` is a valid OpenPGP public key. The current key permits both certification
+  and signing by its primary key, has no expiry, and has an encryption subkey but no signing
+  subkey. Its user ID contains a personal email address.
+- `keys/release_key_backup.asc` is optional. When present it is embedded as a secondary trust key;
+  when absent, builds and signature verification with the main key still work.
+- **A signing subkey, expiry date, project-specific user ID, and backup key are not prerequisites
+  for builds, tests, or tag releases.** They are operational hardening recommendations, not
+  cryptographic parsing requirements.
+- A build needs a parseable public key. `build.rs` embeds only ASCII-armored public keys and refuses
+  secret-key material. An unsigned `--no-sign` build does not need a private key.
+- To create GPG signatures, a signing-capable private key matching `keys/release_key.asc` is
+  required. This is necessary to make a signature and is separate from optional key-shape policy.
+- The current key can sign directly with its primary key. Since it has no expiry, time alone will
+  not expire it; compromise therefore requires revocation/rotation and distribution of a new key.
+
+1. Recommended operating model (optional)
+-----------------------------------------
+  Primary key [C]       Certification only, kept offline. Long lifetime or no expiry.
+  Signing subkey [S]    Expires after 1-2 years. Prefer storing only this secret subkey in CI.
+  Revocation certificate  Create with the primary key and keep on two separate offline media.
+  Backup key            Optional separate key, public part embedded and secret part kept offline.
+  User ID               A project-controlled identity is recommended; a personal email is not a build blocker.
+  Revocation list       Put revoked primary fingerprints in `keys/revoked_keys.txt`; manifest v2 carries them.
+
+The program embeds `keys/release_key.asc`. If `keys/release_key_backup.asc` exists, it embeds that
+key too and accepts signatures made by either key. The files must be public keys and no larger than
+1 MiB. Never commit private key material.
+
+2. Example: create a key and optional signing subkey offline
+-----------------------------------------------------------
+The following is a recommended GnuPG 2.2+ setup, performed by a person on an offline computer:
+  gpg --quick-generate-key "Shield release signing <release@example.org>" ed25519 cert 5y
+  gpg --list-keys --with-colons | grep ^fpr        (primary fingerprint FPR)
+  gpg --quick-add-key FPR ed25519 sign 2y           (optional: a 2-year signing subkey)
+  gpg --output revoke_FPR.asc --gen-revoke FPR      (revocation certificate)
+  gpg --armor --export FPR > release_key.asc        (public key -> keys/release_key.asc)
+  gpg --armor --export-secret-subkeys SUBFPR! > ci_signing_subkey.asc  (optional CI subkey only)
+  gpg --armor --export-secret-keys FPR > main_secret.asc               (primary secret, offline backup only)
+
+Without a signing subkey, the primary key can sign directly when it has signing capability. Putting
+the full primary secret key into online CI is technically possible but not recommended: a compromise
+may require replacing the primary key rather than only one subkey.
+
+- For GitHub Actions signing, configure `SHIELD_GPG_KEY` and `SHIELD_GPG_PASSPHRASE` in the
+  `release-signing` environment. When using a dedicated subkey, export only that secret subkey with
+  `--export-secret-subkeys`. A full primary secret key can be imported, but this is less secure.
+- Verify an actual signature with `gpg --verify`. If the secret key does not match the embedded
+  public key, the signing step fails.
+- Tests do not pin the current release-key fingerprint, so replacing the public key does not require
+  editing a fingerprint assertion. Users should still compare published fingerprints out of band.
+
+3. Optional backup key
+----------------------
+  gpg --quick-generate-key "Shield release backup <release-backup@example.org>" ed25519 sign 0
+  gpg --armor --export <backup fingerprint> > release_key_backup.asc
+  gpg --armor --export-secret-keys <backup fingerprint> > backup_secret.asc
+Keep only the public key in `keys/release_key_backup.asc`; keep the secret key on offline media.
+The backup key is not required to build or verify signatures made by the main key.
+
+4. Moving from an old key to a new key
+-------------------------------------
+Older installs may trust only the key embedded when they were built. They cannot verify an update
+signed only by a new key unless a transition release supplies that key.
+- If no existing installation needs in-app migration, ship a new installer embedding the new key and
+  publish its fingerprint through an independent channel.
+- Otherwise, a transition release signed by the old key may need to embed the new public key. Then
+  sign subsequent releases with the new key and list the old fingerprint in `keys/revoked_keys.txt`
+  and manifest v2.
+- An emergency backup-key transition works only for installations that already embed that backup key.
+
+5. Regular operations
+--------------------
+- When using an expiring signing subkey, extend or replace it three months before expiry and ship the
+  updated public key. Updates signed by an expired key are refused.
+- A v2 manifest is valid for 365 days after issue. Reissue and sign the latest manifest if automatic
+  updates must continue after that period.
+- For each release, verify signatures, SHA-256 sums, published fingerprints and build provenance.
+- Review dependency advisory dates in `.cargo/audit.toml` and periodically test offline revocation backups.
+
+6. Leaks and losses
+-------------------
+- Signing subkey leaked: revoke it, create a replacement, and distribute an updated public key.
+- Primary key leaked: revoke it, replace the primary key, list the old fingerprint in
+  `keys/revoked_keys.txt`, and publish a transition release.
+- Backup key leaked: publish a new backup key and revoke the old fingerprint.
+- If every trusted key is lost or compromised, existing installations may not be able to recover
+  automatically; users must obtain a new installer and compare its fingerprint independently.
+
+7. GitHub settings (when operating signed releases)
+----------------------------------------------------
+  [ ] Protect `release-signing` environment with reviewers and restrict it to release tags.
+  [ ] Keep SHIELD_GPG_KEY / SHIELD_GPG_PASSPHRASE only in that environment.
+  [ ] Protect tag creation/deletion and the default branch.
+  [ ] Use least-privilege Actions permissions and pin third-party Actions to commit SHAs.
+  [ ] Enable build provenance attestations where supported.
+
+8. Scope and limitations
+------------------------
+- Builds require a valid public key, but do not require a particular key topology or a backup key.
+- Signed releases require the matching signing-capable private key. Without it, `--no-sign` builds
+  still work, but their outputs are not equivalent to signed release downloads.
+- Updates check signatures, hashes, versions, validity windows and revocation lists. An expired key
+  is refused; a key with no expiry does not become expired merely through time, so external
+  fingerprint publication and prompt revocation matter.
+- Programs do not fetch OpenPGP revocations online. Revocations arrive through a build embedding the
+  new public key and through revoked keys in manifest v2.
+- MSI and program files have no Authenticode signature. See docs/04 for GPG signature verification.

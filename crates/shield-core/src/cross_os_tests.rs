@@ -52,11 +52,15 @@ fn containers_from_windows_and_linux_open_everywhere() {
         seen += 1;
         let out = tmpdir();
         dec(&f, &out, &cred(PW, 0)).unwrap_or_else(|e| panic!("{os}: {e}"));
+        // 3.1.0 review 2 #4: the fixture holds one folder (TOP) under another name than the
+        // archive ("<os>_v3.shd"), so it comes out inside a folder named after the archive
+        let arch = out.join(format!("{os}_v3"));
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1, "{os}: one folder at the destination");
         for (rel, data) in sample() {
-            let got = fs::read(out.join(&rel)).unwrap_or_else(|e| panic!("{os}: {rel}: {e}"));
+            let got = fs::read(arch.join(&rel)).unwrap_or_else(|e| panic!("{os}: {rel}: {e}"));
             assert_eq!(got, data, "{os}: {rel}");
         }
-        assert!(out.join(TOP).join("빈 폴더").is_dir(), "{os}: empty folder");
+        assert!(arch.join(TOP).join("빈 폴더").is_dir(), "{os}: empty folder");
         assert!(dec(&f, &tmpdir(), &cred("wrong password 1", 0)).is_err());
         let _ = fs::remove_dir_all(out);
     }

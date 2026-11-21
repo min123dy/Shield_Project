@@ -78,3 +78,32 @@ fn hidden_files_and_sorting_follow_settings() {
     assert_eq!(names(&app), vec!["zdir", "a.txt", "b.txt", ".hidden"]);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+// ---- 3.1.0 #14: "Open in SHIELD" on any file ----
+
+#[test]
+fn open_in_shield_takes_any_regular_file_and_refuses_the_rest() {
+    let (_, shd, dir) = app_with_container();
+    // a container renamed to anything still goes to the unlock screen (no extension assumed)
+    for name in ["holiday.jpg", "noext", "report.SHD.txt"] {
+        let p = dir.join(name);
+        std::fs::copy(&shd, &p).unwrap();
+        let a = MgrApp::new_open(Settings::default(), p.clone());
+        assert_eq!(a.pending.as_deref(), Some(p.as_path()), "{name}");
+        assert_eq!(a.cwd.as_deref(), Some(dir.as_path()));
+        let o = container::open(&p, cred("manager test password", 0)).unwrap();
+        assert_eq!(o.entries.len(), 2, "{name}");
+    }
+    // a folder, a missing file: no password question, one message (a missing file is reported
+    // as missing, not as "not a regular file")
+    for (p, missing) in [(dir.join("src"), false), (dir.join("missing.shd"), true)] {
+        let a = MgrApp::new_open(Settings::default(), p.clone());
+        assert!(a.pending.is_none(), "{}", p.display());
+        if missing {
+            assert!(a.sh.status != container::not_regular() && a.sh.status.contains("(os error 2)"), "{}", a.sh.status);
+        } else {
+            assert_eq!(a.sh.status, container::not_regular());
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

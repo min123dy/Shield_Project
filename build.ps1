@@ -12,6 +12,12 @@
 #   -MergeManifest <file>                        add the lines of another release manifest
 #                                                (e.g. the Linux packages) before signing
 #   -GpgHome <dir>  -UpxPath <upx>  -NoUpx  -SkipTests
+#   -Stage all|build|package|manifest   (3.1.0 #2, default all) CI runs the stages in separate jobs
+#        build    : tests + cargo builds (--locked); programs copied to -BinDir
+#        package  : MSI / portable / console / source zip from -BinDir (no cargo); a program's
+#                   .sig next to it in -BinDir is installed with it
+#        manifest : release manifest + SHA256SUMS of the packages in dist\ (with -Sign: signed)
+#   -BinDir <dir>   programs between the stages (default target\stage\windows)
 # Secrets: the signing passphrase is never an argument, variable or log line; gpg-agent/pinentry
 # asks for it. The private key never leaves the local keyring (CI: see docs 02).
 # Saved as UTF-8 with BOM for Windows PowerShell 5.1.
@@ -21,13 +27,15 @@ param(
     [string]$PublicKeyPath,
     [switch]$Sign,
     [switch]$NoSign,
-    [string]$Variants,
+    [string[]]$Variants,
     [ValidateSet('ko-KR', 'en-US')][string]$Culture = 'ko-KR',
     [string]$MergeManifest,
     [string]$GpgHome,
     [string]$UpxPath,
     [switch]$NoUpx,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [ValidateSet('all', 'build', 'package', 'manifest')][string]$Stage = 'all',
+    [string]$BinDir
 )
 $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
@@ -39,6 +47,10 @@ $wixVersion = "5.0.2"
 $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $canAsk = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+$doBuild = $Stage -in @('all', 'build')
+$doPackage = $Stage -in @('all', 'package')
+$doManifest = $Stage -in @('all', 'manifest')
+if (-not $BinDir) { $BinDir = Join-Path $root "target\stage\windows" }
 
 function Assert-ExitCode([string]$what) {
     if ($LASTEXITCODE -ne 0) { throw "$what 실패 (종료 코드: $LASTEXITCODE). 위의 오류를 확인하세요." }
@@ -108,6 +120,10 @@ elseif (-not $NoSign) {
     if ($env:SHIELD_SIGN) { $doSign = $env:SHIELD_SIGN -match '^(y|yes|1|true)$' }
     elseif ($canAsk) { $doSign = Ask-YesNo "GPG 서명을 하시겠습니까? / Sign with GPG?" }
 }
+# the package stage signs nothing (it installs the .sig files it finds next to the programs)
+if ($Stage -eq 'package') { $doSign = $false }
+# "-Variants msi,portable" from PowerShell arrives as an array, from cmd / -File as one string
+$Variants = @($Variants | Where-Object { $_ }) -join ','
 if (-not $Variants) { $Variants = $env:SHIELD_VARIANTS }
 if (-not $Variants) { $Variants = "msi,portable,console" }
 $want = @($Variants -split '[,\s]+' | Where-Object { $_ })
@@ -144,8 +160,15 @@ try {
 
     $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
     if (-not (Get-Command cargo -ErrorAction SilentlyContinue) -and (Test-Path (Join-Path $cargoBin "cargo.exe"))) { $env:PATH = "$cargoBin;$env:PATH" }
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw "Cargo를 찾을 수 없습니다." }
-    if (('msi' -in $want) -and -not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw ".NET SDK가 필요합니다 (WiX)." }
+    if ($doBuild -and -not (Get-Command cargo -ErrorAction SilentlyContinue)) { throw "Cargo를 찾을 수 없습니다." }
+    if ($doBuild) {
+        # 3.1.0 #9-C: release programs are built for the MSVC target only (the hardening flags,
+        # the delay-load and the WiX packaging assume it); a GNU / other host or target is refused
+        $hostLine = (& rustc -vV | Where-Object { $_ -match '^host: ' } | Select-Object -First 1)
+        if ("$hostLine" -notmatch '^host: x86_64-pc-windows-msvc$') { throw "MSVC 툴체인(x86_64-pc-windows-msvc)만 지원합니다: $hostLine (rustup default stable-x86_64-pc-windows-msvc)" }
+        if ($env:CARGO_BUILD_TARGET -and $env:CARGO_BUILD_TARGET -ne 'x86_64-pc-windows-msvc') { throw "CARGO_BUILD_TARGET=$($env:CARGO_BUILD_TARGET): MSVC 대상만 지원합니다." }
+    }
+    if ($doPackage -and ('msi' -in $want) -and -not (Get-Command dotnet -ErrorAction SilentlyContinue)) { throw ".NET SDK가 필요합니다 (WiX)." }
     $versionLine = Select-String -LiteralPath $manifestPath -Pattern '^\s*version\s*=\s*"(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)"' | Select-Object -First 1
     if (-not $versionLine) { throw "Cargo.toml의 version을 읽을 수 없습니다." }
     $version = $versionLine.Matches[0].Groups[1].Value
@@ -158,9 +181,8 @@ try {
     } elseif ($version -match '-') {
         throw "사전 배포 버전에는 번호가 있어야 합니다 (예: 3.0.0-beta.2): $version"
     }
-    $vu = $version -replace '\.', '_'
     if ($UpxPath -and $NoUpx) { throw "-UpxPath와 -NoUpx는 함께 쓸 수 없습니다." }
-    if (('portable' -in $want) -and -not $UpxPath -and -not $NoUpx -and $canAsk) { $UpxPath = Read-Host "포터블 exe를 UPX로 압축하려면 upx.exe 경로 (아니면 Enter)" }
+    if ($doPackage -and ('portable' -in $want) -and -not $UpxPath -and -not $NoUpx -and $canAsk) { $UpxPath = Read-Host "포터블 exe를 UPX로 압축하려면 upx.exe 경로 (아니면 Enter)" }
     $script:upxExe = $null
     if ($UpxPath) {
         $UpxPath = ($UpxPath.Trim() -replace '^&\s*', '').Trim().Trim('"').Trim("'")
@@ -169,144 +191,183 @@ try {
         if (-not $r) { throw "UPX를 찾을 수 없습니다: $UpxPath" }
         $script:upxExe = $r.Source
     }
-    Write-Host "Shield v$version · 저장소: $(if ($RepoUrl) { $RepoUrl } else { '(없음)' }) · 서명: $doSign · 변형: $($want -join ',') · MSI: $Culture"
+    Write-Host "Shield v$version · 단계: $Stage · 저장소: $(if ($RepoUrl) { $RepoUrl } else { '(없음)' }) · 서명: $doSign · 변형: $($want -join ',') · MSI: $Culture"
 
     # ------------------------------------------------------------------ 1. tests and builds
     $env:SHIELD_REPO_URL = $RepoUrl
     $env:SHIELD_PUBKEY_PATH = $keyItem.FullName
-    if (-not $SkipTests) {
-        Step "테스트 (cargo test --workspace --release)"
-        & cargo test --workspace --release --manifest-path $manifestPath
-        Assert-ExitCode "테스트"
-    }
-    Step "릴리스 빌드: shield-gui.exe, shield.exe"
-    & cargo build --release --manifest-path $manifestPath -p shield-gui -p shield-cli
-    Assert-ExitCode "빌드"
-    $bin = Join-Path $root "target\release"
-    $gui = Join-Path $bin "shield-gui.exe"
-    $cli = Join-Path $bin "shield.exe"
-    foreach ($f in @($gui, $cli)) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "빌드 결과가 없습니다: $f" } }
-    $consoleExe = $null
-    if ('console' -in $want) {
-        Step "콘솔 전용 빌드 (GUI 의존성 없음)"
-        & cargo build --release --manifest-path $manifestPath -p shield-cli --no-default-features --target-dir (Join-Path $root "target\console")
-        Assert-ExitCode "콘솔 빌드"
-        $consoleExe = Join-Path $root "target\console\release\shield.exe"
-    }
-    # programs are signed before packaging, so the installed copies can check themselves
-    if ($doSign) {
-        Step "프로그램 서명 (비밀번호는 pinentry 창에 입력)"
-        Sign-File $gui
-        Sign-File $cli
-    } else {
-        foreach ($s in @("$gui.sig", "$cli.sig")) { if (Test-Path -LiteralPath $s) { Remove-Item -LiteralPath $s -Force } }
+    # 3.1.0 final (4-7): no local absolute paths (account name, folders) in the programs. rustc
+    # keeps source paths for panic messages (dependencies: <CARGO_HOME>\registry\...); they are
+    # remapped. The last matching rule wins, so the general home folder comes first.
+    # The flags go into a generated cargo config file passed with --config, never into a
+    # flags variable: cargo then joins them with the crt-static flags of .cargo/config.toml
+    # (any flags variable would replace those, and vcruntime140.dll would be loaded again).
+    $homeDir = [Environment]::GetFolderPath('UserProfile')
+    $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $homeDir ".cargo" }
+    $rustupHome = if ($env:RUSTUP_HOME) { $env:RUSTUP_HOME } else { Join-Path $homeDir ".rustup" }
+    $remap = @("--remap-path-prefix=$homeDir=~", "--remap-path-prefix=$cargoHome=/cargo", "--remap-path-prefix=$rustupHome=/rustup", "--remap-path-prefix=$root=/shield")
+    $tomlStr = { param($s) '"' + $s.Replace('\', '\\').Replace('"', '\"') + '"' }
+    $remapConfig = Join-Path $root "target\remap-paths.toml"
+    New-Item -ItemType Directory -Force (Split-Path $remapConfig) | Out-Null
+    $remapToml = "# generated by build.ps1: local paths out of the programs (docs/02 section 6)`n[target.'cfg(any(unix, windows))']`nrustflags = [" + (($remap | ForEach-Object { & $tomlStr $_ }) -join ", ") + "]`n"
+    [IO.File]::WriteAllText($remapConfig, $remapToml, (New-Object Text.UTF8Encoding $false))
+    $gui = Join-Path $BinDir "shield-gui.exe"
+    $cli = Join-Path $BinDir "shield.exe"
+    $consoleExe = Join-Path $BinDir "console\shield.exe"
+    if ($doBuild) {
+        if (-not $SkipTests) {
+            Step "테스트 (cargo test --workspace --release --locked)"
+            & cargo test --workspace --release --locked --manifest-path $manifestPath --config $remapConfig
+            Assert-ExitCode "테스트"
+        }
+        Step "릴리스 빌드: shield-gui.exe, shield.exe"
+        & cargo build --release --locked --manifest-path $manifestPath --config $remapConfig -p shield-gui -p shield-cli
+        Assert-ExitCode "빌드"
+        $rel = Join-Path $root "target\release"
+        foreach ($f in @("shield-gui.exe", "shield.exe")) { if (-not (Test-Path -LiteralPath (Join-Path $rel $f) -PathType Leaf)) { throw "빌드 결과가 없습니다: $f" } }
+        # the stage folder holds exactly this build's programs (no .sig from an earlier run)
+        if (Test-Path -LiteralPath $BinDir) { Remove-Item -LiteralPath $BinDir -Recurse -Force }
+        New-Item -ItemType Directory -Force -Path (Join-Path $BinDir "console") | Out-Null
+        Copy-Item -LiteralPath (Join-Path $rel "shield-gui.exe") -Destination $gui
+        Copy-Item -LiteralPath (Join-Path $rel "shield.exe") -Destination $cli
+        if ('console' -in $want) {
+            Step "콘솔 전용 빌드 (GUI 의존성 없음)"
+            & cargo build --release --locked --manifest-path $manifestPath --config $remapConfig -p shield-cli --no-default-features --target-dir (Join-Path $root "target\console")
+            Assert-ExitCode "콘솔 빌드"
+            Copy-Item -LiteralPath (Join-Path $root "target\console\release\shield.exe") -Destination $consoleExe
+        }
+        # programs are signed before packaging, so the installed copies can check themselves
+        if ($doSign) {
+            Step "프로그램 서명 (비밀번호는 pinentry 창에 입력)"
+            Sign-File $gui
+            Sign-File $cli
+        }
+        Write-Host "  프로그램: $BinDir"
     }
 
     $distDir = Join-Path $root "dist"
-    # earlier release files are kept: moved aside, never deleted
-    if ((Test-Path -LiteralPath $distDir) -and (Get-ChildItem -LiteralPath $distDir -Force | Select-Object -First 1)) {
-        $old = Join-Path $root ("dist_old_" + (Get-Date -Format 'yyyyMMdd_HHmmss'))
-        Move-Item -LiteralPath $distDir -Destination $old
-        Write-Host "previous dist moved to $(Split-Path -Leaf $old)"
-    }
-    if (-not (Test-Path -LiteralPath $distDir)) { New-Item -ItemType Directory -Path $distDir | Out-Null }
     $packages = @()
+    if ($doPackage) {
+        foreach ($f in @($gui, $cli)) { if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "프로그램이 없습니다 (먼저 -Stage build): $f" } }
+        # .sig next to both programs or next to neither (3.1.0 #2: signed by the CI signing job)
+        $sigs = @("$gui.sig", "$cli.sig" | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+        if ($sigs.Count -eq 1) { throw "서명이 한 프로그램에만 있습니다: $($sigs -join ', ')" }
+        $signedBins = $sigs.Count -eq 2
+        if ($signedBins) { Write-Host "  프로그램 서명 포함: shield-gui.exe.sig, shield.exe.sig" }
+        # earlier release files are kept: moved aside, never deleted
+        if ((Test-Path -LiteralPath $distDir) -and (Get-ChildItem -LiteralPath $distDir -Force | Select-Object -First 1)) {
+            $old = Join-Path $root ("dist_old_" + (Get-Date -Format 'yyyyMMdd_HHmmss'))
+            Move-Item -LiteralPath $distDir -Destination $old
+            Write-Host "previous dist moved to $(Split-Path -Leaf $old)"
+        }
+        if (-not (Test-Path -LiteralPath $distDir)) { New-Item -ItemType Directory -Path $distDir | Out-Null }
 
-    # ------------------------------------------------------------------ 2. MSI
-    if ('msi' -in $want) {
-        Step "MSI ($Culture)"
-        $noticePath = if ($Culture -eq 'en-US') { Join-Path $root "docs\en\04_install_notes.txt" } else { Join-Path $root "docs\04_설치_안내.txt" }
-        $cp = if ($Culture -eq 'en-US') { 1252 } else { 949 }
-        $charset = if ($Culture -eq 'en-US') { 0 } else { 129 }
-        $sb = New-Object System.Text.StringBuilder
-        # every non-ASCII character is a \uN escape: code page bytes (\'xx) are decoded with the PC's
-        # non-Unicode code page by RichEdit and turned into garbage on systems not set to 949
-        [void]$sb.Append("{\rtf1\ansi\ansicpg$cp\deff0{\fonttbl{\f0\fnil\fcharset$charset Malgun Gothic;}}\viewkind4\uc1\pard\sa60\f0\fs18 ")
-        foreach ($line in ([System.IO.File]::ReadAllText($noticePath, $utf8) -split "`r?`n")) {
-            $bold = $line.StartsWith([string][char]0x25A0)
-            if ($bold) { [void]$sb.Append('\b\fs20 ') }
-            foreach ($ch in $line.ToCharArray()) {
-                if ($ch -eq '\' -or $ch -eq '{' -or $ch -eq '}') { [void]$sb.Append('\' + $ch) }
-                elseif ([int]$ch -lt 128) { [void]$sb.Append($ch) }
-                else {
-                    # RTF Unicode escape (signed 16-bit UTF-16 unit) with '?' as fallback
-                    $u = [int]$ch; if ($u -gt 32767) { $u -= 65536 }
-                    [void]$sb.Append('\u' + $u + '?')
+        # ------------------------------------------------------------------ 2. MSI
+        if ('msi' -in $want) {
+            Step "MSI ($Culture)"
+            $noticePath = if ($Culture -eq 'en-US') { Join-Path $root "docs\en\04_install_notes.txt" } else { Join-Path $root "docs\04_설치_안내.txt" }
+            $cp = if ($Culture -eq 'en-US') { 1252 } else { 949 }
+            $charset = if ($Culture -eq 'en-US') { 0 } else { 129 }
+            $sb = New-Object System.Text.StringBuilder
+            # every non-ASCII character is a \uN escape: code page bytes (\'xx) are decoded with the PC's
+            # non-Unicode code page by RichEdit and turned into garbage on systems not set to 949
+            [void]$sb.Append("{\rtf1\ansi\ansicpg$cp\deff0{\fonttbl{\f0\fnil\fcharset$charset Malgun Gothic;}}\viewkind4\uc1\pard\sa60\f0\fs18 ")
+            foreach ($line in ([System.IO.File]::ReadAllText($noticePath, $utf8) -split "`r?`n")) {
+                $bold = $line.StartsWith([string][char]0x25A0)
+                if ($bold) { [void]$sb.Append('\b\fs20 ') }
+                foreach ($ch in $line.ToCharArray()) {
+                    if ($ch -eq '\' -or $ch -eq '{' -or $ch -eq '}') { [void]$sb.Append('\' + $ch) }
+                    elseif ([int]$ch -lt 128) { [void]$sb.Append($ch) }
+                    else {
+                        # RTF Unicode escape (signed 16-bit UTF-16 unit) with '?' as fallback
+                        $u = [int]$ch; if ($u -gt 32767) { $u -= 65536 }
+                        [void]$sb.Append('\u' + $u + '?')
+                    }
                 }
+                if ($bold) { [void]$sb.Append('\b0\fs18') }
+                [void]$sb.Append("\par`r`n")
             }
-            if ($bold) { [void]$sb.Append('\b0\fs18') }
-            [void]$sb.Append("\par`r`n")
+            [void]$sb.Append('}')
+            $rtfDir = Join-Path $root "target\installer"
+            New-Item -ItemType Directory -Force -Path $rtfDir | Out-Null
+            $rtf = Join-Path $rtfDir "notice.rtf"
+            [System.IO.File]::WriteAllText($rtf, $sb.ToString(), [System.Text.Encoding]::ASCII)
+            & dotnet tool restore
+            Assert-ExitCode "WiX 복원"
+            $prevRf = $env:DOTNET_ROLL_FORWARD
+            $env:DOTNET_ROLL_FORWARD = "Major"
+            try {
+                foreach ($ext in @("WixToolset.UI.wixext", "WixToolset.Util.wixext")) { & dotnet tool run wix -- extension add "$ext/$wixVersion"; Assert-ExitCode "WiX 확장 $ext" }
+                $msi = Join-Path $distDir "Shield_v${version}_x64.msi"
+                $wxs = Join-Path $root "installer\windows\installer.wxs"
+                $wxl = Join-Path $root "installer\windows\installer.$Culture.wxl"
+                & dotnet tool run wix -- build -arch x64 -culture $Culture -ext "WixToolset.UI.wixext/$wixVersion" -ext "WixToolset.Util.wixext/$wixVersion" `
+                    -d "Version=$msiVersion" -d "NoticeRtf=$rtf" -d "Bin=$BinDir" -d "Signed=$(if ($signedBins) { 'yes' } else { 'no' })" -loc $wxl $wxs -o $msi
+                Assert-ExitCode "WiX MSI 빌드"
+            } finally {
+                if ($null -eq $prevRf) { Remove-Item Env:\DOTNET_ROLL_FORWARD -ErrorAction SilentlyContinue } else { $env:DOTNET_ROLL_FORWARD = $prevRf }
+            }
+            $wixpdb = [System.IO.Path]::ChangeExtension($msi, ".wixpdb")
+            if (Test-Path -LiteralPath $wixpdb) { Remove-Item -LiteralPath $wixpdb -Force }
+            $packages += $msi
         }
-        [void]$sb.Append('}')
-        $rtfDir = Join-Path $root "target\installer"
-        New-Item -ItemType Directory -Force -Path $rtfDir | Out-Null
-        $rtf = Join-Path $rtfDir "notice.rtf"
-        [System.IO.File]::WriteAllText($rtf, $sb.ToString(), [System.Text.Encoding]::ASCII)
-        & dotnet tool restore
-        Assert-ExitCode "WiX 복원"
-        $prevRf = $env:DOTNET_ROLL_FORWARD
-        $env:DOTNET_ROLL_FORWARD = "Major"
+
+        # ------------------------------------------------------------------ 3. portable builds
+        if ('portable' -in $want) {
+            # the name ending in "_portable" keeps settings in Shield_data next to the program
+            $p = Join-Path $distDir "Shield_v${version}_x64_portable.exe"
+            Copy-Item -LiteralPath $gui -Destination $p
+            if ($script:upxExe) {
+                $before = (Get-PeFlags $p) -band 0x160
+                Invoke-Upx @('--best', '--lzma', '--strip-relocs=0', '--no-progress', $p) | Out-Null
+                $null = Invoke-Upx @('-t', $p)
+                if (((Get-PeFlags $p) -band 0x160) -ne $before) { Remove-Item -LiteralPath $p -Force; throw "UPX 후 ASLR/DEP 플래그가 사라졌습니다." }
+            }
+            $packages += $p
+        }
+        if (('console' -in $want) -and (Test-Path -LiteralPath $consoleExe -PathType Leaf)) {
+            $c = Join-Path $distDir "shield-console_v${version}_windows_x64.exe"
+            Copy-Item -LiteralPath $consoleExe -Destination $c
+            $packages += $c
+        }
+
+        # ------------------------------------------------------------------ 4. source zip
+        Step "소스 zip"
+        Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+        $zipPath = Join-Path $distDir "Shield_Project_v${version}.zip"
+        $excludeDirs = @('target', 'dist', '.git', '.vs', '.idea', '.wix', '.claude', '.claude-flow', '.swarm', '.hive-mind', 'node_modules', '_unused')
+        $excludeExt = @('.msi', '.wixpdb', '.sig', '.gpg', '.kbx', '.key', '.pem', '.pfx', '.p12', '.zip', '.shd', '.tmp', '.part')
+        $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force | Where-Object {
+            $rel = $_.FullName.Substring($root.Length + 1)
+            $parts = @($rel -split '[\\/]')
+            $top = $parts[0]
+            # 3.1.0 #8: tool and editor state never goes into the source zip, at any depth
+            $deep = @($parts[0..([Math]::Max(0, $parts.Count - 2))] | Where-Object { $_ -in @('.git', '.vs', '.idea', '.vscode', '.claude', '.claude-flow', '.swarm', '.hive-mind', 'node_modules', 'target') }).Count -gt 0
+            # test fixtures (.asc / .sig / .shd) are part of the source; other keys and outputs are not
+            $fixture = $rel -match '^crates[\\/]shield-core[\\/]tests[\\/]fixtures[\\/]'
+            $pubkey = $rel -match '^keys[\\/][^\\/]+\.asc$'
+            -not ($excludeDirs -contains $top) -and -not $deep -and -not $top.StartsWith('dist_old_') -and ($fixture -or $pubkey -or -not ($excludeExt -contains $_.Extension.ToLowerInvariant())) -and
+            -not ($_.Extension -eq '.asc' -and -not $fixture -and -not $pubkey) -and -not ($_.Name -like '.env*') -and -not ($_.Name -like '.shd_*')
+        }
+        foreach ($f in $files) { if ([System.IO.File]::ReadAllText($f.FullName) -match '(?m)^-----BEGIN [A-Z0-9 ]*(PRIVATE|SECRET) KEY( BLOCK)?-----') { throw "비밀키가 들어 있는 파일은 zip에 넣지 않습니다: $($f.FullName)" } }
+        $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
         try {
-            foreach ($ext in @("WixToolset.UI.wixext", "WixToolset.Util.wixext")) { & dotnet tool run wix -- extension add "$ext/$wixVersion"; Assert-ExitCode "WiX 확장 $ext" }
-            $msi = Join-Path $distDir "Shield_v${version}_x64.msi"
-            $wxs = Join-Path $root "installer\windows\installer.wxs"
-            $wxl = Join-Path $root "installer\windows\installer.$Culture.wxl"
-            & dotnet tool run wix -- build -arch x64 -culture $Culture -ext "WixToolset.UI.wixext/$wixVersion" -ext "WixToolset.Util.wixext/$wixVersion" `
-                -d "Version=$msiVersion" -d "NoticeRtf=$rtf" -d "Bin=$bin" -d "Signed=$(if ($doSign) { 'yes' } else { 'no' })" -loc $wxl $wxs -o $msi
-            Assert-ExitCode "WiX MSI 빌드"
-        } finally {
-            if ($null -eq $prevRf) { Remove-Item Env:\DOTNET_ROLL_FORWARD -ErrorAction SilentlyContinue } else { $env:DOTNET_ROLL_FORWARD = $prevRf }
-        }
-        $wixpdb = [System.IO.Path]::ChangeExtension($msi, ".wixpdb")
-        if (Test-Path -LiteralPath $wixpdb) { Remove-Item -LiteralPath $wixpdb -Force }
-        $packages += $msi
+            foreach ($f in $files) {
+                [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $f.FullName.Substring($root.Length + 1).Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
+            }
+        } finally { $zip.Dispose() }
+        Write-Host "  $(Split-Path -Leaf $zipPath) ($($files.Count)개 파일)"
+        $packages += $zipPath
     }
-
-    # ------------------------------------------------------------------ 3. portable builds
-    if ('portable' -in $want) {
-        # the name ending in "_portable" keeps settings in Shield_data next to the program
-        $p = Join-Path $distDir "Shield_v${version}_x64_portable.exe"
-        Copy-Item -LiteralPath $gui -Destination $p
-        if ($script:upxExe) {
-            $before = (Get-PeFlags $p) -band 0x160
-            Invoke-Upx @('--best', '--lzma', '--strip-relocs=0', '--no-progress', $p) | Out-Null
-            $null = Invoke-Upx @('-t', $p)
-            if (((Get-PeFlags $p) -band 0x160) -ne $before) { Remove-Item -LiteralPath $p -Force; throw "UPX 후 ASLR/DEP 플래그가 사라졌습니다." }
-        }
-        $packages += $p
-    }
-    if ($consoleExe) {
-        $c = Join-Path $distDir "shield-console_v${version}_windows_x64.exe"
-        Copy-Item -LiteralPath $consoleExe -Destination $c
-        $packages += $c
-    }
-
-    # ------------------------------------------------------------------ 4. source zip
-    Step "소스 zip"
-    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
-    $zipPath = Join-Path $distDir "Shield_Project_v$vu.zip"
-    $excludeDirs = @('target', 'dist', '.git', '.vs', '.idea', '.wix', '.claude', '.claude-flow', '.swarm', '.hive-mind', 'node_modules', '_unused')
-    $excludeExt = @('.msi', '.wixpdb', '.sig', '.gpg', '.kbx', '.key', '.pem', '.pfx', '.p12', '.zip', '.shd', '.tmp', '.part')
-    $files = Get-ChildItem -LiteralPath $root -Recurse -File -Force | Where-Object {
-        $rel = $_.FullName.Substring($root.Length + 1)
-        $top = ($rel -split '[\\/]')[0]
-        # test fixtures (.asc / .sig / .shd) are part of the source; other keys and outputs are not
-        $fixture = $rel -match '^crates[\\/]shield-core[\\/]tests[\\/]fixtures[\\/]'
-        $pubkey = $rel -match '^keys[\\/][^\\/]+\.asc$'
-        -not ($excludeDirs -contains $top) -and -not $top.StartsWith('dist_old_') -and ($fixture -or $pubkey -or -not ($excludeExt -contains $_.Extension.ToLowerInvariant())) -and
-        -not ($_.Extension -eq '.asc' -and -not $fixture -and -not $pubkey) -and -not ($_.Name -like '.env*') -and -not ($_.Name -like '.shd_*')
-    }
-    foreach ($f in $files) { if ([System.IO.File]::ReadAllText($f.FullName) -match '(?m)^-----BEGIN [A-Z0-9 ]*(PRIVATE|SECRET) KEY( BLOCK)?-----') { throw "비밀키가 들어 있는 파일은 zip에 넣지 않습니다: $($f.FullName)" } }
-    $zip = [System.IO.Compression.ZipFile]::Open($zipPath, [System.IO.Compression.ZipArchiveMode]::Create)
-    try {
-        foreach ($f in $files) {
-            [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip, $f.FullName, $f.FullName.Substring($root.Length + 1).Replace('\', '/'), [System.IO.Compression.CompressionLevel]::Optimal)
-        }
-    } finally { $zip.Dispose() }
-    Write-Host "  $(Split-Path -Leaf $zipPath) ($($files.Count)개 파일)"
-    $packages += $zipPath
 
     # ------------------------------------------------------------------ 5. release manifest (the updater checks it)
+    if (-not $doManifest) { Write-Host "완료 / done ($Stage)" -ForegroundColor Green; return }
+    if (-not $doPackage) {
+        if (-not (Test-Path -LiteralPath $distDir)) { throw "dist\ 가 없습니다 (먼저 -Stage package)" }
+        $names = @("Shield_v${version}_x64.msi", "Shield_v${version}_x64_portable.exe", "shield-console_v${version}_windows_x64.exe", "Shield_Project_v${version}.zip")
+        $packages = @($names | ForEach-Object { Join-Path $distDir $_ } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf })
+        if ($packages.Count -eq 0) { throw "dist\ 에 패키지가 없습니다." }
+    }
     $lines = @{}
     if ($MergeManifest) {
         $m = [System.IO.File]::ReadAllLines($MergeManifest)
@@ -320,11 +381,25 @@ try {
     $manifest = Join-Path $distDir "Shield_v${version}_release.txt"
     $body = @('Shield release manifest 1', "version $version") + @($lines.Keys | Sort-Object | ForEach-Object { $lines[$_] })
     [System.IO.File]::WriteAllText($manifest, (($body -join "`n") + "`n"), $utf8)
+    # 3.1.0 final (review B): v2 manifest (update::manifest2) for 3.1.0 final and later; v1 above
+    # stays unchanged for 3.0.0. Valid 365 days; revoked keys from keys\revoked_keys.txt.
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $rev = @()
+    $revFile = Join-Path $root "keys\revoked_keys.txt"
+    if (Test-Path -LiteralPath $revFile) {
+        foreach ($l in [System.IO.File]::ReadAllLines($revFile)) {
+            if ($l -cmatch '^[0-9A-F]{40}$') { $rev += "revoked_key $l" } elseif ($l -and -not $l.StartsWith('#')) { throw "keys\revoked_keys.txt: 지문은 줄마다 대문자 16진수 40자리입니다: $l" }
+        }
+    }
+    $hashLines = @($body | Select-Object -Skip 2)
+    $manifest2 = Join-Path $distDir "Shield_v${version}_release_v2.txt"
+    $body2 = @('Shield release manifest 2', "version $version", "release_id $now", "issued_at $now", "expires_at $($now + 365 * 86400)", "min_allowed_version $version") + @($rev | Sort-Object -Unique) + $hashLines
+    [System.IO.File]::WriteAllText($manifest2, (($body2 -join "`n") + "`n"), $utf8)
 
     # ------------------------------------------------------------------ 6. signatures, key, sums
     if ($doSign) {
         Step "배포 파일 서명"
-        foreach ($p in $packages + @($manifest)) { Sign-File $p }
+        foreach ($p in $packages + @($manifest, $manifest2)) { Sign-File $p }
         Copy-Item -LiteralPath $keyItem.FullName -Destination (Join-Path $distDir $keyItem.Name)
         $verify = @"
 Shield $version - verifying the release / 배포 파일 검증

@@ -10,7 +10,7 @@ use crate::progress::*;
 use sevenz_rust2::{ArchiveEntry, ArchiveReader, ArchiveWriter, EncoderMethod, Error as ZErr, NtTime, Password};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs::{self, OpenOptions},
     io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -75,9 +75,138 @@ pub fn entry_ok(n: &str) -> bool {
         && n.split('/').all(component_ok)
 }
 
-/// Key used for duplicate detection: Windows file names are case-insensitive.
+/// Key used for duplicate detection (3.1.0 final, review H: conservative). Two names count as the
+/// same when they could be the same file somewhere or look the same: NFKC compatibility forms
+/// ("ﬁ" / "fi", full-width letters), case (Windows, macOS), canonical composition (macOS stores
+/// "e" + U+0301 as "é"), and invisible characters (spoofing characters, ZWJ/ZWNJ, variation
+/// selectors). Such an archive is refused as a whole (`arc.dup`) instead of extracting one entry
+/// over another or showing two entries that can't be told apart. Only used for comparison; names
+/// are stored and extracted unchanged.
 pub fn dup_key(n: &str) -> String {
-    n.to_lowercase()
+    use unicode_normalization::UnicodeNormalization;
+    let visible: String = n.chars().filter(|c| !is_spoof_char(*c) && !is_variation_selector(*c) && !matches!(c, '\u{200C}' | '\u{200D}')).collect();
+    let folded: String = visible.nfkc().collect::<String>().to_lowercase();
+    folded.nfkc().collect()
+}
+
+/// Variation selectors (U+FE00..U+FE0F, U+E0100..U+E01EF): they change how the character BEFORE
+/// them is drawn (emoji or text style, CJK variants) and are invisible on their own.
+pub fn is_variation_selector(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{E0100}'..='\u{E01EF}')
+}
+
+/// Characters that make a file name look like something else or hide part of it.
+///
+/// 3.1.0 #4: bidirectional embedding, override and isolate controls (U+202A..U+202E,
+/// U+2066..U+2069), the LRM/RLM/ALM marks and the byte order mark. "a\u{202E}gpj.exe" shows as
+/// "aexe.jpg".
+/// 3.1.0 final (review H): every other invisible format character of Unicode category Cf (soft
+/// hyphen, zero width space, word joiner, invisible operators, interlinear annotation, tags,
+/// Arabic / Syriac / Kaithi / Egyptian format marks ...), private use characters (category Co: no
+/// meaning, any font may draw anything) and noncharacters (U+FDD0..U+FDEF, U+xxFFFE/U+xxFFFF).
+/// Not included on purpose: ZWJ (U+200D) and ZWNJ (U+200C), which emoji sequences, Persian and
+/// Indic scripts need, and variation selectors after a visible character (`spoof_at` treats a
+/// misplaced one as spoofing).
+pub fn is_spoof_char(c: char) -> bool {
+    let u = c as u32;
+    matches!(c,
+        // bidi controls and marks (3.1.0 #4)
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{FEFF}'
+        // other Cf (Unicode 15.1)
+        | '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{06DD}' | '\u{070F}' | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
+        | '\u{200B}' | '\u{2060}'..='\u{2064}' | '\u{206A}'..='\u{206F}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{110BD}' | '\u{110CD}' | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}' | '\u{1D173}'..='\u{1D17A}'
+        | '\u{E0001}' | '\u{E0020}'..='\u{E007F}'
+        // private use (Co)
+        | '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}'
+        // noncharacters
+        | '\u{FDD0}'..='\u{FDEF}'
+    ) || (u & 0xFFFE) == 0xFFFE
+}
+
+/// `is_spoof_char`, plus a variation selector that has no visible character to modify: at the
+/// start, after a separator or white space, or after another variation selector / spoofing
+/// character.
+fn spoof_at(prev: Option<char>, c: char) -> bool {
+    is_spoof_char(c) || (is_variation_selector(c) && prev.is_none_or(|p| p == '/' || p.is_whitespace() || p.is_control() || is_variation_selector(p) || is_spoof_char(p)))
+}
+
+/// Indices (char positions) of the spoofing characters of `name`.
+fn spoof_flags(name: &str) -> Vec<bool> {
+    let mut prev = None;
+    name.chars()
+        .map(|c| {
+            let s = spoof_at(prev, c);
+            prev = Some(c);
+            s
+        })
+        .collect()
+}
+
+/// True when `name` holds a spoofing character (`is_spoof_char` or a misplaced variation selector).
+pub fn has_spoof(name: &str) -> bool {
+    spoof_flags(name).into_iter().any(|x| x)
+}
+
+/// `name` with every spoofing character replaced by '_' (borrowed when there is none).
+pub fn sanitize_component(name: &str) -> Cow<'_, str> {
+    let f = spoof_flags(name);
+    if f.iter().any(|x| *x) {
+        Cow::Owned(name.chars().zip(f).map(|(c, s)| if s { '_' } else { c }).collect())
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// A name for display: each spoofing character shown as "<U+202E>". Comparisons and selection keep
+/// using the real name; only what is drawn or printed changes.
+pub fn display_name(name: &str) -> Cow<'_, str> {
+    let f = spoof_flags(name);
+    if f.iter().any(|x| *x) {
+        let mut s = String::with_capacity(name.len() + 16);
+        for (c, sp) in name.chars().zip(f) {
+            if sp {
+                s.push_str(&format!("<U+{:04X}>", c as u32));
+            } else {
+                s.push(c);
+            }
+        }
+        Cow::Owned(s)
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
+/// File types that Windows Explorer acts on by themselves (folder settings, shortcuts to network
+/// locations, Explorer commands). They are extracted unchanged (the download mark is copied
+/// already); the result only counts them so the user is warned.
+pub fn is_risky_windows_name(name: &str) -> bool {
+    let l = name.to_lowercase();
+    l == "desktop.ini" || [".library-ms", ".searchconnector-ms", ".scf", ".url"].iter().any(|x| l.ends_with(x))
+}
+
+/// What an extraction did besides writing files.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Extracted {
+    pub files: u64,
+    /// Entries whose name had direction-control characters replaced by '_'.
+    pub renamed: u64,
+    /// Files of a type `is_risky_windows_name` names.
+    pub risky: u64,
+}
+
+impl Extracted {
+    /// " · N names ..." notes for the result message (empty when there is nothing to say).
+    pub fn notes(&self) -> String {
+        let mut s = String::new();
+        if self.renamed > 0 {
+            s += &format!(" · {}", tf("arc.spoof_renamed", &[&self.renamed]));
+        }
+        if self.risky > 0 {
+            s += &format!(" · {}", tf("arc.risky_types", &[&self.risky]));
+        }
+        s
+    }
 }
 
 pub struct EntryInfo {
@@ -136,7 +265,18 @@ pub fn inspect<Rd: Read + Seek>(r: &mut Rd, packed_len: u64) -> R<Listing> {
         return Err(tf("arc.too_many", &[&a.files.len(), &MAX_FILES]));
     }
     let avail = crate::sysinfo::avail_mem();
-    for b in &a.blocks {
+    // (absolute offset, size) of every pack stream a zstd decoder reads (checked below)
+    let mut zstd_streams = Vec::new();
+    for (bi, b) in a.blocks.iter().enumerate() {
+        if b.coders.iter().any(|c| c.encoder_method_id() == EncoderMethod::ID_ZSTD) {
+            // Shield writes one coder per block; a zstd chain is not something it made
+            let idx = a.stream_map.block_first_pack_stream_index().get(bi).copied();
+            let range = idx.and_then(|i| Some((a.stream_map.pack_stream_offsets().get(i)?, a.pack_sizes().get(i)?)));
+            match (b.coders.len(), range) {
+                (1, Some((off, size))) => zstd_streams.push((sevenz_rust2::SIGNATURE_HEADER_SIZE.saturating_add(a.pack_pos()).saturating_add(*off), *size)),
+                _ => return Err(t("arc.method").into()),
+            }
+        }
         for c in &b.coders {
             let id = c.encoder_method_id();
             if id == EncoderMethod::ID_LZMA2 {
@@ -185,8 +325,134 @@ pub fn inspect<Rd: Read + Seek>(r: &mut Rd, packed_len: u64) -> R<Listing> {
         return Err(t("arc.bomb").into());
     }
     drop(rd);
+    for (off, size) in zstd_streams {
+        zstd_frames_ok(r, off, size)?;
+    }
     r.seek(SeekFrom::Start(0)).map_err(e)?;
     Ok(out)
+}
+
+/// Largest zstd window (decoder buffer) accepted (3.1.0 final, review H). Shield compresses with
+/// levels 1..19 (window at most 8 MiB); the zstd decoder itself accepts up to 128 MiB per stream.
+pub const MAX_ZSTD_WINDOW: u64 = 32 << 20;
+/// Most zstd blocks walked in one pack stream (a 128 KiB block each: 64 GiB).
+const MAX_ZSTD_BLOCKS: u64 = 1 << 19;
+
+/// The window size a zstd frame header (starting at its magic number) asks for, or why it is
+/// refused. `hdr` holds at least the first 14 bytes of the frame (fewer at the end of the stream).
+/// Returns (window, header length).
+pub fn zstd_frame_window(hdr: &[u8]) -> Result<(u64, usize), &'static str> {
+    if hdr.len() < 5 || hdr[..4] != [0x28, 0xB5, 0x2F, 0xFD] {
+        return Err("arc.zstd_frame");
+    }
+    let fhd = hdr[4];
+    if fhd & 0x08 != 0 {
+        return Err("arc.zstd_frame"); // reserved bit
+    }
+    if fhd & 0x03 != 0 {
+        return Err("arc.zstd_dict"); // Shield never uses dictionaries
+    }
+    let single = fhd & 0x20 != 0;
+    let fcs_len = match fhd >> 6 {
+        0 if single => 1,
+        0 => 0,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let mut pos = 5;
+    let window = if single {
+        0
+    } else {
+        let wd = *hdr.get(pos).ok_or("arc.zstd_frame")?;
+        pos += 1;
+        let log = 10 + u64::from(wd >> 3);
+        if log > 41 {
+            return Err("arc.zstd_frame");
+        }
+        let base = 1u64 << log;
+        base + (base / 8) * u64::from(wd & 7)
+    };
+    let fcs_bytes = hdr.get(pos..pos + fcs_len).ok_or("arc.zstd_frame")?;
+    pos += fcs_len;
+    let mut fcs = 0u64;
+    for (i, b) in fcs_bytes.iter().enumerate() {
+        fcs |= u64::from(*b) << (8 * i);
+    }
+    if fcs_len == 2 {
+        fcs += 256;
+    }
+    // a single segment frame is decoded into one buffer of its content size
+    Ok((if single { fcs } else { window }, pos))
+}
+
+/// Walks every zstd frame of the pack stream at `off` (`size` bytes): each frame's window must be
+/// within `MAX_ZSTD_WINDOW`, skippable frames are skipped, the blocks must fit the stream. Only
+/// headers are read (3 bytes per block), never the compressed data.
+fn zstd_frames_ok<Rd: Read + Seek>(r: &mut Rd, off: u64, size: u64) -> R<()> {
+    let end = off.checked_add(size).ok_or_else(|| t("arc.zstd_frame").to_string())?;
+    let bad = |k: &'static str| t(k).to_string();
+    let mut pos = off;
+    let mut blocks = 0u64;
+    while pos < end {
+        let mut hdr = [0u8; 14];
+        r.seek(SeekFrom::Start(pos)).map_err(e)?;
+        let n = read_up_to(r, &mut hdr[..(end - pos).min(14) as usize]).map_err(e)?;
+        let h = &hdr[..n];
+        // skippable frame: magic 0x184D2A50..5F, 4-byte length
+        if h.len() >= 8 && h[1..4] == [0x2A, 0x4D, 0x18] && h[0] & 0xF0 == 0x50 {
+            let len = u64::from(u32::from_le_bytes([h[4], h[5], h[6], h[7]]));
+            pos = pos.checked_add(8 + len).filter(|p| *p <= end).ok_or_else(|| bad("arc.zstd_frame"))?;
+            continue;
+        }
+        let (window, hlen) = zstd_frame_window(h).map_err(bad)?;
+        if window > MAX_ZSTD_WINDOW {
+            return Err(tf("arc.zstd_window", &[&crate::ui_fmt::human(window), &crate::ui_fmt::human(MAX_ZSTD_WINDOW)]));
+        }
+        let checksum = h[4] & 0x04 != 0;
+        pos += hlen as u64;
+        loop {
+            blocks += 1;
+            if blocks > MAX_ZSTD_BLOCKS {
+                return Err(bad("arc.zstd_frame"));
+            }
+            let mut bh = [0u8; 3];
+            r.seek(SeekFrom::Start(pos)).map_err(e)?;
+            if pos + 3 > end || read_up_to(r, &mut bh).map_err(e)? != 3 {
+                return Err(bad("arc.zstd_frame"));
+            }
+            let v = u32::from(bh[0]) | u32::from(bh[1]) << 8 | u32::from(bh[2]) << 16;
+            let (last, kind, bsize) = (v & 1 == 1, (v >> 1) & 3, u64::from(v >> 3));
+            let data = match kind {
+                0 | 2 => bsize,
+                1 => 1,
+                _ => return Err(bad("arc.zstd_frame")),
+            };
+            // a block is never larger than 128 KiB or the window
+            if bsize > (128 << 10).min(window.max(1 << 10)) && kind != 1 {
+                return Err(bad("arc.zstd_frame"));
+            }
+            pos = pos.checked_add(3 + data).filter(|p| *p <= end).ok_or_else(|| bad("arc.zstd_frame"))?;
+            if last {
+                break;
+            }
+        }
+        if checksum {
+            pos = pos.checked_add(4).filter(|p| *p <= end).ok_or_else(|| bad("arc.zstd_frame"))?;
+        }
+    }
+    Ok(())
+}
+
+fn read_up_to<Rd: Read>(r: &mut Rd, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut n = 0;
+    while n < buf.len() {
+        match r.read(&mut buf[n..])? {
+            0 => break,
+            k => n += k,
+        }
+    }
+    Ok(n)
 }
 
 fn entry_for(rel: &str, is_dir: bool, mtime: Option<SystemTime>) -> ArchiveEntry {
@@ -346,15 +612,35 @@ impl Read for Bounded<'_> {
 /// name of an entry (None = skip it). Files are created with `create_new` and never overwrite.
 /// `limit` is the number of bytes the caller verified against the authenticated metadata; the
 /// running total of written bytes may never exceed it.
-pub fn extract<Rd: Read + Seek>(r: &mut Rd, dest: &Path, limit: u64, map: &dyn Fn(&str) -> Option<String>) -> R<u64> {
+///
+/// 3.1.0 #4: every component of the output name has its direction-control characters replaced by
+/// '_' (`sanitize_component`) and the result is checked again (`entry_ok`, duplicates). Two
+/// entries that become the same name are an error, never silently renamed further.
+pub fn extract<Rd: Read + Seek>(r: &mut Rd, dest: &Path, limit: u64, map: &dyn Fn(&str) -> Option<String>) -> R<Extracted> {
     progress_start(limit);
     let mut seen = HashSet::new();
-    let mut count = 0u64;
+    let mut done = Extracted::default();
+    // cleaned name key -> the entry name it came from (for the collision message)
+    let mut renamed: HashMap<String, String> = HashMap::new();
     let mut written = 0u64;
     for_each(r, |en, rdr| {
-        let Some(out) = map(en.name()) else { return Ok(true) };
-        if !entry_ok(&out) || !seen.insert(dup_key(&out)) {
-            return Err(tf("arc.unsafe_path", &[&out]));
+        let Some(orig) = map(en.name()) else { return Ok(true) };
+        let out: String = orig.split('/').map(sanitize_component).collect::<Vec<_>>().join("/");
+        let changed = out != orig;
+        if !entry_ok(&out) {
+            return Err(tf("arc.unsafe_path", &[&display_name(&orig)]));
+        }
+        let key = dup_key(&out);
+        if !seen.insert(key.clone()) {
+            let shown = if changed { Some(orig.as_str()) } else { renamed.get(&key).map(String::as_str) };
+            return Err(match shown {
+                Some(o) => tf("arc.spoof_clash", &[&display_name(o), &out]),
+                None => tf("arc.unsafe_path", &[&out]),
+            });
+        }
+        if changed {
+            renamed.insert(key, orig.clone());
+            done.renamed += 1;
         }
         if en.is_directory() {
             make_dirs(dest, &out)?;
@@ -377,10 +663,13 @@ pub fn extract<Rd: Read + Seek>(r: &mut Rd, dest: &Path, limit: u64, map: &dyn F
         if en.has_last_modified_date {
             let _ = fh.set_modified(en.last_modified_date().into());
         }
-        count += 1;
+        done.files += 1;
+        if is_risky_windows_name(file) {
+            done.risky += 1;
+        }
         Ok(true)
     })?;
-    Ok(count)
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -432,5 +721,69 @@ mod tests {
         assert_eq!(lzma2_dict(1), Some(6144));
         assert_eq!(lzma2_dict(18), Some(2 << 20));
         assert_eq!(lzma2_dict(41), None);
+    }
+
+    /// One zstd frame: header with window descriptor `wd`, then raw blocks of `blocks` sizes.
+    fn frame(wd: u8, blocks: &[usize], checksum: bool) -> Vec<u8> {
+        let mut v = vec![0x28, 0xB5, 0x2F, 0xFD, if checksum { 0x04 } else { 0 }, wd];
+        for (i, n) in blocks.iter().enumerate() {
+            let last = u32::from(i + 1 == blocks.len());
+            let h = last | ((*n as u32) << 3);
+            v.extend_from_slice(&h.to_le_bytes()[..3]);
+            v.extend(std::iter::repeat_n(0xAB, *n));
+        }
+        if checksum {
+            v.extend_from_slice(&[1, 2, 3, 4]);
+        }
+        v
+    }
+
+    fn walk(data: &[u8]) -> R<()> {
+        // 7 bytes of something else first: offsets are honoured
+        let mut all = vec![9u8; 7];
+        all.extend_from_slice(data);
+        zstd_frames_ok(&mut std::io::Cursor::new(all), 7, data.len() as u64)
+    }
+
+    #[test]
+    fn zstd_frames_are_walked_and_big_windows_refused() {
+        let ok = frame(13 << 3, &[1000, 50], true);
+        walk(&ok).unwrap();
+        // two frames and a skippable frame in between
+        let mut two = ok.clone();
+        two.extend_from_slice(&[0x5E, 0x2A, 0x4D, 0x18, 3, 0, 0, 0, 7, 7, 7]);
+        two.extend(frame(10 << 3, &[10], false));
+        walk(&two).unwrap();
+        // the second frame asks for 128 MiB: refused although the first is fine
+        let mut big = ok.clone();
+        big.extend(frame(17 << 3, &[10], false));
+        let e = walk(&big).unwrap_err();
+        assert!(e.contains("128"), "{e}");
+        // cut off, garbage after the frame, a block past the end, reserved block type
+        assert!(walk(&ok[..ok.len() - 2]).is_err());
+        let mut junk = ok.clone();
+        junk.extend_from_slice(&[0, 0, 0]);
+        assert!(walk(&junk).is_err());
+        let mut lie = frame(13 << 3, &[10], false);
+        lie[6] = 0xF9; // block size far larger than the stream
+        assert!(walk(&lie).is_err());
+        let mut reserved = frame(13 << 3, &[10], false);
+        reserved[6] |= 0b110;
+        assert!(walk(&reserved).is_err());
+    }
+
+    #[test]
+    fn archives_shield_writes_with_zstd_pass_the_frame_check() {
+        use std::io::Cursor;
+        let mut z = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+        for level in [1, 19] {
+            z.set_content_methods(vec![sevenz_rust2::encoder_options::ZstandardOptions::from_level(level).into()]);
+            let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8 ^ (i / 7) as u8).collect();
+            z.push_archive_entry(ArchiveEntry::new_file(&format!("f{level}.bin")), Some(Cursor::new(data))).unwrap();
+        }
+        let mut c = z.finish().unwrap();
+        let n = c.get_ref().len() as u64;
+        let l = inspect(&mut c, n).unwrap();
+        assert_eq!(l.files, 2);
     }
 }

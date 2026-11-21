@@ -22,7 +22,7 @@ fn args(s: &str) -> usize {
 fn both_languages_have_the_same_keys() {
     let (ko, en) = (tables(Lang::Ko), tables(Lang::En));
     for (i, (a, b)) in ko.iter().zip(en.iter()).enumerate() {
-        let area = ["core", "ui", "v3", "cli"][i];
+        let area = ["core", "ui", "v3", "cli", "sd"][i];
         let (ka, kb) = (keys(a), keys(b));
         let only_ko: Vec<_> = ka.difference(&kb).collect();
         let only_en: Vec<_> = kb.difference(&ka).collect();
@@ -49,7 +49,7 @@ fn both_languages_take_the_same_arguments() {
 #[test]
 fn appended_fragments_start_with_a_separator_in_both_languages() {
     // these are added to the end of another message
-    for k in ["eng.skipped", "eng.no_guarantee", "eng.wipe_cancelled", "eng.wipe_failed", "eng.zone_only", "man.streams_shredded", "man.changed_kept", "man.hardlinks_kept", "man.shred_failed", "man.dirs_kept", "ui.eta", "job.secs", "eng.some_stored"] {
+    for k in ["eng.skipped", "eng.no_guarantee", "eng.wipe_cancelled", "eng.wipe_failed", "eng.zone_only", "man.streams_shredded", "man.changed_kept", "man.hardlinks_kept", "man.shred_failed", "man.dirs_kept", "ui.eta", "job.secs", "eng.some_stored", "sd.res_cancelled"] {
         for m in [map(Lang::Ko), map(Lang::En)] {
             assert!(m[k].starts_with(' '), "{k}");
         }
@@ -59,7 +59,7 @@ fn appended_fragments_start_with_a_separator_in_both_languages() {
 fn source_keys() -> BTreeSet<String> {
     const PREFIXES: &[&str] = &[
         "ads", "algo", "arc", "cap", "col", "comp", "cont", "crypto", "dlg", "eng", "err", "fmt", "help", "i", "job", "kf", "m", "man", "p", "pw", "set", "shell",
-        "st", "stage", "stage_s", "sys", "tab", "ui", "v", "wipe", "sig", "upd", "cli", "ent", "info", "multi", "harden", "win",
+        "st", "stage", "stage_s", "sys", "tab", "ui", "v", "wipe", "sig", "upd", "cli", "ent", "info", "multi", "harden", "win", "sd",
     ];
     // file names that look like keys ("m.shd" in a test)
     const NOT_KEYS: &[&str] = &["shd", "rs", "txt", "lst", "key", "lck", "tmp", "ttf", "exe", "pdf", "toml"];

@@ -1,13 +1,33 @@
-# cargo audit (3.0.0 section 6). Each ignored advisory was reviewed; see docs/05 (audit log).
+# cargo audit (3.0.0 section 6; 3.1.0 #2: CI runs `cargo audit --deny warnings`). Each entry says
+# why it is listed, where the crate comes from and what would remove it; docs/05 has the review log.
+# The same IDs are listed in deny.toml for `cargo deny check advisories`.
+# 3.1.0 final (review I): every entry has a "review-by" date (6 months); the CI audit job fails
+# once one has passed, so each exception is looked at again (still needed? fixed release out?).
 [advisories]
 ignore = [
     # rsa 0.9 (Marvin attack) and crypto-bigint 0.5 (timing): only reached through `pgp` for
-    # verifying release signatures with a PUBLIC key. Timing side channels need secret-key
-    # operations (decrypt / sign), which Shield never performs. No fixed rsa release exists.
-    "RUSTSEC-2023-0071",
-    "RUSTSEC-2026-0387",
+    # verifying release signatures with a PUBLIC key. The advisories concern secret-key
+    # operations (decrypt / sign), which Shield does not perform. No fixed rsa release exists.
+    "RUSTSEC-2023-0071", # review-by 2027-05-10
+    # crypto-bigint: the lock file has two versions. 0.7.10 (bp256/bp384 -> elliptic-curve 0.14)
+    # is in the patched range (>= 0.7.6). 0.5.5 (pgp 0.21 -> cx448, elliptic-curve 0.13) is not,
+    # and cannot be raised without a pgp release that leaves 0.5. This entry is for 0.5.5.
+    "RUSTSEC-2026-0387", # review-by 2027-05-10
     # webbrowser 0.8 (BROWSER argument injection, Unix): pulled in by egui-winit 0.27's always-on
-    # "links" feature. Unreachable: shield-gui drops every egui open_url request at the end of
-    # each frame (shell::end_frame, tested); its own links go through Platform::open_url.
-    "RUSTSEC-2026-0257",
+    # "links" feature. shield-gui drops every egui open_url request at the end of each frame
+    # (shell::end_frame; tests: links_never_reach_the_webbrowser_crate, and
+    # every_window_drops_links_at_the_end_of_each_frame checks that every window does so);
+    # its own links go through Platform::open_url.
+    "RUSTSEC-2026-0257", # review-by 2027-05-10
+    # --- "unmaintained" notices (no vulnerability reported), listed so that --deny warnings
+    # still fails on anything new. Removing them needs dependency upgrades that 3.1.0 does not do:
+    # paste 1.0: only in the lock file through `metal` (macOS graphics; not built for Windows/Linux)
+    "RUSTSEC-2024-0436", # review-by 2027-05-10
+    # ttf-parser 0.25: egui 0.27 -> epaint -> ab_glyph -> owned_ttf_parser (font loading)
+    "RUSTSEC-2026-0192", # review-by 2027-05-10
+    # zbus_names 3 / zvariant 4 / zvariant_derive 4: rfd 0.14 -> ashpd 0.8 -> zbus 4 (Linux file
+    # dialog through the XDG portal)
+    "RUSTSEC-2026-0371", # review-by 2027-05-10
+    "RUSTSEC-2026-0370", # review-by 2027-05-10
+    "RUSTSEC-2026-0372", # review-by 2027-05-10
 ]

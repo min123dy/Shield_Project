@@ -2,6 +2,7 @@
 
 pub mod display;
 mod entropy;
+mod erase;
 pub mod fs;
 mod install;
 pub mod mem;
@@ -15,7 +16,10 @@ mod tests;
 /// System helpers (memory, processes, UI language, time, pkexec).
 pub mod sys {
     pub use super::storage::{volume_label, wipe_free_space};
-    pub use super::install::{install_package, package_kind, Installed};
+    pub use super::install::{
+        create_update_file, helper_allowed, input_owner_ok, install_from_private, install_package, package_kind, remove_private_dir, root_dir_ok, run_update_helper, update_helper_allowed,
+        update_input_owner_ok, update_private_dir, update_state_path, Installed, HELPER_ARG as UPDATE_HELPER_ARG,
+    };
     pub use super::sys_impl::*;
 
     /// Linux has no hidden elevated helper (TRIM needs `sudo fstrim`, shown as a hint).
@@ -36,6 +40,19 @@ fn runtime_dir() -> Option<PathBuf> {
     let d = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
     let m = std::fs::symlink_metadata(&d).ok()?;
     (d.is_absolute() && m.is_dir() && m.uid() == unsafe { libc::getuid() } && m.permissions().mode() & 0o077 == 0).then_some(d)
+}
+
+/// The base of the config folder: $XDG_CONFIG_HOME when it is an absolute path (the XDG spec
+/// ignores a relative one), else `<home>/.config`. Neither: an error (3.1.0 final, review D:
+/// 3.1.0 used /tmp/shield, a folder other users can create first).
+pub(crate) fn config_base(xdg: Option<std::ffi::OsString>, home: Option<PathBuf>) -> PResult<PathBuf> {
+    if let Some(x) = xdg.map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return Ok(x);
+    }
+    match home.filter(|h| h.is_absolute()) {
+        Some(h) => Ok(h.join(".config")),
+        None => Err(PlatformError::Failed("no config folder: neither XDG_CONFIG_HOME nor a home folder is set".into())),
+    }
 }
 
 impl Platform for LinuxOs {
@@ -72,9 +89,9 @@ impl Platform for LinuxOs {
     fn open_url(&self, url: &str) -> PResult<()> {
         shell::open_url(url)
     }
-    fn config_dir(&self) -> PathBuf {
-        // $XDG_CONFIG_HOME/shield (usually ~/.config/shield)
-        dirs::config_dir().or_else(|| dirs::home_dir().map(|h| h.join(".config"))).unwrap_or_else(|| PathBuf::from("/tmp")).join("shield")
+    fn config_dir(&self) -> PResult<PathBuf> {
+        // $XDG_CONFIG_HOME/shield (usually ~/.config/shield); never a shared folder like /tmp
+        config_base(std::env::var_os("XDG_CONFIG_HOME"), dirs::home_dir()).map(|d| d.join("shield"))
     }
     fn temp_dir(&self) -> PathBuf {
         // small temporary files (update downloads): RAM-backed runtime folder when available

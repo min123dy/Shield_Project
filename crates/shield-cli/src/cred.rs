@@ -95,21 +95,34 @@ impl Ctx {
             }
             b2.clear();
         }
-        check_new(&self.o, &b, pim, !keyfiles.is_empty(), new)?;
+        check_new(&self.o, &b, pim, !keyfiles.is_empty(), new, self.a.has("allow-weak"))?;
         let kf = crate::keyfile::keyfile_opt(&keyfiles)?;
         Ok(Secret { pw: b.take()?, kf, pim, keyfiles })
     }
 }
 
-/// The same check as the windows (`password::check_new`): a block is an error, warnings need the
-/// "use it anyway" confirmation (a terminal answer or `--yes`). The confirmation field was
+/// The same check as the windows (`password::check_new`): a block is an error. Warnings (weak
+/// password, key file only) are always printed and then need the "use it anyway" answer on a
+/// terminal or `--allow-weak` (3.1.0 final, review E). `--yes` does not answer this: a script
+/// that says yes to everything must not create a container with a weak password by accident;
+/// without a terminal and without `--allow-weak` it is refused. The confirmation field was
 /// compared by the caller already.
-pub fn check_new(o: &Out, b: &SecretBuf, pim: u32, has_kf: bool, new: bool) -> Result<(), String> {
+pub fn check_new(o: &Out, b: &SecretBuf, pim: u32, has_kf: bool, new: bool, allow_weak: bool) -> Result<(), String> {
     let c = check_new_password(b.as_str(), None, b.overflow, pim, has_kf);
     if let Some(first) = c.blocks.into_iter().next() {
         return Err(if first == t("pw.b_empty") { t(if new { "p.need_new_cred" } else { "p.need_cred" }).into() } else { first });
     }
-    if !c.warnings.is_empty() && !o.confirm(&c.warnings, t("cli.use_weak"))? {
+    if c.warnings.is_empty() {
+        return Ok(());
+    }
+    if allow_weak {
+        for w in &c.warnings {
+            eprintln!("{} {w}", t("cli.warning"));
+        }
+        eprintln!("{}", t("cli.weak_allowed"));
+        return Ok(());
+    }
+    if !o.ask_tty(&c.warnings, t("cli.use_weak"), t("cli.weak_needs_flag"))? {
         return Err(crate::progress::cancelled_msg());
     }
     Ok(())
@@ -126,19 +139,19 @@ mod tests {
     #[test]
     fn new_credentials_follow_the_window_rules() {
         let yes = Out { yes: true, ..Default::default() };
-        assert!(check_new(&yes, &buf(""), DEFAULT_PIM, false, false).is_err(), "nothing given");
-        assert!(check_new(&yes, &buf("short"), DEFAULT_PIM, false, false).is_ok(), "short: a warning, confirmed by --yes");
-        assert!(check_new(&yes, &buf("Zk#9vQ!x2Lp$7"), 0, false, false).is_err(), "below the default PIM: 20 characters needed");
         let no = Out::default();
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            assert!(check_new(&no, &buf("short"), DEFAULT_PIM, false, false).is_err(), "short without --yes: refused");
-        }
-        assert!(check_new(&yes, &buf(""), DEFAULT_PIM, true, false).is_ok(), "key file only, confirmed by --yes");
-        assert!(check_new(&yes, &buf("correct horse battery staple 9"), DEFAULT_PIM, false, true).is_ok());
-        // a weak password without --yes and without a terminal is refused, never silently used
-        let no = Out::default();
-        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-            assert!(check_new(&no, &buf("password1234"), DEFAULT_PIM, false, false).is_err());
+        let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        assert!(check_new(&yes, &buf(""), DEFAULT_PIM, false, false, true).is_err(), "nothing given: a block, --allow-weak does not help");
+        assert!(check_new(&no, &buf("short"), DEFAULT_PIM, false, false, true).is_ok(), "short: a warning, accepted with --allow-weak");
+        assert!(check_new(&no, &buf("Zk#9vQ!x2Lp$7"), 0, false, false, true).is_err(), "below the default PIM: 20 characters needed (a block)");
+        assert!(check_new(&no, &buf(""), DEFAULT_PIM, true, false, true).is_ok(), "key file only, accepted with --allow-weak");
+        assert!(check_new(&no, &buf("correct horse battery staple 9"), DEFAULT_PIM, false, true, false).is_ok(), "no warning: nothing to allow");
+        if !tty {
+            // review E: --yes alone never accepts a weak password; without a terminal it is refused
+            let e = check_new(&yes, &buf("short"), DEFAULT_PIM, false, false, false).unwrap_err();
+            assert_eq!(e, t("cli.weak_needs_flag"));
+            assert!(check_new(&no, &buf("password1234"), DEFAULT_PIM, false, false, false).is_err());
+            assert!(check_new(&yes, &buf(""), DEFAULT_PIM, true, false, false).is_err(), "key file only needs --allow-weak too");
         }
     }
 }

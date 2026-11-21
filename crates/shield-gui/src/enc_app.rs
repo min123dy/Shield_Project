@@ -1,5 +1,6 @@
 //! Encryption window: state, input checks and dialogs (jobs: enc_jobs.rs).
-//! Tabs: encrypt / decrypt / password and key change / disk cleanup / settings / algorithms / help.
+//! Tabs: encrypt / decrypt / password and key change / disk cleanup / secure delete (wipe_view.rs)
+//! / settings / algorithms / help.
 //! Browsing and opening containers live in the separate file manager window (mgr_app.rs).
 
 use crate::engine::*;
@@ -26,6 +27,8 @@ pub enum Tab {
     Decrypt,
     Rekey,
     Disk,
+    /// 3.1.0 final: secure delete of any files and folders (wipe_view.rs).
+    Wipe,
     Settings,
     Algo,
     Help,
@@ -77,6 +80,7 @@ pub struct EncApp {
     pub disk_drive: Option<PathBuf>,
     pub job: Option<Job<String>>,
     pub pending: Option<Pending>,
+    pub wipe: crate::wipe_view::WipeTab,
 }
 
 pub use crate::outname::{bundle_output, default_output};
@@ -128,13 +132,18 @@ impl EncApp {
             disk_drive: None,
             job: None,
             pending: None,
+            wipe: crate::wipe_view::WipeTab::new(set.shred_passes),
             sh: Shell::new(set),
         };
         match start {
-            Start::Encrypt(items) => {
+            Start::Encrypt { items, dropped } => {
                 a.tab = Tab::Encrypt;
                 for p in items {
                     a.select(p);
+                }
+                // review F: unusable items of the file manager selection are counted, not lost
+                if dropped > 0 {
+                    a.sh.msg(false, tf("sd.dropped", &[&dropped]));
                 }
                 if a.items.len() > 1 {
                     a.pending = Some(Pending::Multi(a.items.len()));
@@ -145,6 +154,13 @@ impl EncApp {
                 if let Some(p) = p {
                     a.select(p);
                 }
+            }
+            Start::Wipe { items, dropped } => {
+                a.tab = Tab::Wipe;
+                for p in items {
+                    a.wipe.add(p);
+                }
+                a.wipe.dropped = dropped;
             }
             Start::Settings => a.tab = Tab::Settings,
             _ => {}
@@ -157,13 +173,18 @@ impl EncApp {
     }
 
     pub fn busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.wipe.busy()
     }
 
     /// A .shd file is the container to decrypt / rekey; anything else joins the items to encrypt.
     pub fn select(&mut self, p: PathBuf) {
         if self.tab == Tab::Disk {
             self.disk_drive = Some(p);
+            return;
+        }
+        // secure delete: only joins that list (not remembered in the recent files)
+        if self.tab == Tab::Wipe {
+            self.wipe.add(p);
             return;
         }
         let shd = is_shd(&p) && p.is_file();
@@ -193,7 +214,7 @@ impl EncApp {
     }
 
     pub fn has_secrets(&self) -> bool {
-        !(self.pw.is_empty() && self.pw2.is_empty() && self.new_pw.is_empty() && self.new_pw2.is_empty())
+        !(self.pw.is_empty() && self.pw2.is_empty() && self.new_pw.is_empty() && self.new_pw2.is_empty()) || self.wipe.pw.is_some()
     }
 
     pub fn clear_secrets(&mut self) {
@@ -376,8 +397,10 @@ impl EncApp {
     pub fn ui_frame(&mut self, ctx: &egui::Context) {
         let ev = self.sh.frame(ctx, self.has_secrets());
         if let Some(r) = ev.lock {
-            if self.has_secrets() || self.pending.is_some() {
+            if self.has_secrets() || self.pending.is_some() || self.wipe.confirming() {
                 self.clear_secrets();
+                // a started secure delete confirmation does not survive a lock (3.1.0 final)
+                self.wipe.reset_confirm();
                 self.sh.lock_message(r);
             }
         }
@@ -401,11 +424,13 @@ impl EncApp {
             ui.enc_passes = Some(self.passes);
         }
         self.poll_job();
+        self.poll_wipe();
         if self.busy() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
         crate::enc_views::frame(self, ctx);
         self.dialogs(ctx);
+        self.wipe_dialogs(ctx);
         crate::shell::end_frame(ctx);
     }
 }

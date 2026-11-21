@@ -124,7 +124,7 @@ fn encryption_window_draws_every_tab_without_blocking() {
 
 #[test]
 fn every_start_screen_opens() {
-    for start in [Start::Default, Start::Encrypt(vec![]), Start::Decrypt(None), Start::Settings] {
+    for start in [Start::Default, Start::Encrypt { items: vec![], dropped: 2 }, Start::Decrypt(None), Start::Settings, Start::Wipe { items: vec![], dropped: 1 }] {
         let file = temp_settings();
         let label = format!("{start:?}");
         within(&label, 60, move || {

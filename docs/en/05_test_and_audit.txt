@@ -1,4 +1,4 @@
-SHIELD 3.0.0 - Test and security audit record
+SHIELD 3.1.0 - Test and security audit record
 ============================================
 한국어: docs\05_테스트_및_점검_기록.txt. The 2.x record: docs\history\05_테스트_및_수정_기록_2.x.txt (Korean)
 
@@ -303,3 +303,191 @@ Results of the run right before the final artifacts were made (2026-11-03).
     portable start (default, --manager,             window visible in 0.22-0.51 s, responding, exit 0 on WM_CLOSE
     --settings, --decrypt)
     console --version                               exit 0
+
+9. 3.1.0 audit (2026-11-08 to 11-09, 3.0.0 -> 3.1.0)
+---------------------------------------------------
+Items of the two static reviews and the results of this round. Per item details: 06_changes_3.1.0.txt.
+
+9.1 Static review items and results
+  No.   Subject                                          Severity    Result
+  1     swap between update verification and install     medium      fixed (privileged helper re-verifies a copy)
+  2     signing key reachable from build jobs, no pins   medium      fixed (build/sign split, environment, SHA pins)
+  3     no time/expiry/sign-flag checks, a single key    low-medium  fixed (check_times, backup key, docs/07)
+  4     bidi control characters in names                low-medium  fixed (escaped display, '_' on extraction)
+  5     option-like file names, --shred question        low         fixed
+  6     password policy                                 -           out of scope (unchanged)
+  7     limits of settings protection                   info        documented (no code change)
+  8     repository hygiene                              low         fixed (.claude-flow removed, .gitignore, zip)
+  9-A   key copies inside the AEAD                      check       poly1305 zeroize on, the rest checked in source
+  9-B   Nemo Quote=double                               check       safe by source + GLib check, kept (real Nemo not run)
+  9-C   MinGW builds lose the DLL search protection     low         build.ps1 refuses non-MSVC targets
+  9-D   no Authenticode on the MSI                      optional    documented (optional task)
+  9-E   3 dependency advisories                         check       cannot be raised (checked), reasons written, test
+  10    fail-open directory walk on Linux               medium      fixed (walk by handle, re-check before shredding)
+  11    overwrite race in the folder-move fallback      low         fixed (files by link, folders into closed parents)
+  12    path re-check when removing temporary files     low         fixed (file ID compared)
+  13    KDF cost before authentication, cancel          low         fixed (size check, one at a time, prompt cancel)
+  14    "Open in SHIELD" (new feature)                  -           implemented
+
+9.2 Found during this round
+  R1  build.sh's EXIT trap (cleanup) ended with status 1 in unsigned builds, so under set -e the whole script exited 1
+      (since 3.0.0). Found running the Linux stages. Fixed + release_tests::build_sh_exit_trap_cannot_fail_the_build.
+  R2  The item 14 code called a missing file "not a regular file". Found in the real 3.0.0 -> 3.1.0 run. Fixed
+      (missing / reason / not regular told apart) + expectations in container_tests and mgr_tests corrected.
+  R3  The Windows device paths in the item 14 test had lost one leading \ and did not test devices (the writing tool
+      had turned \\ into \). Data fixed + form checked. The whole source was searched for raw strings that start with a
+      single backslash; the only other one is correct (the \??\ prefix).
+  R4  4 clippy warnings introduced by this round. Fixed.
+  R5  cargo deny counted internal path dependencies as wildcards: internal crates are publish = false.
+
+9.3 How things were checked
+- rPGP 0.21 verify: the source shows no time or expiry checks -> implemented here (item 3).
+- chacha20poly1305 0.10.1 / chacha20 0.9.1 / poly1305 0.8.0: Drop and zeroize read in the source (9-A).
+- Nemo (linuxmint/nemo master): the quoting code in nemo-action.c and eel-string.c was read, and Exec lines built the
+  same way were split with GLib 2.84.4 g_shell_parse_argv (installer/linux/tests/nemo_quote_check.c): all 12 names
+  came out as one unchanged argument, nothing ran.
+- RUSTSEC-2026-0387: the advisory's patched >= 0.7.6; Cargo.lock holds 0.7.10 (not affected) and 0.5.5 (pgp path,
+  affected).
+- Action SHAs: tags looked up with git ls-remote (actions/checkout v4.3.1, upload-artifact v4.6.2, download-artifact
+  v4.3.0).
+- 3.0.0 compatibility: the real 3.0.0 console program (dist's shield-console_v3.0.0_windows_x64.exe) encrypted a folder;
+  3.1.0 shield listed and decrypted it (passwords typed through a pseudo console): exit code 0, both files identical
+  byte for byte. Automated: compat_tests, cross_os_tests, settings_auth_tests::a_3_0_0_mac_without_lock_on_focus_loss_
+  still_opens.
+- Test changes: all 230 test names of 3.0.0 are still there (compared by script), 47 added, 5 existing tests whose
+  bodies changed (reasons in 06 section 16).
+
+9.4 Results
+  Windows 10, rust 1.99.1, 2026-11-09:
+    cargo test --workspace --release --locked      258 passed, 0 failed, 2 ignored (fixture generators), 173 s
+                                                   (cli 21, core 185, gui 29, platform 23)
+    cargo clippy --workspace --release --locked --all-targets   0 warnings
+    cargo audit --deny warnings                    passes (8 ignores: .cargo/audit.toml)
+    cargo deny --locked check advisories bans sources licenses (0.20.2)   all ok
+    build.ps1 -Stage build / package / manifest    run in a copy of the repository: MSI, portable, console, source
+                                                   zip, manifest in the 3.0.0 format
+    encrypt with 3.0.0 console -> list/decrypt 3.1.0   exit code 0, both files identical byte for byte
+  Linux container (rust:latest, rust 1.99.1, no DISPLAY), 2026-11-09:
+    cargo test --workspace --release --locked      255 passed, 0 failed, 1 ignored, 199 s
+    cargo clippy --workspace --release --locked --all-targets   0 warnings
+    build.sh --stage build / package / manifest (deb, console, zip)   all three stages exit 0. The deb holds the polkit
+                                                   policy and the Nemo/Dolphin "open" entries; source zip 213 files (no
+                                                   .claude-flow); manifest in the 3.0.0 format
+    Nemo quoting check with GLib 2.84.4 (Debian trixie)   12/12 names one argument, nothing ran
+  Not run: the GitHub Actions workflow, real UAC / MSI / pkexec / polkit installs, real file manager menus (06 section 17).
+
+9.5 Review 2 (2026-11-09, details in 06_changes_3.1.0.txt section 19)
+  No.   Subject                                              Severity    Result
+  2-1   Linux helper read other users' files as root, 0644   medium      fixed (PKEXEC_UID's files only, copies 0600,
+                                                                         folders 0711, package.deb 0644 only after
+                                                                         verification, one refusal message)
+  2-2   update signatures: expiry at signing time only,      low-medium  fixed (Policy::Release: binary signatures only,
+        text signatures, manifest replay                                 expired-today refused). Replay recorded as a
+                                                                         limit (format frozen, 0-2)
+  2-3   Windows secure_parent: takeover by path, junction    low         fixed (MSI creates it administrators-only,
+        TOCTOU                                                           checked on a handle, refused unless an
+                                                                         administrator owns it, SetSecurityInfo)
+  2-4   new: a folder or several items into a folder named   -           implemented (auto rule, 06 19-4)
+        after the archive
+  2-5   further look from the same angle                     -           nothing new to fix (06 19-5)
+  Results:
+  (after review 2, 2026-11-09)
+  Windows 10, rust 1.99.1:
+    cargo test --workspace --release --locked      268 passed, 0 failed, 2 ignored (fixture generators), 180 s
+                                                   (cli 21, core 193, gui 29, platform 25)
+    cargo clippy --workspace --release --locked --all-targets   0 warnings
+    cargo audit --deny warnings / cargo deny (0.20.2)   passes / all ok
+    build.ps1 -Stage build, -Stage package -Variants msi (copy of the repository)   succeeded. The MSI's
+                                                   MsiLockPermissionsEx table holds one row SHIELDDATAFOLDER /
+                                                   CreateFolder / O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA) (read through
+                                                   the Windows Installer COM API)
+  Linux container (rust:latest, rust 1.99.1, no DISPLAY):
+    cargo test --workspace --release --locked      265 passed, 0 failed, 1 ignored, 222 s
+    cargo clippy --workspace --release --locked --all-targets   0 warnings
+    build.sh --stage build / package / manifest (deb, console, zip)   all three stages exit 0, source zip 215 files
+  (First round: Windows 258/0/2 173 s, Linux 255/0/1 199 s. A container made by the 3.0.0 console decrypted by 3.1.0
+   byte for byte; GLib 2.84.4 Nemo quoting check 12/12.)
+  Not run: the GitHub Actions workflow, real UAC / MSI install / pkexec / polkit / apt installs, real file manager menus
+  (section 17).
+
+10. 3.1.0 final review (2026-11-10 to 11-11, earlier 3.1.0 build -> 3.1.0 final)
+-------------------------------------------------------------------------------
+Changes: 08_changes_3.1.0_final.txt; verdicts and findings: 09_security_report.txt; secure delete design:
+10_secure_delete_design.txt.
+
+10.1 Results (all actually run this time)
+  Windows 10 Pro 22H2, rust 1.99.1 (rust-toolchain.toml), 2026-11-11:
+    build.ps1 -Stage build -NoSign -Variants portable,console (with tests)
+      cargo test --workspace --release --locked --config target\remap-paths.toml
+                                                 327 passed, 0 failed, 3 ignored
+                                                 (cli 24, core 241 + 2 ignored, wipe_cancel 1, gui 31, platform 28 + 1
+                                                  ignored, doc tests 2 = ConfirmedWipePlan compile_fail)
+      release_key_gate (--ignored)               fails (expected): the current key is the temporary development key;
+                                                 the build script only warns
+    cargo clippy --workspace --release --locked --all-targets -- -D warnings   0 warnings
+    cargo audit --deny warnings                  passes (8 exceptions: .cargo/audit.toml, review-by 2027-05-10)
+    cargo deny --locked check advisories bans sources licenses (0.20.2)   advisories ok, bans ok, licenses ok, sources ok
+    String scan of the programs (shield.exe, shield-gui.exe, console shield.exe)
+                                                 account name, C:\Users and the repository path: 0; dependency paths
+                                                 remapped to /cargo\registry\...; no vcruntime140.dll or api-ms-win-crt-*
+                                                 imports (static C runtime)
+    dist\ (MSI, portable, console, source zip, manifests v1/v2 from the same programs)   sha256sum -c all OK,
+                                                 source zip 245 files, no secret key block (besides the detection string
+                                                 in build.ps1/build.sh)
+  Linux container (Docker rust:latest, rust 1.99.1, root, no DISPLAY), 2026-11-11:
+    cargo test --workspace --release --locked --config <remap-paths.toml written by build.sh>
+                                                 328 passed, 0 failed, 2 ignored, 240 s
+                                                 (cli 24, core 238 + 2 ignored, wipe_cancel 1, gui 31, platform 32, doc tests 2)
+                                                 platform 32 includes the 3 new D tests (as root, so the "other owner"
+                                                 case ran too)
+    cargo clippy --workspace --release --locked --all-targets -- -D warnings   0 warnings
+    bash -n build.sh                             passes
+    String scan of the remapped console build    /work 0, /usr/local/cargo 0, /cargo/registry 54 (remapped)
+    installer/linux/tests/nautilus_scripts_test.sh (dash)   47 passed, 0 failed (the old scripts fail 30)
+    release_key_gate (--ignored)                 fails (expected)
+  Counts differ per OS because of OS-specific tests (Windows junctions, ACLs, VSS arguments ... / Linux modes, owners,
+  links ...).
+
+10.2 Problems the tests caught during this review
+  - The path remapping (S-05) first went into CARGO_ENCODED_RUSTFLAGS, which dropped crt-static from .cargo\config.toml
+    so the Windows programs imported vcruntime140.dll as a DLL again (the DLL planting problem fixed in the 2026-11-08
+    review coming back). release_tests::windows_programs_load_dlls_from_system32_only failed in the Linux run; the import
+    was then confirmed in that build's shield-gui.exe. It now uses a generated cargo config file (--config), and a test
+    checks that the build scripts set no flags variable and that every cargo call uses --config. It never reached a
+    released artifact.
+  - The Bash tool's heredoc collapsed backslashes and broke the sed expression in build.sh; caught and fixed before it
+    ran (the function alone turns C:\Users\a "b" into "C:\\Users\\a \"b\"").
+  - On a real Linux PC, sudo ./build.sh stopped with "cargo: command not found" (line 132). sudo switches PATH and HOME to
+    root's, so rustup's cargo (~/.cargo/bin) is not seen, and target/ had already been created owned by root. build.sh
+    now refuses sudo before the first question, points to sudo chown -R when target/ or dist/ is not writable, and
+    finds cargo in ~/.cargo/bin when it is not on PATH. Checked in Docker (debian:stable-slim, normal user moon) in five
+    cases (sudo, root-owned target, cargo only in ~/.cargo/bin, no cargo, root without sudo), and
+    release_tests::build_sh_refuses_sudo_and_finds_rustup_cargo was added (Windows release_tests rerun: 23 passed; the
+    counts in 10.1 are from before this test).
+
+10.3 Not run / not done
+  - GitHub Actions (release.yml): never run (attestations, environment approval, arm runners, the key gate).
+  - Real systems: UAC, MSI install/upgrade/uninstall, context menus (secure delete included), pkexec/polkit/apt, real
+    Nautilus / Nemo / Dolphin / Thunar, whether data remains on a real SSD, VSS and btrfs snapshot detection. The Nautilus
+    scripts were tested with a fake shield-gui only.
+  - Some symbolic link tests are skipped on Windows without the privilege (developer mode); junctions cover the same paths.
+  - The args_os change in shield-gui main.rs (S-02) has no automated test (binary entry point; code review only).
+  - cargo fmt --check: 1,473 differences (the code base was never formatted with rustfmt). No effect on behaviour; not
+    applied.
+  - Long fuzzing (cargo-fuzz), measuring secure delete on multi-GB sparse files, checking reproducible builds (same bytes).
+  - Rebuilding the Linux packages (deb, AppImage, rpm): not done this time (only the earlier 3.1.0 results in 9.5).
+  - Signing: no private key, so -Sign/--sign was not run (unsigned artifacts).
+
+
+Note: the release_key_gate results and test counts above are historical records from before the 2026-11-11 follow-up. The key-shape gate has since been removed. The new Rust tests described below have not yet been run; section 11 is the current status.
+
+11. Follow-up fixes dated 2026-11-11 (after the test counts in section 10)
+--------------------------------------------------------------------------
+- License metadata: the Cargo workspace now declares Apache-2.0; all four crates inherit `license.workspace = true`. The root LICENSE is Apache License 2.0 and deny.toml allows it.
+- Secure delete: Guard::check now compares protected paths in both directions. A regression test covers Shield data files (settings, settings.key), a nested journal folder, the data directory, an ancestor and an unrelated sibling.
+- Updates: the elevated helper now uses a machine-wide rollback state under ProgramData /var/lib. Corrupt state fails closed; an OS lock serializes the check, save and install sequence.
+- GitHub Actions YAML: the `Verify:` colon in the publish step inline `run:` scalar made the workflow invalid YAML; changed it to a block scalar (`run: |`). PyYAML parsing and a regression check pass.
+- Debian package: set the `DEBIAN` directory to 0755 and `control` to 0644, avoiding dpkg-deb rejection of a 0777 control directory under umask 000; added a release_tests regression check.
+- Release key: removed the release gate and source-pinned fingerprint that required a signing subkey, expiry, project-specific user ID and backup key. A valid public key is still required, and signing requires a signing-capable secret key matching the embedded key.
+- New Rust regression tests: `shield_data_folder_children_are_protected_in_both_directions`, `strict_seen_state_rejects_corruption_and_noncanonical_records`, `protected_machine_seen_state_round_trips_and_fails_closed`, `bundled_release_key_is_usable_without_optional_key_shape_requirements`, `release_workflow_has_no_release_key_shape_gate`, and `debian_control_directory_permissions_are_explicit`.
+- **Not run**: cargo/rustc are unavailable in the editing environment, so the Windows/Linux workspace tests, clippy and new Rust tests were not run for this follow-up. The previous counts in sections 2 and 10 are from before this patch and do not imply the new tests pass. CI should rerun `cargo test --workspace --release --locked` and `cargo clippy --workspace --release --locked --all-targets -- -D warnings` on both OSes. GitHub tag releases and real UAC/pkexec, MSI/deb/AppImage installs are also unverified.

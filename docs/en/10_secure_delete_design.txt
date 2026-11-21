@@ -1,0 +1,248 @@
+SHIELD 3.1.0 - Secure delete design
+===================================
+한국어: docs\10_완전삭제_설계.txt
+Code: shield-core/src/secure_delete.rs (state machine, plan, execution), wipe.rs (overwrite loop, TRIM, snapshot
+      warnings), shield-platform/src/{windows,linux}/erase.rs (no-follow lookups and opens, protected paths, warning
+      detection), shield-gui/src/wipe_view.rs (GUI tab), shield-cli/src/wipe_cmd.rs (shield wipe)
+Tests: shield-core/src/secure_delete_tests.rs, shield-core/tests/wipe_cancel.rs, shield-cli/src/cli_tests.rs,
+       release_tests.rs (context menu registration), installer/linux/tests/nautilus_scripts_test.sh
+
+Terms: this file, the UI and the help say "secure delete" (overwrite, then delete). "Shredding the originals" is only
+the name of the existing option that deletes the originals after encryption. Both use the same overwrite loop
+(wipe::overwrite_with).
+
+
+1. Purpose and entry points
+---------------------------
+A separate feature that overwrites and then deletes ordinary files and folders, not only Shield containers (.shd).
+  (a) the "Secure delete" tab of the GUI encryption window: drag and drop, [Add files], [Add folder]
+  (b) console: shield wipe [--passes 3|7] [-r|--recursive] [--dry-run] <paths...>
+  (c) context menu: Windows classic menu "Secure delete with SHIELD" (files and folders, .shd included), Linux Nautilus
+      script, Nemo action, Dolphin service menu, Thunar custom action
+The context menu path deletes nothing. It only opens the GUI with --wipe; the GUI resolves and checks the items again
+and goes through the three confirmation steps (section 6).
+
+The number of passes follows the 3/7 setting (shield wipe --passes overrides it). 3 passes: 0x00, 0xFF, random.
+7 passes: 0x00, 0xFF, random, 0x55, 0xAA, random, random. Random data comes from a generator seeded by the OS CSPRNG.
+The existing rule that key material of containers (old key slots, the header of a replaced container, key files) always
+gets 7 passes is unchanged (wipe::KEY_PASSES).
+
+
+2. Flow (GUI, console and context menu alike)
+---------------------------------------------
+  scan(items) ──> Plan ──> Confirmation(step 1 → step 2 → step 3) ──> ConfirmedWipePlan ──> execute ──> Report
+                                └ scripts: --dry-run token + --i-understand-irreversible ─┘
+
+2-1. scan: fixing the plan
+  - Every item is made absolute (relative paths against the current folder); files and folders are resolved to their
+    real path. A link or junction chosen directly is itself the item (its target is never touched).
+  - An item on the blocklist (section 4) refuses the whole plan (error code E_WIPE_REFUSED, with the reason).
+  - The same item twice, or an item inside a chosen folder, is refused.
+  - Folders are listed from an open folder handle (Linux fstatat/openat, Windows handles). Links, junctions and reparse
+    points are not followed, only recorded as links. Folders on another volume (device number) or mount points are not
+    entered and are recorded as "left in place". Devices, FIFOs and sockets are left too (so their folder is not empty
+    and stays).
+  - Every entry records path, kind, file ID (Windows: volume serial + file index, Linux: dev + inode), link count, size
+    and modification time. Entries inside a folder come before the folder (deleted innermost first).
+  - More than MAX_ITEMS (200,000) entries is refused with a hint to split the job (no memory exhaustion).
+  - Information for the warnings: hard link counts, compressed / sparse / EFS / cloud / network / copy-on-write (COW) /
+    tmpfs (section 5), storage type (SSD / unknown), volume shadow copies and btrfs / ZFS / LVM / Timeshift / Snapper
+    snapshots.
+
+2-2. Confirmation state machine (secure_delete::Confirmation, exactly one, in shield-core)
+  Ordinary files and folders: all three steps, in order.
+   Step 1 warning: list of items (at most LIST_MAX = 20, the rest as "... and N more"), resolved real paths, numbers of
+                   files / folders / links, total size, "This cannot be undone or recovered" (red). Links show "only the
+                   link is deleted". With a folder, 1 GiB or more, or 100 items or more an extra emphasis (sd.w_big).
+                   [I understand, continue]
+   Step 2 limits:  shows everything below and requires the checkbox ([Continue] without it is refused).
+                   - not a file made by Shield; no way to recover it after deletion (no undo, no recycle bin)
+                   - SSD/NVMe/USB sticks, snapshots (VSS, btrfs, ZFS, LVM), copy-on-write file systems, cloud sync,
+                     backups, recycle bin copies, temp files and swap can keep old data
+                   - hard links: overwriting changes the data under the other names too (count shown)
+                   - storage warnings found (section 5) and the snapshot check result
+   Step 3 code:    a 6-character code from the CSPRNG (OS-seeded) without look-alike characters 0/O/1/I/L
+                   (ABCDEFGHJKMNPQRSTUVWXYZ23456789).
+                   - confirming is refused until CODE_WAIT (3 s) after it is shown (GUI: button disabled, seconds left)
+                   - a wrong answer gets a new code; MAX_FAILS (3) wrong answers end the whole confirmation (start over)
+                   - case and spaces are ignored; the comparison is constant-time (password::ct_eq)
+  Only .shd containers: step 1 warning + step 3 code (step 2 skipped, two steps in all).
+  Cancelling at any step ends the confirmation; codes and state of an earlier run are never reused (a new code per plan).
+  When the list changes (add, remove), the confirmation and the scan are dropped and everything starts again from the
+  scan. When the window locks (idle, minimize, focus loss), a confirmation in progress is dropped too.
+  Weakening options such as "don't ask again" or "always skip the code" do not exist in the settings (release_tests
+  checks the settings keys).
+
+2-3. Structural enforcement: ConfirmedWipePlan
+  - execute() only takes a ConfirmedWipePlan. The type has no public constructor or public fields and holds a private
+    marker (Seal), so it cannot be built outside the secure_delete module (GUI, CLI, context menu paths).
+  - There are only two ways to get one: Confirmation::finish() (after all steps) and confirm_with_token() (scripts, 2-4).
+  - Two compile_fail doc tests check that building a ConfirmedWipePlan outside the module and passing a Plan to execute
+    do not compile (cargo test runs them as doc tests).
+  - execute() also takes a WipePermit (2-5), sealed the same way (compile_fail doc test) and needed anew for every run.
+
+2-5. Settings password (added after 3.1.0 final)
+  - Settings > Security > Secure delete "Ask for the settings password before secure delete" (settings key
+    wipe_needs_settings_pw, on by default). Applies only when a settings password is set. It is protected:
+    switching it off needs the settings password, and "reset to the safe defaults" can only switch it on (the default is
+    on, so there is no way to switch it off without the password).
+  - Flow: after step 3 (code), right before deleting, the settings password is asked. secure_delete::permit checks it
+    with settings_auth::unlock (Argon2id 128 MiB, delay of 1-30 s after wrong answers) and returns a WipePermit; the
+    unlock (MAC key) is dropped at once. The settings window's unlock is not used: it is typed for every secure delete.
+  - Decision: asked when either this window's / command's settings or the settings file on disk asks for it (switched on
+    in another window counts). When both ask, the password of the file is the one checked.
+  - Window: a modal after the code (settings password field). Checked on a worker thread. Three wrong answers throw
+    the whole confirmation away; so do a changed list and a lock (idle, minimize, focus).
+  - Console (shield wipe): interactive and token runs both read it on the terminal without echo right before deleting
+    (at most 3 tries). Without a terminal the run is refused (exit code 8). Arguments, environment variables and pipes are
+    not accepted, so scripts cannot skip this step. --dry-run says whether the step comes and puts
+    "settings_password": true/false into its JSON.
+  - Settings MAC: 3.0.0's protected_text stays as it is; this value enters the MAC input (mac_text) only when it is not
+    at its default (off), as the line "wipe_needs_settings_pw=false". 3.0.0 and earlier 3.1.0 files keep their
+    MAC. The 3.0.0 (v1) MAC is computed from mac_text too, so writing "= false" into a file with a v1 MAC is detected.
+  - Limits: programs running as the same user can delete files without Shield, and deleting the settings file
+    (forgotten-password recovery) removes this step from the next start on. The feature stops someone else at an
+    unlocked PC from deleting with Shield; it is no defence against malware in the same account (docs/09 R-1). A settings
+    file with this value off reads as "changed outside Shield" in 3.0.0 (its protected values go back to the defaults).
+
+2-4. Script (non-interactive) path
+  - shield wipe --dry-run <paths...>: makes the plan, prints warnings and limits on stderr and issues a confirmation
+    token. Token = the first 16 bytes (hex) of SHA3-256("SHIELD-WIPE-PLAN-v1" ‖ passes ‖ per entry kind, path, file ID,
+    size, modification time).
+  - Running: only with both --confirm-token <token> and --i-understand-irreversible, and only when the plan made again
+    now has the same token. Any change (file added or replaced, size, time, passes) changes the token and is refused
+    (exit code 8).
+  - Non-interactive runs print the warnings on stderr twice (before the token check and just before deleting).
+  - The global --yes cannot stand in for any wipe confirmation (ignored; cli.wipe_yes_ignored is printed).
+  - Without a terminal and without a token the warnings are printed and the run is refused (exit code 8).
+
+
+3. Execution (execute)
+----------------------
+Entries are processed in plan order (folders innermost first); one failure does not stop the rest.
+ Files:
+  1) Opened for writing without following links. Windows: FILE_FLAG_OPEN_REPARSE_POINT, share mode 0 (exclusive),
+     DELETE access. Linux: O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, regular file checked on the handle.
+  2) File ID, kind, size and modification time of the open handle are compared with the plan. A difference skips the
+     file as "changed after the check" (TOCTOU).
+  3) Read-only files (only after all confirmations): first opened with a handle that can only change attributes, checked
+     to be the same file, then changed through that handle (Windows SetFileInformationByHandle, Linux fchmod).
+  4) Extra streams: Windows ADS (:Zone.Identifier ...), Linux user.* extended attributes are overwritten with the same
+     patterns, then removed.
+  5) The chosen number of passes: streamed with a single 1 MiB buffer (memory does not grow with the file), flush +
+     FlushFileBuffers/fsync after each pass. A write error or a zero-byte write fails that pass and is reported as
+     "partly overwritten".
+  6) Truncated to length 0 and synced → renamed RENAMES (3) times to random names in the same folder (checking each time
+     that it is the same file) → opened with a no-follow handle, checked to be the same file, and deleted through that
+     handle.
+ Links: checked to be the same link, then only the link is deleted.
+ Folders: when it is the same folder and empty, renamed to a random name and deleted. With entries left (skipped files,
+          mount points, special files) the folder stays under its original name.
+ Containers: a .shd being deleted is locked exclusively. When another Shield task has it open, it is skipped as "busy".
+ Finish: unless cancelled, the existing TRIM request for SSD / unknown volumes (Windows: UAC when needed, Linux: fstrim
+         and similar) and the existing snapshot warning.
+ Result: per entry done / partial (overwritten but not deleted, cancelled during a pass, a stream failed) / skipped
+         (changed, gone, busy, cancelled) / failed with the reason. Unless all are done, the result never says only
+         "done" (GUI result list, CLI exit code 7).
+ Cancelling: between files at once (the remaining entries are "cancelled, untouched"); during a file after the current
+         pass, and that file is shown as "cancelled after N/M passes, not deleted" (tests/wipe_cancel.rs).
+ Logging: file names and paths are never written to a log on disk. Plan and result exist only in memory.
+
+
+4. Blocklist (refused regardless of the confirmation)
+-----------------------------------------------------
+An item that is one of the paths below or inside it (subtree), or that contains one of them (exact), is refused.
+ Both: drive roots, volume roots and mount points, paths of 3 characters or fewer (C:\ ...), the running Shield program,
+       the AppImage file ($APPIMAGE), the Shield data folder (settings, settings.key, lock files, journal), the portable
+       data folder, special files such as devices, FIFOs and sockets (when chosen directly)
+ Windows (from the known-folder API):
+   everything inside: %SystemRoot% (Windows), Program Files, Program Files (x86), the parent of System32
+   the folder itself (and folders containing it): ProgramData, the profiles root (C:\Users), the current user profile
+   The Shield install folder is under Program Files and therefore protected (portable: the program and its data folder).
+ Linux:
+   everything inside: /bin /sbin /lib /lib32 /lib64 /libx32 /usr /etc /boot /dev /proc /sys /run /snap /efi
+   the folder itself: / /home /root /var /opt /srv /media /mnt /tmp /var/tmp /lost+found, the current user's home
+   Shield's install paths (/usr/bin, /usr/share/shield) are under /usr and therefore protected.
+ Inside folders: mount boundaries and reparse points (junctions, symbolic links) are not followed (2-1).
+ Symbolic links and junctions chosen directly: only the link is deleted; step 1 says "only the link is deleted".
+ Tests: protected_paths_are_refused_in_both_directions, shield_data_folder_children_are_protected_in_both_directions,
+        links_are_removed_but_never_followed,
+        duplicates_overlaps_missing_and_empty_are_refused, relative_items_are_resolved_to_the_real_path
+
+
+5. Platform warnings and limits (always shown in the UI and the docs)
+--------------------------------------------------------------------
+Overwriting and TRIM do not guarantee that the same physical location is erased. Step 2 and the note next to [passes]
+always say so.
+ - SSD/NVMe/USB sticks: wear levelling and spare blocks can keep old data where no program can reach. TRIM is requested
+   but the drive decides what happens. More passes do not change this.
+ - Snapshots and backups: Windows volume shadow copies (previous versions, system restore), btrfs/ZFS/LVM snapshots,
+   Timeshift/Snapper, backup programs, recycle bin copies. Shield does not delete snapshots; it warns when it finds them.
+ - Per-entry warnings when detected (WipeNote):
+   NTFS compression (compressed data can move), sparse files (only stored ranges are overwritten), EFS (plaintext temp
+   copies possible), cloud folders (OneDrive/Dropbox/Google Drive ...: the service keeps versions and a recycle bin;
+   Windows also checks the cloud file attributes), network drives (the server decides how writes happen), copy-on-write
+   and log-structured file systems (btrfs, ZFS, bcachefs, F2FS, NILFS, ReFS ...: writes go to new blocks), memory file
+   systems (tmpfs: the data was only in memory and swap).
+ - Hard links: the content under the other names is overwritten too, and the other names stay (count warning).
+ - Pasting into the GUI code field: blocked by dropping Paste input events (egui). Characters arriving through other input
+   methods or accessibility tools are not blocked; the purpose of this step is "read and type deliberately", not a
+   security boundary.
+ - Console: the code is shown on the terminal and typed by hand. Pasting cannot be blocked (the terminal handles it).
+ - Malware running as the same user can delete that user's files regardless of the confirmation. The confirmation guards
+   against mistakes.
+ - Not verified on real systems: whether data remains on a real SSD, detection of real VSS and btrfs snapshots, the real
+   Explorer and Nautilus behaviour.
+
+
+6. Context menu integration
+---------------------------
+ Windows: HKCU/HKLM\Software\Classes\*\shell\Shield.Wipe, Directory\shell\Shield.Wipe (classic menu; Windows 11 under
+   "Show more options"). Command "\"<install folder>\shield-gui.exe\" --wipe \"%1\"" (program and item both quoted). The
+   MSI registers and removes it (component ShellWipe); portable builds register and unregister in the settings. Explorer
+   starts one process per item, so the spool collects them into one window (a separate spool_wipe folder, never mixed
+   with encryption).
+ Linux: Nautilus script "Secure delete with SHIELD" (installed into the user's folder by integrate.sh); Nemo / Dolphin /
+   Thunar entries run shield-gui --wipe %F. The Nautilus script uses $NAUTILUS_SCRIPT_SELECTED_FILE_PATHS only when it
+   matches the arguments 1:1; otherwise (a newline in a name ...) it makes the arguments absolute against the current
+   folder (docs/08 F).
+ Spool: holds paths only (NUL-terminated; non-UTF-8 names are dropped and counted). Not used unless the folder is private
+   to the user. Spool contents are untrusted input: the GUI normalises the paths again, and the Secure delete tab scans
+   again and goes through the three confirmation steps. The number of unusable items is shown on the tab (sd.dropped).
+ Tests: secure_delete_verb_is_registered_everywhere_and_only_opens_the_window (no --yes, no --confirm-token),
+        nautilus_scripts_share_the_absolute_path_block, spool::names_with_newlines_stay_one_item
+
+
+7. Console exit codes (shield wipe)
+-----------------------------------
+  0 all done   7 some failed or skipped (PARTIAL)   8 refused (blocklist, confirmation failed or missing, token mismatch,
+  settings password missing / wrong 3 times / no terminal; REFUSED)     5 cancelled   2 usage error (a folder without -r ...)
+ Described in both shield help wipe and shield -h (the cli_help test checks every option has a description).
+
+
+8. Test map (2-8)
+-----------------
+ No skipping a step                every_step_is_needed_in_order
+ No confirming before 3 s          code_waits_three_seconds_and_ignores_case_and_spaces
+ 3 wrong answers abort, new code   wrong_codes_get_a_new_code_and_three_abort_everything, every_plan_gets_its_own_random_code
+ Cancel / list change resets       cancel_at_any_step_ends_the_confirmation, (GUI) list change handling in wipe_view
+ Containers only: two steps        containers_only_skip_the_limits_step
+ Nothing without ConfirmedWipePlan two compile_fail doc tests
+ Token binding, acknowledgement    token_binds_the_plan_and_needs_the_acknowledgement
+ Blocklist                         protected_paths_are_refused_in_both_directions
+ Links and junctions not followed  links_are_removed_but_never_followed (Windows junctions, Linux symbolic links)
+ File replaced (TOCTOU)            a_file_changed_after_the_confirmation_is_not_touched, a_file_replaced_after_the_confirmation_is_not_touched
+ Hard link warning                 hard_links_are_counted_and_named_in_the_limits
+ Streaming, constant memory        every_pass_covers_the_whole_file_and_is_synced (one buffer, size of the last write)
+ Injected write failure            a_failing_or_short_write_fails_the_pass
+ Item limit                        more_than_max_items_is_refused
+ Cancelling                        tests/wipe_cancel.rs (between files at once, during a file after the pass, next file untouched)
+ CLI: --yes ignored, token mismatch, dry-run, exit codes   cli_tests::wipe_* (non-interactive shield wipe)
+ Settings password step (2-5)      the_settings_password_is_needed_only_when_set_and_asked_for,
+                                   the_file_password_counts_when_both_ask, settings_auth::the_secure_delete_password_switch_is_protected,
+                                   switching_secure_delete_off_by_editing_the_file_is_noticed, WipePermit compile_fail
+ Folder of a selected link (S-11)  a_selected_link_is_checked_and_shown_where_it_really_is
+ Read-only files                   read_only_files_are_removed_too
+ Safe terminal output              shown_paths_are_safe_for_terminals
+ Large sparse files (several GB) were not measured: that the loop uses a single buffer is checked by the code and the
+ tests above.

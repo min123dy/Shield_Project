@@ -1,0 +1,49 @@
+# Shield 3.1.0 #8: build output, tool state and anything secret stay out of the repository.
+
+# build output
+/target/
+/dist/
+/dist_old_*/
+/.wix/
+/Shield.msi
+/Shield.wixpdb
+*.wixobj
+*.wixpdb
+
+# dead code kept locally
+/_unused/
+
+# editor / assistant / tool state (any depth)
+.claude-flow/
+.claude/
+.swarm/
+.hive-mind/
+.vs/
+.vscode/
+.idea/
+node_modules/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# keys and signatures: only the public release key (keys/*.asc) and the test fixtures belong here
+*.gpg
+*.kbx
+*.key
+*.pem
+*.pfx
+*.p12
+*.sig
+!/crates/shield-core/tests/fixtures/**
+secring.*
+private-keys-v1.d/
+.env
+.env.*
+
+# Shield working files that may appear next to test data
+*.shd
+!/crates/shield-core/tests/fixtures/**
+.shd_*
+*.part
+*.tmp

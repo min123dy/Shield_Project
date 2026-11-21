@@ -73,6 +73,31 @@ fn stamp(p: &Path) -> R<(u64, Option<SystemTime>)> {
     Ok((m.len(), m.modified().ok()))
 }
 
+/// 3.1.0 #14: "Open in SHIELD" is offered on every file, so the path may be anything. Only a
+/// regular file is opened (no link, folder, FIFO, socket or device; opened without blocking and
+/// without following a link), and every refusal reads the same.
+pub fn not_regular() -> String {
+    t("cont.not_regular").to_string()
+}
+
+/// Opens `p` for reading when it is a regular file (see `not_regular`).
+pub fn open_regular(p: &Path) -> R<File> {
+    sysinfo::open_regular(p).map_err(|e| {
+        // Shield's own refusals (device path, not a disk file / regular file) are io::Error::other
+        if e.kind() == std::io::ErrorKind::Other {
+            return not_regular();
+        }
+        match std::fs::symlink_metadata(p) {
+            // nothing there: the system's "not found", as before 3.1.0
+            Err(m) if m.kind() == std::io::ErrorKind::NotFound => m.to_string(),
+            // a plain file that could not be opened (access denied, in use ...): say why
+            Ok(m) if m.is_file() => e.to_string(),
+            // a link, folder, FIFO, device ...
+            _ => not_regular(),
+        }
+    })
+}
+
 fn changed() -> String {
     coded(C_CHANGED, "err.changed_since_open")
 }
@@ -88,7 +113,7 @@ fn unlock_again(o: &Opened, cred: &Cred, mode: Mode) -> R<(FileLock, File, Heade
     if stamp(&o.path)? != o.stamp {
         return Err(changed());
     }
-    let mut f = File::open(&o.path).map_err(e)?;
+    let mut f = open_regular(&o.path)?;
     let h = header(&mut f, cred)?;
     if h.meta != o.meta || h.file_len != o.file_len {
         return Err(changed());
@@ -98,10 +123,11 @@ fn unlock_again(o: &Opened, cred: &Cred, mode: Mode) -> R<(FileLock, File, Heade
 
 /// Unlocks, lists, checks the list against the meta, and forgets the key (A-4).
 pub fn open(path: &Path, cred: Cred) -> R<Opened> {
+    drop(open_regular(path)?); // before the lock file and the key derivation
     let _lock = lock_container(path, Mode::Shared)?;
     set_stage(ST_OPEN);
+    let mut f = open_regular(path)?;
     let st = stamp(path)?;
-    let mut f = File::open(path).map_err(e)?;
     let hdr = header(&mut f, &cred)?;
     drop(cred);
     let mut cr = ChunkReader::new(f, &hdr);
@@ -169,8 +195,8 @@ pub fn extract_selected(o: &Opened, cred: Cred, selected: &HashSet<String>, base
     let r = archive::extract(&mut cr, &stage.path, total, &|n| selection_map(n, base, selected));
     drop(cr);
     drop(h);
-    let n = match r {
-        Ok(n) => n,
+    let done = match r {
+        Ok(d) => d,
         Err(x) => return Err(stage.abort().map(|w| format!("{x} · {w}")).unwrap_or(x)),
     };
     let mut moved = Vec::new();
@@ -196,7 +222,8 @@ pub fn extract_selected(o: &Opened, cred: Cred, selected: &HashSet<String>, base
     if let Err(x) = stage.finish() {
         return Err(format!("{x} · {}", roll_back(&moved)));
     }
-    let mut msg = tf("cont.extracted", &[&n, &outdir.display()]);
+    let mut msg = tf("cont.extracted", &[&done.files, &outdir.display()]);
+    msg += &done.notes();
     if let Some(w) = motw_warn {
         msg += &format!(" · {w}");
     }
@@ -341,7 +368,7 @@ fn rebuild(o: &mut Opened, cred: Cred, adds: &[PathBuf], prefix: &str, ao: &AddO
         progress_start(newm.total.saturating_mul(ao.passes.count() as u64));
         let rep = shred_listed(&newm, ao.passes, true);
         msg += &tf("cont.added_shred", &[&rep.summary(ao.passes)]);
-        failed = !rep.failed.is_empty();
+        failed = rep.is_failure();
         touched.extend(adds.iter().map(PathBuf::as_path));
     }
     for w in [a_warn, warn, old_warn].into_iter().flatten() {

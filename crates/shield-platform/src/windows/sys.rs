@@ -182,13 +182,28 @@ pub(crate) fn seal_3_0_0(data: &[u8]) -> PResult<Vec<u8>> {
 /// Runs `program` (a System32 tool) elevated (UAC "runas", hidden window) with `params` and
 /// waits for it. Shield never elevates itself.
 pub fn run_elevated(program: &Path, params: &str) -> io::Result<u32> {
+    if super::fs::system_dir().is_none_or(|s| program.parent() != Some(s.as_path())) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "only System32 programs are elevated"));
+    }
+    shell_runas(program, params)
+}
+
+/// Update only (3.1.0 #1): runs the *installed* Shield program `program` elevated and waits. It
+/// must lie below Program Files (administrators-only); anything else is refused, so a portable
+/// copy in a user-writable folder is never elevated.
+pub fn run_elevated_installed(program: &Path, params: &str) -> io::Result<u32> {
+    let pf = super::install::program_files().ok_or_else(|| io::Error::other("Program Files folder"))?;
+    if !super::install::below(program, &pf) {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "only installed programs below Program Files are elevated"));
+    }
+    shell_runas(program, params)
+}
+
+fn shell_runas(program: &Path, params: &str) -> io::Result<u32> {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
     use windows_sys::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
-    if super::fs::system_dir().is_none_or(|s| program.parent() != Some(s.as_path())) {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "only System32 programs are elevated"));
-    }
     let exe = super::fs::wide(program);
     let (verb, params) = (super::fs::wstr("runas"), super::fs::wstr(params));
     unsafe {

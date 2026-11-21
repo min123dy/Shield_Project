@@ -47,6 +47,9 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="ApplicationProgramsFolder" Name="Shield" />
     </StandardDirectory>
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="SHIELDDATAFOLDER" Name="Shield" />
+    </StandardDirectory>
 
     <Feature Id="Main" Title="Shield" Level="1">
       <ComponentRef Id="GuiExe" />
@@ -55,7 +58,9 @@
       <ComponentRef Id="UserGuide" />
       <ComponentRef Id="ShellEncrypt" />
       <ComponentRef Id="ShellDecrypt" />
-      <ComponentRef Id="ShellOpen" />
+      <ComponentRef Id="ShellOpenAny" />
+      <ComponentRef Id="ShellWipe" />
+      <ComponentRef Id="UpdateDataFolder" />
       <?if $(var.Signed) = "yes" ?>
       <ComponentRef Id="GuiSignature" />
       <ComponentRef Id="ConsoleSignature" />
@@ -86,6 +91,16 @@
     <Component Id="ConsolePath" Directory="INSTALLFOLDER" Bitness="always64" Guid="9C3A41E2-7B5D-4E08-8F16-2D7C5B0A9E31">
       <Environment Id="ShieldPath" Name="PATH" Value="[INSTALLFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
       <CreateFolder />
+    </Component>
+
+    <!-- 3.1.0 review 2 #3: %ProgramData%\Shield (the update helper's folder) is created here,
+         owner Administrators, SYSTEM + Administrators only, not inherited - the same DACL the
+         helper uses (shield-platform windows/install.rs ADMIN_DACL). A normal account then can't
+         create it first; one it made before the installation is refused by the helper. -->
+    <Component Id="UpdateDataFolder" Directory="SHIELDDATAFOLDER" Bitness="always64" Guid="975C4053-E64B-4359-B32A-261CA43C1CAE">
+      <CreateFolder>
+        <PermissionEx Sddl="O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)" />
+      </CreateFolder>
     </Component>
 
     <?if $(var.Signed) = "yes" ?>
@@ -139,12 +154,43 @@
       </RegistryKey>
     </Component>
 
-    <Component Id="ShellOpen" Directory="INSTALLFOLDER" Bitness="always64" Guid="FAD7429D-1362-5A6A-BA62-507E092764CC">
-      <RegistryKey Root="HKCR" Key="SystemFileAssociations\.shd\shell\Shield.Open">
+    <!-- 3.1.0 #14: "Open in SHIELD" on every file (a container may have any name), one item at a
+         time (MultiSelectModel=Single: Explorer shows it only for a single selection), classic menu
+         only (Win11: "Show more options"). It replaces 3.0.0's .shd-only verb
+         (SystemFileAssociations\.shd\shell\Shield.Open, component ShellOpen
+         {FAD7429D-1362-5A6A-BA62-507E092764CC}); the major upgrade removes that one with the old
+         product. The registry key path changed, so this is a new component with its own GUID.
+         The .shd decrypt verb and the .shd type itself are unchanged. -->
+    <Component Id="ShellOpenAny" Directory="INSTALLFOLDER" Bitness="always64" Guid="4FFE6B85-5A92-46BC-AB60-BA9877B1BB95">
+      <RegistryKey Root="HKLM" Key="Software\Classes\*\shell\Shield.Open">
         <RegistryValue Type="string" Value="!(loc.VerbOpen)" KeyPath="yes" />
         <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryValue Type="string" Name="MultiSelectModel" Value="Single" />
         <RegistryKey Key="command">
           <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --open "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+    </Component>
+
+    <!-- 3.1.0 final: "secure delete" on files and folders (classic menu; Win11: "Show more
+         options"). It only starts the window with the selection (gathered like encrypt, own spool
+         folder); the window scans the items, refuses protected paths and asks three confirmations
+         (warning, limits, typed code) before anything is overwritten. New component, new GUID. -->
+    <Component Id="ShellWipe" Directory="INSTALLFOLDER" Bitness="always64" Guid="C81AF9CF-4EC3-4E3E-B743-306BC6D54FDA">
+      <RegistryKey Root="HKCR" Key="*\shell\Shield.Wipe">
+        <RegistryValue Type="string" Value="!(loc.VerbWipe)" KeyPath="yes" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryValue Type="string" Name="MultiSelectModel" Value="Player" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --wipe "%1"' />
+        </RegistryKey>
+      </RegistryKey>
+      <RegistryKey Root="HKCR" Key="Directory\shell\Shield.Wipe">
+        <RegistryValue Type="string" Value="!(loc.VerbWipe)" />
+        <RegistryValue Type="string" Name="Icon" Value="[INSTALLFOLDER]shield-gui.exe" />
+        <RegistryValue Type="string" Name="MultiSelectModel" Value="Player" />
+        <RegistryKey Key="command">
+          <RegistryValue Type="string" Value='"[INSTALLFOLDER]shield-gui.exe" --wipe "%1"' />
         </RegistryKey>
       </RegistryKey>
     </Component>

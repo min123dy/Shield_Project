@@ -1,4 +1,4 @@
-SHIELD 3.0.0 - 테스트 및 보안 점검 기록
+SHIELD 3.1.0 - 테스트 및 보안 점검 기록
 =====================================
 English: docs\en\05_test_and_audit.txt. 2.x의 기록: docs\history\05_테스트_및_수정_기록_2.x.txt
 
@@ -283,3 +283,172 @@ TOCTOU (그 밖)
     포터블 실행(기본, --manager, --settings,       0.22~0.51초에 창 표시, 응답함, WM_CLOSE로 종료 코드 0
     --decrypt)
     콘솔 --version                                 종료 코드 0
+
+9. 3.1.0 점검 (2026-11-08 ~ 11-09, 3.0.0 -> 3.1.0)
+-------------------------------------------------
+두 번의 정적 점검(외부 검토 문서)에서 나온 항목과 이번 재점검 결과입니다. 항목별 수정 내용은 06_3.1.0_수정_기록.txt.
+
+9.1 정적 점검 항목과 결과
+  번호  내용                                             심각도      결과
+  1     업데이트 검증-설치 사이 바꿔치기                  중간        수정 (권한 있는 도우미가 복사본을 다시 검증)
+  2     서명 키가 빌드 작업에 노출 / CI 고정 없음          중간        수정 (빌드·서명 분리, environment, SHA 고정)
+  3     서명 시각·만료·주 키 sign 플래그 미확인, 키 하나   낮음~중간   수정 (check_times, 백업 키, docs/07)
+  4     이름의 방향 제어 문자 위장                        낮음~중간   수정 (표시 이스케이프, 추출 시 '_')
+  5     옵션처럼 보이는 파일 이름, --shred 확인            낮음        수정
+  6     비밀번호 정책                                    -           범위 밖 (변경 없음)
+  7     설정 보호의 한계                                  정보        문서화 (코드 변경 없음)
+  8     저장소 위생                                      낮음        수정 (.claude-flow 삭제, .gitignore, zip 제외)
+  9-A   AEAD 키 복사본                                   확인        poly1305 zeroize 켬, 나머지는 소스 확인
+  9-B   Nemo Quote=double                               확인        소스 + GLib 검사로 안전 확인, 유지 (실기 미확인)
+  9-C   MinGW 빌드 시 DLL 검색 보호 빠짐                  낮음        build.ps1이 MSVC 외 대상을 거부
+  9-D   MSI Authenticode 없음                            선택        문서화 (선택 과제)
+  9-E   의존성 권고 3건                                  확인        올릴 수 없음 확인, 사유 기록, webbrowser 방어 테스트
+  10    Linux 디렉터리 순회 fail-open                     중간        수정 (핸들 기준 순회, 파쇄 직전 재확인)
+  11    폴더 이동 폴백의 덮어쓰기 경쟁                    낮음        수정 (파일은 링크, 폴더는 닫힌 부모만)
+  12    임시 파일 정리 시 경로 재확인                     낮음        수정 (파일 ID 비교)
+  13    인증 전 KDF 자원, 취소                            낮음        수정 (크기 검사, 한 번에 하나, 취소 즉시)
+  14    "SHIELD에서 열기"(새 기능)                        -           구현
+
+9.2 이번 점검에서 새로 찾은 것
+  R1  build.sh의 EXIT trap(cleanup)이 서명 없는 빌드에서 1로 끝나 set -e 아래 스크립트 전체가 종료 코드 1
+      (3.0.0부터). Linux 단계 실행에서 발견. 수정 + release_tests::build_sh_exit_trap_cannot_fail_the_build.
+  R2  14번 구현에서 없는 파일도 "일반 파일이 아님"으로 안내. 실제 3.0.0 -> 3.1.0 시험 중 발견. 수정(없음 / 이유 /
+      일반 파일 아님 구분) + container_tests·mgr_tests 기대값 정정.
+  R3  14번 테스트의 Windows 장치 경로 자료가 앞의 \ 하나를 잃어 장치를 시험하지 않았음(작성 도구가 \\를 \로 바꿈).
+      자료 수정 + 형식 검사. 같은 형태(백슬래시 하나로 시작하는 raw 문자열)를 소스 전체에서 찾았고 다른 곳은
+      정상(\??\ 접두사)입니다.
+  R4  clippy 경고 4건(이번 변경에서 생김). 수정.
+  R5  cargo deny가 내부 path 의존성을 와일드카드로 봄: 내부 크레이트를 publish = false로.
+
+9.3 확인 방법과 결과
+- rPGP 0.21 verify: 소스에서 시각·만료를 보지 않음을 확인 -> 직접 구현(3번).
+- chacha20poly1305 0.10.1 / chacha20 0.9.1 / poly1305 0.8.0: 소스에서 Drop·zeroize 확인(9-A).
+- Nemo(linuxmint/nemo master)의 nemo-action.c·eel-string.c 인용 코드를 읽고, 같은 방식의 Exec 줄을 GLib 2.84.4
+  g_shell_parse_argv로 나누는 검사(installer/linux/tests/nemo_quote_check.c): 이름 12개 모두 인자 하나로 그대로,
+  실행된 것 없음.
+- RUSTSEC-2026-0387: 권고 원문의 patched >= 0.7.6, Cargo.lock의 0.7.10(해당 없음)과 0.5.5(pgp 경로, 해당) 확인.
+- 액션 SHA: git ls-remote로 태그를 조회(actions/checkout v4.3.1, upload-artifact v4.6.2, download-artifact v4.3.0).
+- 3.0.0 호환: 실제 3.0.0 콘솔 프로그램(dist의 shield-console_v3.0.0_windows_x64.exe)으로 폴더를 암호화하고 3.1.0
+  shield로 list·decrypt(의사 콘솔로 비밀번호 입력): 종료 코드 0, 두 파일 바이트 단위로 같음. 자동 테스트: compat_tests,
+  cross_os_tests, settings_auth_tests::a_3_0_0_mac_without_lock_on_focus_loss_still_opens.
+- 테스트 변경 점검: 3.0.0의 테스트 230개 이름이 모두 남아 있음(스크립트로 비교), 47개 추가, 본문이 바뀐 기존 테스트
+  5개(06 16절에 이유).
+
+9.4 실행 결과
+  Windows 10, rust 1.99.1, 2026-11-09:
+    cargo test --workspace --release --locked      258 통과, 0 실패, 2 무시(픽스처 생성용), 173초
+                                                   (cli 21, core 185, gui 29, platform 23)
+    cargo clippy --workspace --release --locked --all-targets   경고 0
+    cargo audit --deny warnings                    통과 (무시 8건: .cargo/audit.toml)
+    cargo deny --locked check advisories bans sources licenses (0.20.2)   모두 ok
+    build.ps1 -Stage build / package / manifest    저장소 복사본에서 실행: MSI·포터블·콘솔·소스 zip, 3.0.0 형식 매니페스트
+    3.0.0 콘솔로 암호화 -> 3.1.0으로 list·decrypt  종료 코드 0, 파일 2개 바이트 단위로 같음
+  Linux 컨테이너(rust:latest, rust 1.99.1, DISPLAY 없음), 2026-11-09:
+    cargo test --workspace --release --locked      255 통과, 0 실패, 1 무시, 199초
+    cargo clippy --workspace --release --locked --all-targets   경고 0
+    build.sh --stage build / package / manifest (deb, console, zip)   세 단계 모두 종료 코드 0. deb에 polkit 정책과
+                                                   Nemo·Dolphin "열기" 항목, 소스 zip 213개 파일(.claude-flow 없음),
+                                                   매니페스트 3.0.0 형식
+    GLib 2.84.4(Debian trixie) Nemo 인용 검사      12/12 이름이 인자 하나, 실행된 것 없음
+  실행하지 못함: GitHub Actions 워크플로, 실제 UAC·MSI·pkexec·polkit 설치, 실제 파일 관리자 메뉴(06 17절).
+
+9.5 2차 검토 (2026-11-09, 자세한 내용은 06_3.1.0_수정_기록.txt 19절)
+  번호  내용                                                 심각도      결과
+  2-1   Linux 헬퍼가 남의 파일을 root로 읽어 0644 사본으로     중간        수정 (PKEXEC_UID 소유자만, 사본 0600, 폴더 0711,
+                                                                         검증 뒤에만 package.deb 0644, 거부 문구 통일)
+  2-2   업데이트 서명: 서명 시각 기준 만료만, 텍스트 서명 허용,  낮음~중간   수정 (Policy::Release: 바이너리 서명만, 오늘 기준
+        매니페스트 재생                                                  만료 거부). 재생은 형식 고정(0-2) 때문에 한계로 기록
+  2-3   Windows secure_parent: 경로로 인수, 정션 TOCTOU        낮음        수정 (MSI가 관리자 전용으로 생성, 핸들로 확인,
+                                                                         관리자 소유가 아니면 거부, SetSecurityInfo)
+  2-4   새 기능: 폴더·여러 항목은 아카이브 이름의 폴더 안에     -           구현 (자동 규칙, 06 19-4)
+  2-5   같은 관점의 추가 점검                                 -           새로 고칠 것 없음 (06 19-5)
+  결과:
+  (2차 검토 반영 후, 2026-11-09)
+  Windows 10, rust 1.99.1:
+    cargo test --workspace --release --locked      268 통과, 0 실패, 2 무시(픽스처 생성용), 180초
+                                                   (cli 21, core 193, gui 29, platform 25)
+    cargo clippy --workspace --release --locked --all-targets   경고 0
+    cargo audit --deny warnings / cargo deny (0.20.2)   통과 / 모두 ok
+    build.ps1 -Stage build, -Stage package -Variants msi (저장소 복사본)   성공. MSI의 MsiLockPermissionsEx 표에
+                                                   SHIELDDATAFOLDER / CreateFolder / O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)
+                                                   한 줄이 있음(Windows Installer COM으로 조회)
+  Linux 컨테이너(rust:latest, rust 1.99.1, DISPLAY 없음):
+    cargo test --workspace --release --locked      265 통과, 0 실패, 1 무시, 222초
+    cargo clippy --workspace --release --locked --all-targets   경고 0
+    build.sh --stage build / package / manifest (deb, console, zip)   세 단계 모두 종료 코드 0, 소스 zip 215개 파일
+  (1차 결과: Windows 258/0/2 173초, Linux 255/0/1 199초. 3.0.0 콘솔로 만든 컨테이너를 3.1.0으로 풀어 바이트 단위로 같음,
+   GLib 2.84.4 Nemo 인용 검사 12/12.)
+  실행하지 못함: GitHub Actions 워크플로, 실제 UAC·MSI 설치·pkexec·polkit·apt 설치, 실제 파일 관리자 메뉴(17절).
+
+10. 3.1.0 최종 점검 (2026-11-10 ~ 11-11, 이전 3.1.0 빌드 -> 3.1.0 최종)
+--------------------------------------------------------------------
+변경 내용: 08_3.1.0_최종_변경_내역.txt, 판정·발견 표: 09_보안_분석_보고서.txt, 완전삭제 설계: 10_완전삭제_설계.txt.
+
+10.1 실행 결과 (모두 이번에 실제로 실행한 것)
+  Windows 10 Pro 22H2, rust 1.99.1 (rust-toolchain.toml), 2026-11-11:
+    build.ps1 -Stage build -NoSign -Variants portable,console (테스트 포함)
+      cargo test --workspace --release --locked --config target\remap-paths.toml
+                                                 327 통과, 0 실패, 3 무시
+                                                 (cli 24, core 241 + 2 무시, wipe_cancel 1, gui 31, platform 28 + 1 무시,
+                                                  문서 테스트 2 = ConfirmedWipePlan compile_fail)
+      release_key_gate (--ignored)               실패(예상): 지금 키는 개발용 임시 키. 빌드 스크립트는 경고만 출력
+    cargo clippy --workspace --release --locked --all-targets -- -D warnings   경고 0
+    cargo audit --deny warnings                  통과 (예외 8건: .cargo/audit.toml, review-by 2027-05-10)
+    cargo deny --locked check advisories bans sources licenses (0.20.2)   advisories ok, bans ok, licenses ok, sources ok
+    실행 파일 문자열 검사(shield.exe, shield-gui.exe, 콘솔 shield.exe)
+                                                 계정 이름·C:\Users·저장소 경로 0건, 의존성 경로는 /cargo\registry\...로
+                                                 재매핑, vcruntime140.dll·api-ms-win-crt-* 가져오기 없음(정적 C 런타임)
+    dist\ (같은 프로그램으로 만든 MSI·포터블·콘솔·소스 zip·매니페스트 v1/v2)   sha256sum -c 전부 OK,
+                                                 소스 zip 245개 파일, 비밀키 블록 없음(검사 문자열이 있는 build.ps1/build.sh 제외)
+  Linux 컨테이너(Docker rust:latest, rust 1.99.1, root, DISPLAY 없음), 2026-11-11:
+    cargo test --workspace --release --locked --config <build.sh가 만든 remap-paths.toml>
+                                                 328 통과, 0 실패, 2 무시, 240초
+                                                 (cli 24, core 238 + 2 무시, wipe_cancel 1, gui 31, platform 32, 문서 테스트 2)
+                                                 platform 32에는 이번에 더한 D 테스트 3개 포함(root라 "다른 소유자" 경우도 실행)
+    cargo clippy --workspace --release --locked --all-targets -- -D warnings   경고 0
+    bash -n build.sh                             통과
+    재매핑한 콘솔 빌드 문자열 검사               /work 0건, /usr/local/cargo 0건, /cargo/registry 54건(재매핑됨)
+    installer/linux/tests/nautilus_scripts_test.sh (dash)   47 통과, 0 실패 (이전 스크립트로는 30개 실패)
+    release_key_gate (--ignored)                 실패(예상)
+  OS마다 수가 다른 것은 OS 전용 테스트 때문입니다(Windows 정션·ACL·VSS 인수 등 / Linux 권한·소유자·링크 등).
+
+10.2 이번 점검에서 테스트가 잡은 문제
+  - 경로 재매핑(S-05)을 처음에 CARGO_ENCODED_RUSTFLAGS로 넣었더니 .cargo\config.toml의 crt-static이 사라져
+    Windows 프로그램이 vcruntime140.dll을 다시 DLL로 가져왔습니다(2026-11-08 점검에서 고친 DLL 바꿔치기 문제의 재발).
+    Linux 실행에서 release_tests::windows_programs_load_dlls_from_system32_only가 실패해 발견했고, 그 빌드의
+    shield-gui.exe에서 가져오기를 직접 확인했습니다. 생성한 cargo 설정 파일(--config)로 바꾸고, 빌드 스크립트에
+    플래그 변수가 없고 모든 cargo 호출이 --config를 쓰는지 테스트합니다. 배포 산출물에는 들어가지 않았습니다.
+  - Bash 도구의 여기 문서(heredoc)가 백슬래시를 줄여 build.sh의 sed 식이 깨진 것을 실행 전에 확인해 고쳤습니다
+    (함수만 따로 실행해 C:\Users\a "b" -> "C:\\Users\\a \"b\"" 확인).
+  - 실제 Linux PC에서 sudo ./build.sh를 실행하자 "cargo: 명령을 찾을 수 없음"(줄 132)으로 멈췄습니다. sudo는 PATH·HOME을
+    root의 것으로 바꾸므로 rustup의 cargo(~/.cargo/bin)가 보이지 않고, 멈추기 전에 target\이 root 소유로 만들어집니다.
+    build.sh가 sudo 실행을 처음 질문 전에 거부하고, 쓸 수 없는 target\·dist\가 있으면 sudo chown -R을 안내하며,
+    PATH에 없을 때 ~/.cargo/bin의 cargo를 찾도록 고쳤습니다. Docker(debian:stable-slim, 일반 사용자 moon)에서
+    다섯 경우(sudo, root 소유 target, ~/.cargo/bin에만 cargo, cargo 없음, sudo 아닌 root)를 실행해 확인했고,
+    release_tests::build_sh_refuses_sudo_and_finds_rustup_cargo를 더했습니다(Windows release_tests 23 통과 재실행;
+    위 10.1의 개수는 이 테스트를 더하기 전의 실행입니다).
+
+10.3 실행하지 못한 것 / 하지 않은 것
+  - GitHub Actions(release.yml) 실행: 한 번도 실행하지 않았습니다(attestation, environment 승인, arm 러너, 키 게이트).
+  - 실기: UAC·MSI 설치·업그레이드·제거, 우클릭 메뉴(완전삭제 포함), pkexec·polkit·apt, 실제 Nautilus·Nemo·Dolphin·
+    Thunar, 실제 SSD에서 데이터가 남는지, VSS·btrfs 스냅숏 감지. Nautilus 스크립트는 가짜 shield-gui로만 시험했습니다.
+  - Windows에서 심볼릭 링크 테스트 일부는 권한(개발자 모드)이 없어 건너뜁니다(정션으로 같은 경로를 시험).
+  - shield-gui main.rs의 args_os 변경(S-02)에는 자동 테스트가 없습니다(바이너리 진입점; 코드 확인만).
+  - cargo fmt --check: 1,473곳 차이(코드 베이스가 rustfmt로 정리된 적 없음). 동작과 무관하며 적용하지 않았습니다.
+  - 퍼징 도구(cargo-fuzz) 장시간 실행, 수 GB 희소 파일 완전삭제 실측, 재현 가능 빌드(같은 바이트) 확인.
+  - Linux 패키지(deb·AppImage·rpm) 다시 만들기: 이번에는 하지 않았습니다(이전 3.1.0 빌드 때 9.5의 결과만 있음).
+  - 서명: 개인키가 없어 -Sign/--sign은 실행하지 않았습니다(서명 없는 산출물).
+
+
+※ 2026-11-11 후속 수정 전의 역사적 기록: 아래 2절·10절에 나오는 이전 테스트 수치와 release_key_gate 결과는 당시 소스·정책에 대한 기록입니다. 후속 수정으로 키 형태 게이트를 제거했으며, 후속 수정의 새 Rust 테스트는 아직 실행되지 않았습니다. 현재 상태는 11절을 기준으로 확인하세요.
+
+11. 2026-11-11 후속 수정 기록 (이전 10절 테스트 수치 이후)
+------------------------------------------------------
+- 라이선스 메타데이터: Cargo workspace의 license를 Apache-2.0으로 바꾸었습니다. 네 하위 크레이트는 license.workspace = true로 상속합니다. 루트 LICENSE는 Apache License 2.0이며 deny.toml 허용 목록에 포함됩니다.
+- 완전삭제: Guard::check의 보호 경로 비교를 양방향으로 변경하고 Shield 데이터 폴더의 파일(settings, settings.key), 중첩 폴더(저널), 데이터 폴더 자체·상위 폴더 및 무관한 형제 파일을 확인하는 회귀 테스트를 추가했습니다.
+- 업데이트: 권한 상승 헬퍼에 ProgramData /var/lib의 기계 공용 롤백 상태를 추가했습니다. 손상된 상태는 fail-closed 처리하며, 별도 OS 잠금으로 확인·저장·설치 시퀀스를 직렬화합니다.
+- GitHub Actions YAML: publish 단계의 인라인 `run:`에 포함된 `Verify:` 콜론이 YAML 파서에서 문법 오류를 일으켜 블록 스칼라(`run: |`)로 변경했습니다. PyYAML 파싱 검사를 통과하고 회귀 검사도 추가했습니다.
+- Debian 패키지: `DEBIAN` 디렉터리를 0755, `control` 파일을 0644로 명시해 umask 000에서도 dpkg-deb가 0777 제어 디렉터리 권한으로 실패하지 않게 했고, 이를 확인하는 release_tests 회귀 검사를 추가했습니다.
+- 릴리스 키: 서명 부키·만료·프로젝트 사용자 ID·백업 키 모양을 필수로 강제하던 릴리스 게이트 및 소스의 지문 고정을 제거했습니다. 유효한 공개키는 필수이고 서명할 때는 내장 공개키와 일치하는 서명 가능한 비밀키가 필요합니다.
+- 새 Rust 회귀 테스트 추가: `shield_data_folder_children_are_protected_in_both_directions`, `strict_seen_state_rejects_corruption_and_noncanonical_records`, `protected_machine_seen_state_round_trips_and_fails_closed`, `bundled_release_key_is_usable_without_optional_key_shape_requirements`, `release_workflow_has_no_release_key_shape_gate`, `debian_control_directory_permissions_are_explicit`.
+- **미실행**: 이 편집 환경에는 cargo/rustc가 없어 이 후속 패치의 Windows/Linux 전체 테스트, clippy, 새 Rust 테스트를 실행하지 못했습니다. 2절과 10절의 기존 수치는 후속 패치 적용 전 실행 결과이며 새 테스트의 통과를 의미하지 않습니다. CI에서 두 OS 모두 `cargo test --workspace --release --locked` 및 `cargo clippy --workspace --release --locked --all-targets -- -D warnings`를 다시 실행해야 합니다. GitHub 태그 릴리스, UAC/pkexec, MSI/deb/AppImage 실기 설치도 미검증입니다.

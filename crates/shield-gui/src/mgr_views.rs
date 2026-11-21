@@ -62,7 +62,7 @@ impl MgrApp {
                 if ui.add_enabled(!self.inner.is_empty(), egui::Button::new(t("m.up"))).clicked() {
                     self.inner_up();
                 }
-                let loc = if self.inner.is_empty() { name } else { format!("{name} \u{203A} {}", self.inner.replace('/', " \u{203A} ")) };
+                let loc = if self.inner.is_empty() { name } else { format!("{name} \u{203A} {}", crate::archive::display_name(&self.inner).replace('/', " \u{203A} ")) };
                 let w = ui.available_width();
                 crate::ui_table::clipped_label(ui, &loc, w).on_hover_text(&loc);
                 return;
@@ -138,7 +138,9 @@ impl MgrApp {
                     t("m.k_file")
                 };
                 let size = if e.is_dir { String::new() } else { human(e.size) };
-                let name = if e.is_dir && self.cwd.is_some() { format!("{}\\", e.name) } else { e.name.clone() };
+                // 3.1.0 #4: direction-control characters are shown as <U+202E>, never applied
+                let shown = crate::archive::display_name(&e.name);
+                let name = if e.is_dir && self.cwd.is_some() { format!("{shown}\\") } else { shown.into_owned() };
                 let dt = date(e.mtime);
                 let r = table.row(ui, self.sel.contains(&e.path), &[&name, &size, &dt, kind]);
                 if r.double_clicked() {
@@ -265,7 +267,8 @@ impl MgrApp {
             ui.spacing_mut().item_spacing.y = 0.0;
             for i in range {
                 let c = &self.children[i];
-                let name = if c.is_dir { format!("{}/", c.name.as_str()) } else { c.name.to_string() };
+                let shown = crate::archive::display_name(c.name.as_str());
+                let name = if c.is_dir { format!("{shown}/") } else { shown.into_owned() };
                 let size = human(c.size);
                 let dt = date(c.mtime);
                 let r = table.row(ui, self.csel.contains(c.full.as_str()), &[&name, &size, &dt]);
@@ -309,7 +312,7 @@ impl MgrApp {
         let created = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(m.created));
         let rows: Vec<(&str, String)> = vec![
             (t("i.version"), format!("Shield v{}", m.version)),
-            (t("i.name"), m.name.clone()),
+            (t("i.name"), crate::archive::display_name(&m.name).into_owned()),
             (t("i.created"), date(created)),
             (t("i.aead"), "XChaCha20-Poly1305".into()),
             (t("i.kdf"), tf("i.kdf_val", &[&human(m.kdf_mem_kib as u64 * 1024), &m.kdf_lanes])),

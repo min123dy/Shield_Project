@@ -1,10 +1,10 @@
-SHIELD 3.0.0 - Building
+SHIELD 3.1.0 - Building
 =======================
 한국어: docs\02_빌드_방법.txt
 
 1. Layout
 ---------
-Cargo.toml                workspace (shield-platform, shield-core, shield-gui, shield-cli), version 3.0.0
+Cargo.toml                workspace (shield-platform, shield-core, shield-gui, shield-cli), version 3.1.0
 crates\                   the four crates (01_overview section 3)
 keys\release_key.asc      release public key to embed (public key only; never put a secret key in the repository)
 installer\windows\        installer.wxs, installer.ko-KR.wxl, installer.en-US.wxl
@@ -43,6 +43,8 @@ The scripts print public values only (URL, fingerprint, file names). bash runs w
   .\build.ps1                                    (asks everything)
   .\build.ps1 -RepoUrl https://github.com/o/r -NoSign -Variants msi,console
   .\build.ps1 -RepoUrl https://github.com/o/r -Sign -PublicKeyPath keys\release_key.asc
+  .\build.ps1 -Stage build -NoSign -RepoUrl ...  /  -Stage package  /  -Stage manifest   (stage by stage like CI, 7)
+  Release builds are x86_64-pc-windows-msvc only (other targets such as MinGW stop: /DEPENDENTLOADFLAG is MSVC only).
 Steps: check inputs -> (signing) temp keyring with only the public key, check the local keyring holds the secret key ->
 cargo test --workspace --release -> build shield-gui.exe and shield.exe -> console-only build (target\console) ->
 (signing) sign both exes (the .sig files are installed next to them for the integrity check) -> MSI -> portable ->
@@ -54,46 +56,120 @@ keyring -> VERIFY.txt, SHA256SUMS.txt
   ./build.sh --repo https://github.com/o/r --no-sign
   ./build.sh --repo https://github.com/o/r --sign --variants deb,appimage,console
   ./build.sh --zig --arch aarch64 --variants console     (cross-built static console only)
+Do not run it with sudo (no step needs root; the deb uses --root-owner-group). Under sudo PATH and HOME are root's, so
+rustup's cargo is not found and target/ becomes owned by root. In 3.1.0 final build.sh refuses sudo at the start, points
+to sudo chown -R <user>: <folder> when an earlier sudo run left files behind, and finds cargo in ~/.cargo/bin even when it
+is not on PATH. Running as the root account itself (containers, CI) is not refused.
+  ./build.sh --stage build --no-sign --repo ...  /  --stage package  /  --stage manifest   (stage by stage, 7)
 deb, AppImage and rpm are built for the machine's own architecture (they need GTK). aarch64 packages come from an
 aarch64 machine or GitHub's ubuntu-24.04-arm runner. Package tree: /usr/bin/shield, /usr/bin/shield-gui,
 /usr/share/applications (shield.desktop, shield-open.desktop), /usr/share/mime/packages/shield.xml,
 /usr/share/icons/hicolor/*/apps/shield.png, /usr/share/nemo/actions, /usr/share/kio/servicemenus (KF6),
 /usr/share/kservices5/ServiceMenus (KF5), /usr/share/shield (integrate.sh: per-user Nautilus scripts and Thunar actions),
-/usr/share/doc/shield. When signed also /usr/bin/shield.sig and shield-gui.sig.
+/usr/share/polkit-1/actions/com.shield.update.policy (update install helper, 3.1.0 #1), /usr/share/doc/shield. When
+signed also /usr/bin/shield.sig and shield-gui.sig. Since 3.1.0 Nemo, Dolphin, Nautilus and Thunar offer "Open in SHIELD"
+on every file.
 
 6. Artifacts (dist\)
 --------------------
-  Shield_v3.0.0_x64.msi                  Windows installer (shield-gui.exe + shield.exe, PATH entry)
-  Shield_v3.0.0_x64_portable.exe         Windows portable GUI
-  shield-console_v3.0.0_windows_x64.exe  Windows console only (no GUI dependencies)
-  shield_v3.0.0_amd64.deb / _arm64.deb   Debian / Ubuntu packages
-  Shield_v3.0.0_x86_64.AppImage / _aarch64.AppImage
-  shield-console_v3.0.0_linux_x64 / _linux_arm64   static musl console
-  shield_v3.0.0_x86_64.rpm               optional
-  Shield_Project_v3_0_0.zip              source (without target, dist, .git, secret keys, .env ...; stops on a secret key block)
-  Shield_v3.0.0_release.txt              release manifest (checked by updates)
+  Shield_v3.1.0_x64.msi                  Windows installer (shield-gui.exe + shield.exe, PATH entry)
+  Shield_v3.1.0_x64_portable.exe         Windows portable GUI
+  shield-console_v3.1.0_windows_x64.exe  Windows console only (no GUI dependencies)
+  shield_v3.1.0_amd64.deb / _arm64.deb   Debian / Ubuntu packages
+  Shield_v3.1.0_x86_64.AppImage / _aarch64.AppImage
+  shield-console_v3.1.0_linux_x64 / _linux_arm64   static musl console
+  shield_v3.1.0_x86_64.rpm               optional
+  Shield_Project_v3.1.0.zip              source (without target, dist, .git, secret keys, .env ...; stops on a secret key block)
+  Shield_v3.1.0_release.txt              release manifest v1 (read by 3.0.0 and the earlier 3.1.0 build; fixed format)
+  Shield_v3.1.0_release_v2.txt           release manifest v2 (read by 3.1.0 final and later; added in 3.1.0 final)
   a .sig for each, the public key .asc, VERIFY.txt (when signed), SHA256SUMS.txt (always)
-Manifest format (LF; updates accept exactly this):
+Manifest v1 format (LF; 3.0.0's parser accepts exactly this, so it is not changed):
   Shield release manifest 1
-  version 3.0.0
+  version 3.1.0
   sha256 <64 lowercase hex digits> <file name>
-Updates check manifest signature -> version (equal to the tag, newer than the running one) -> package SHA-256 -> package
-signature. When Windows and Linux are built separately, pass one manifest to the other build with -MergeManifest /
+Manifest v2 format (LF; the whole file is signed; update::manifest2):
+  Shield release manifest 2
+  version 3.1.0
+  release_id <integer, grows with every release; the scripts use the build time in seconds>
+  issued_at <Unix seconds>
+  expires_at <Unix seconds; the scripts use +365 days, clients accept at most 400 days>
+  min_allowed_version 3.1.0
+  revoked_key <40 upper-case hex digits>   (one per line of keys\revoked_keys.txt; none if empty; at most 64)
+  sha256 <64 lowercase hex digits> <file name>
+Updates (3.1.0 final) check the v2 manifest signature -> issue time and expiry (24 h clock tolerance) -> version (equal
+to the tag, newer than the running one, at least min_allowed_version) -> revoked keys -> rollback (highest release_id in
+update_seen.txt) -> package SHA-256 -> package signature. Without a v2 manifest, or when any check fails, nothing is
+installed and only the release page link is shown. v2 expires after 365 days, so without a new release within a year it
+has to be made and signed again (docs/07 section 5).
+- Build path remapping (3.1.0 final): build.ps1/build.sh write target\remap-paths.toml (a cargo config file) and pass it
+  with --config to every cargo build/test/run. --remap-path-prefix replaces the user's home (~), CARGO_HOME (/cargo),
+  RUSTUP_HOME (/rustup) and the repository root (/shield), so the account name and local paths no longer end up in the
+  programs' panic location strings (docs/09 S-05). Why not a flags variable: it would replace the rustflags of
+  .cargo\config.toml (crt-static), and the C runtime would be linked as a DLL (vcruntime140.dll) again; cargo joins
+  target.<cfg>.rustflags from config files. A plain cargo build outside the scripts is not remapped.
+- Release key handling: the build checks that the embedded file is a parseable public key and contains no private-key
+  material. A signing subkey, expiry, project-specific user ID and backup key are not mandatory key-shape requirements.
+  A signed release still needs a signing-capable secret key matching the embedded public key.
+- build.sh's test stage also runs installer/linux/tests/nautilus_scripts_test.sh (47 path cases of the Nautilus scripts). When Windows and Linux are built separately, pass one manifest to the other build with -MergeManifest /
 --merge-manifest so a single manifest is signed. Release asset names must match the table above.
 
-7. GitHub Actions (.github\workflows\release.yml)
-------------------------------------------------
-- windows (windows-latest) and linux (ubuntu-24.04, ubuntu-24.04-arm) build; on a vX.Y.Z tag the release job merges the
-  manifests (every hash checked against the real file), signs the result and runs gh release create.
-- How secrets are used (never put the signing private key in the repository):
-  SHIELD_GPG_KEY         signing subkey only: gpg --armor --export-secret-subkeys <fingerprint>!  (no primary secret key)
-  SHIELD_GPG_PASSPHRASE  its passphrase
-  Each job imports them into a throwaway GNUPGHOME under RUNNER_TEMP, hands the passphrase to gpg only through a 0600
-  file there, and deletes the folder at the end. Secret values are never echoed (GitHub also masks them).
-  Without the secrets the build runs unsigned (updates then refuse that release).
-- AppImage: with both repository variables APPIMAGETOOL_URL and APPIMAGETOOL_SHA256 set, the tool is downloaded and its
-  hash checked. Unpinned tools are never downloaded.
-- Recommended: tag protection rules, an environment approval for the release job, an expiry date on the subkey.
+7. GitHub Actions (.github\workflows\release.yml, 3.1.0 final)
+--------------------------------------------------------------
+Building and signing are separate jobs. Build jobs never see a secret; signing jobs never build. The workflow has not
+run on GitHub yet (not verified on a real system); try it with workflow_dispatch before the first tag. The toolchain is
+pinned by rust-toolchain.toml (1.99.1, clippy, rustfmt), the runners to windows-2022 / ubuntu-24.04 / ubuntu-24.04-arm.
+run: scripts contain no ${{ }} expressions; values come through env: and GITHUB_* variables (checked by release_tests).
+  audit           cargo audit --deny warnings, cargo deny --locked check (advisories bans sources licenses), with
+                  pinned tool versions (cargo-audit 0.22.2, cargo-deny 0.20.2). Ignore list: .cargo\audit.toml = deny.toml.
+                  Fails when an exception is past its review-by date (2027-05-10). Release-key topology is an operational
+                  recommendation, not an audit-job gate (signing still needs a matching signing-capable secret key)
+  build-windows   clippy -D warnings, build.ps1 -Stage build -NoSign: tests, shield-gui.exe, shield.exe,
+                  console\shield.exe; provenance attestation of the programs (actions/attest-build-provenance)
+  build-linux     clippy -D warnings, build.sh --stage build --no-sign (ubuntu-24.04, ubuntu-24.04-arm): tests,
+                  programs, icons, static musl console, attestation. Results are uploaded as artifacts (bin-*)
+  sign-binaries   environment release-signing, v* tag pushes only. Before any secret is loaded, gh attestation verify
+                  checks every downloaded program (same file, built by this workflow of this repository); then
+                  detached signatures (.sig), verified again with the public key. No cargo, no package installs, no
+                  third-party actions
+  package-*       build.ps1 -Stage package / build.sh --stage package build MSI, portable, deb, AppImage, console and
+                  the source zip from the uploaded programs (+ .sig); -Stage manifest writes the manifest lines. No
+                  secrets, no cargo build
+  sign-release    environment release-signing, tags only. Merges the manifests (v1 format unchanged; v2 gets
+                  release_id, issued_at, expires_at (+365 days), min_allowed_version, revoked_key), checks every hash
+                  against the file, signs and re-verifies every package and both manifests, VERIFY.txt, SHA256SUMS.txt
+  publish         contents: write only; attests the published files and runs gh release create (no secrets)
+- Attestations work only in public repositories (or GitHub Enterprise Cloud). Where they are unavailable, set the
+  repository variable SHIELD_ATTESTATIONS=off; that also drops the provenance check before signing.
+- Stage options: build.ps1 -Stage all|build|package|manifest (-BinDir, default target\stage\windows),
+  build.sh --stage all|build|package|manifest (--bin-dir, default target/stage/linux-<arch>). The default "all" does
+  everything in one run as before. The package stage never signs; the programs' .sig files must be there for both
+  programs or for neither. Every cargo build/test/run/install call in the scripts and the workflow uses --locked
+  (checked by release_tests).
+- Environment setup (repository Settings > Environments > New environment "release-signing"):
+  1) Required reviewers: the release managers (each signing job waits for approval)
+  2) Deployment branches and tags: Selected -> a tag rule v* only
+  3) Environment secrets:
+     SHIELD_GPG_KEY         signing-capable secret-key material matching keys\release_key.asc (dedicated signing subkey recommended, not required)
+     SHIELD_GPG_PASSPHRASE  its passphrase
+  Do not add them as repository-wide secrets. The backup key (docs\07) never goes to CI. If the primary key itself
+  has signing capability, its secret material can sign directly, although a dedicated subkey is recommended.
+- Passphrase: only through file descriptor 0 (printf '%s' "$PASS" | gpg --batch --pinentry-mode loopback
+  --passphrase-fd 0 ...). No passphrase file on disk (3.0.0's 0600 file is gone). The key goes into a throwaway
+  GNUPGHOME under RUNNER_TEMP; at the end (trap) gpg-agent is stopped and the folder deleted.
+- workflow_dispatch (manual runs) skips the signing jobs, builds unsigned packages and publishes nothing.
+- Pinned actions: every uses: names a 40-digit commit SHA with the tag in a comment (release_tests checks this; a line
+  whose SHA could not be looked up must say '# TODO-PIN'; there is none now). .github\dependabot.yml proposes cargo and
+  github-actions updates weekly as pull requests. Before merging one, check that the new SHA is that action's tag.
+- AppImage: with both repository variables APPIMAGETOOL_URL and APPIMAGETOOL_SHA256 set, the tool is downloaded and
+  its hash checked; without them no AppImage is built (unpinned tools are never downloaded).
+- Manual settings (tag protection, environment reviewers, Actions permissions ...) cannot be enforced by files: see the
+  checklist in docs/07 section 7.
+- Key-operation recommendation (docs/07): keep a certify-only primary offline and use a time-limited signing subkey in
+  CI where possible. This is operational hardening, not a build or signature-verification prerequisite.
+- Optional task (3.1.0 #9-D, not implemented): Authenticode for the MSI. With a certificate the order would be:
+  build the MSI -> Authenticode (signtool or a signing service, only inside the same environment as sign-release) ->
+  write that MSI's hash into the manifest -> OpenPGP signatures. The certificate's private key stays out of ordinary CI
+  jobs and the repository. Until then UAC shows "Unknown publisher"; integrity is checked with the OpenPGP signatures.
 
 8. Checklists per OS
 --------------------
@@ -102,13 +178,24 @@ Windows (after installing)
   [ ] Select several files + a folder in Explorer -> Encrypt with Shield -> one window asking "one / separately"
   [ ] .shd right-click decrypt and open; Settings > Updates > Check program integrity ("verified" for signed builds)
   [ ] Shredding: VSS warning, 3/7 choice, TRIM result at the end (UAC when not admin)
+  [ ] Right-click files/folders "Secure delete with SHIELD" -> Secure delete tab: warning -> limits checkbox ->
+      6-character code; cancelling deletes nothing. C:\, C:\Windows and the user profile root are refused (docs/10)
   [ ] After uninstalling, PATH entry and context menu entries are gone
-  [ ] With 2.1.0 installed (Korean and English MSI, each), install 3.0.0 -> one Shield in Programs, one set of
+  [ ] With 2.1.0 installed (Korean and English MSI, each), install 3.1.0 -> one Shield in Programs, one set of
       context menu entries, the install folder once in PATH (table in 05_test_and_audit.txt 8.4)
+  [ ] With 3.0.0 installed, install 3.1.0 (MSI and in-app update, each) -> "Open in SHIELD" appears once on a .shd and
+      once on other files (the old .shd-only entry is gone); "Encrypt" and double-clicking a .shd are unchanged
+  [ ] In-app update: one UAC prompt (the installed shield.exe update-install runs elevated); after the install, starting Shield again runs the new version
   [ ] Move and close the window, open it again: same place; after unplugging that monitor it opens on screen
 Linux (after installing the deb; GNOME, KDE, Xfce ...)
   [ ] App menu Shield, shield version in a terminal, double-clicking a .shd -> Open with
   [ ] Nemo and Dolphin entries; Nautilus scripts and Thunar actions after /usr/share/shield/integrate.sh
+  [ ] Nautilus scripts (encrypt, open, secure delete): items in subfolders, search results and names with spaces or
+      newlines show the same absolute path in the window (the automated test uses a fake shield-gui only)
+  [ ] "Secure delete with SHIELD" menus (Nemo, Dolphin, Thunar, Nautilus); /, /usr and ~ are refused
+  [ ] Right-click any file -> Open in SHIELD: a container opens, anything else gets "not a regular file / not a
+      container". Names with spaces, quotes, $ or backticks open the same file (Nemo Quote=double, docs/05 9-B)
+  [ ] deb update: pkexec asks for com.shield.update.install and the package is installed
   [ ] Snapshot warning on btrfs/ZFS/LVM/Timeshift/Snapper volumes; FITRIM on an ext4 SSD (pkexec hint when not root)
   [ ] On Wayland and X11 the window has the Windows size (1040x700 logical, same letter size); it also starts on
       X11 without Xft.dpi and with an invalid WINIT_X11_SCALE_FACTOR
@@ -120,15 +207,21 @@ Both
 
 9. Release signing checklist
 ----------------------------
-  [ ] Cargo.toml version = 3.0.0, tag v3.0.0, the docs\06 heading and the MSI ProductVersion agree (release_tests)
+  [ ] Verify the fingerprint of keys\release_key.asc through an independent channel and confirm the signing secret
+      matches the embedded public key
+  [ ] Consider a dedicated expiring signing subkey and an offline backup key (docs/07; recommendations, not gates)
+  [ ] Cargo.toml version = 3.1.0, tag v3.1.0, the docs\06_3.1.0 heading and the MSI ProductVersion agree (release_tests)
   [ ] UpgradeCode 6B1E5C0A-3D7F-4C52-9A1B-0F8E2D4C7A91 unchanged, MajorUpgrade IgnoreLanguage="yes" (release_tests)
   [ ] Built with SHIELD_REPO_URL (https://github.com/<owner>/<repo>) and the public key (keys\release_key.asc, no
       private key)
-  [ ] build.ps1 -Sign / build.sh --sign: .sig for both programs, every artifact and the manifest signed and verified
-      again with the temporary keyring
+  [ ] build.ps1 -Sign / build.sh --sign: .sig for both programs, every artifact and both manifests (v1, v2) signed and
+      verified again with the temporary keyring. v2 expires_at is a year ahead; revoked_key matches keys\revoked_keys.txt
   [ ] The fingerprint in VERIFY.txt equals the one the developer published; SHA256SUMS.txt matches the files
   [ ] Settings > Updates > integrity check of the installed program says "integrity confirmed"
   [ ] On Linux: cargo test --workspace / clippy 0 warnings / build.sh (this patch's Linux code was not compiled on
       Windows)
-  [ ] cargo audit: nothing new besides the 3 entries in .cargo\audit.toml
+  [ ] cargo audit --deny warnings and cargo deny check pass (nothing besides the exceptions in .cargo\audit.toml /
+      deny.toml, before their review date 2027-05-10)
+  [ ] The released programs contain no local paths or account names (built with build.ps1/build.sh; docs/05 "3.1.0 final")
+  [ ] Environment release-signing: reviewers, v* tags only, both secrets in the environment, not repository-wide
   [ ] The signing passphrase and private keys are not in the repository, logs or the zip (the zip's key scan passes)

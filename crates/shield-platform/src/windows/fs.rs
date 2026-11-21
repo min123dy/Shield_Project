@@ -2,6 +2,7 @@
 //! never overwrite, replace-with-backup, delete by handle, lock files, NTFS alternate data streams
 //! and the Mark of the Web (Zone.Identifier).
 
+pub use super::erase::{clear_readonly, ensure_data_dir, open_attrs, entry_info, entry_info_at, entry_info_of, is_mount_point, is_reparse_other, mount_points, open_exclusive, private_file_ok, protected, wipe_notes};
 use crate::{FileId, MotwReport, PResult, PlatformError, Retained, Stream};
 use std::{
     fs::{self, File, OpenOptions},
@@ -65,6 +66,70 @@ pub fn final_path(f: &File) -> io::Result<PathBuf> {
         }
         buf.resize(n + 1, 0);
     }
+}
+
+/// Names in the held folder at `path`. While `dir` (from `open_dir_held`, no FILE_SHARE_DELETE) is
+/// open the folder can't be renamed, moved or deleted, so listing by path reads the held folder.
+pub fn list_dir_held(_dir: &File, path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+    fs::read_dir(path)?.map(|d| d.map(|d| d.file_name())).collect()
+}
+
+/// Kind of `path` (an entry of the held folder), without following a reparse point.
+pub fn entry_kind_at(_dir: &File, _name: &std::ffi::OsStr, path: &Path) -> io::Result<crate::EntryKind> {
+    let m = fs::symlink_metadata(path)?;
+    Ok(if m.file_type().is_symlink() || is_reparse(&m) {
+        crate::EntryKind::Link
+    } else if m.is_dir() {
+        crate::EntryKind::Dir
+    } else if m.is_file() {
+        crate::EntryKind::File
+    } else {
+        crate::EntryKind::Other
+    })
+}
+
+/// Opens and holds the sub-folder at `path` (see `open_dir_held`).
+pub fn open_dir_at(_dir: &File, _name: &std::ffi::OsStr, path: &Path) -> io::Result<File> {
+    open_dir_held(path)
+}
+
+/// Opens the file at `path` for reading without following a reparse point.
+pub fn open_file_at(_dir: &File, _name: &std::ffi::OsStr, path: &Path) -> io::Result<File> {
+    open_no_follow(path, false)
+}
+
+/// True for DOS device paths (`\\.\X`, `\\?\GLOBALROOT`, ...) and reserved device names (CON,
+/// NUL, COM1, LPT1, ... with or without an extension, in any folder).
+pub fn is_device_path(p: &Path) -> bool {
+    let s = p.as_os_str().to_string_lossy().replace('/', "\\");
+    let low = s.to_ascii_lowercase();
+    if low.starts_with(r"\\.\") || low.starts_with(r"\??\") || low.starts_with(r"\\?\globalroot") {
+        return true;
+    }
+    let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_ascii_uppercase()) else { return false };
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    matches!(stem, "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT")) && stem.as_bytes()[3].is_ascii_digit())
+}
+
+/// Opens `p` for reading as a regular file only: device paths are refused before the open, then
+/// the handle must be a plain disk file (GetFileType = FILE_TYPE_DISK, not a folder or reparse
+/// point). 3.1.0 #14: "open in Shield" now receives any path.
+pub fn open_regular(p: &Path) -> io::Result<File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_DISK};
+    if is_device_path(p) {
+        return Err(io::Error::other("device path"));
+    }
+    let f = open_no_follow(p, false)?;
+    if unsafe { GetFileType(f.as_raw_handle() as _) } != FILE_TYPE_DISK {
+        return Err(io::Error::other("not a regular file"));
+    }
+    let id = file_id(&f)?;
+    if id.special || !f.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(f)
 }
 
 pub fn file_id(f: &File) -> io::Result<FileId> {
@@ -426,12 +491,12 @@ const INTERNET_ZONE: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
 /// (over 64 KiB) or unreadable becomes a plain Internet-zone mark instead of "no mark" (security
 /// review 2026-11-08: an oversized mark used to drop the protection).
 pub fn read_zone(p: &Path) -> Option<Vec<u8>> {
-    let sp = stream_path(p, ZONE);
-    match fs::metadata(&sp) {
+    // 3.1.0 review 3: the limit is applied on the open stream, not after reading it whole
+    match crate::bounded::read_file_limited(&stream_path(p, ZONE), 64 * 1024) {
         Err(x) if x.kind() == io::ErrorKind::NotFound => None,
-        Ok(m) if m.len() == 0 => None,
-        Ok(m) if m.len() > 64 * 1024 => Some(INTERNET_ZONE.to_vec()),
-        _ => Some(fs::read(&sp).ok().filter(|z| !z.is_empty() && z.len() <= 64 * 1024).unwrap_or_else(|| INTERNET_ZONE.to_vec())),
+        Ok(z) if z.is_empty() => None,
+        Ok(z) => Some(z),
+        Err(_) => Some(INTERNET_ZONE.to_vec()),
     }
 }
 

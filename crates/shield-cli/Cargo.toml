@@ -4,6 +4,7 @@ description = "Shield console program `shield` (with the `gui` feature also `shi
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [[bin]]

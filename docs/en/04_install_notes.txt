@@ -1,28 +1,32 @@
-■ Shield 3.0.0 setup - please read the warnings and the short guide
+■ Shield 3.1.0 setup - please read the warnings and the short guide
 
-An installed Shield (2.1.0, 3.0.0 betas included) is removed automatically and upgraded to 3.0.0, whatever its
+An installed Shield (2.1.0, 3.0.0 and its betas included) is removed automatically and upgraded to 3.1.0, whatever its
 installer language.
 3.0 opens 2.x containers unchanged. The 1.x format is not opened: decrypt 1.x files with 1.x first.
 
 ■ Important
 - If you lose the password, the PIM or a key file, nobody (the developer included) can decrypt the files.
 - Do not edit or re-save key files; back them up somewhere other than the encrypted files.
-- Overwrite deletion (shredding the originals) cannot be undone. Try encrypting and decrypting a copy first.
+- Overwrite deletion (shredding the originals) and secure delete cannot be undone. Try encrypting and decrypting a
+  copy first. Secure delete runs only after a warning, a limits confirmation and a typed confirmation code.
 - On SSDs, USB sticks, volume shadow copies and cloud-synced folders, overwriting and TRIM cannot guarantee
   physical erasure. Shield checks for shadow copies and reports them but never deletes them.
 - After a password change, older backups still open with the old password.
 - Memory and process protection is best effort. It does not stop malware running as the same user,
   administrators, the kernel or physical access.
 - Screen capture protection (on by default) only blocks software capture such as screenshots and recordings.
-- This installer has no Authenticode signature, so SmartScreen may warn. Verify the OpenPGP signature with the
-  .sig and VERIFY.txt first, and compare the key fingerprint with the one the developer published.
+- This installer has no Authenticode signature, so SmartScreen ("Windows protected your PC") and UAC's "Unknown
+  publisher" may appear. Verify the OpenPGP signature with the .sig and VERIFY.txt before installing:
+    gpg --import <key.asc>  ->  gpg --fingerprint <fingerprint>  ->  gpg --verify Shield_v3.1.0_x64.msi.sig Shield_v3.1.0_x64.msi
+  Compare the fingerprint with the one the developer published outside the repository (release notes, web page ...).
 - Update checks are off by default. When turned on, Shield only contacts GitHub, sends no identifying
   information, and installs a correctly signed newer version only after asking.
 
 ■ What is installed
 - shield-gui.exe (windows) and shield.exe (command line). The install folder is added to the system PATH, so
   'shield help' works in a new terminal.
-- Start menu shortcuts, Explorer context menu entries (several items at once) and the user guide.
+- Start menu shortcuts, Explorer context menu entries (several items at once: encrypt, secure delete, .shd decrypt and
+  open) and the user guide.
 
 ■ Short guide
 1. 'Shield' in the Start menu is the encryption window; 'Shield File Manager' browses folders and opens .shd files.

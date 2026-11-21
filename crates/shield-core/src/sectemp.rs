@@ -33,6 +33,8 @@ const LABEL: &[u8] = b"SHIELD-v2-SECTEMP";
 pub struct SecTemp {
     f: Option<File>,
     path: PathBuf,
+    /// Identity recorded at creation; only this file is deleted (3.1.0 #12).
+    id: Option<crate::sysinfo::FileId>,
     key: Box<[u8; 32]>,
     ctr: u64,
     /// Expected counter per block (0 = never written).
@@ -76,7 +78,9 @@ impl SecTemp {
             return Err(io::Error::other(m));
         }
         lock_mem(key.as_ptr(), 32);
+        let id = crate::sysinfo::file_id(&f).ok();
         Ok(Self {
+            id,
             f: Some(f),
             path,
             key,
@@ -187,9 +191,12 @@ impl SecTemp {
             let _ = f.set_len(0);
             drop(f);
         }
-        match fs::remove_file(&self.path) {
-            Ok(()) => Ok(()),
-            Err(x) if x.kind() == io::ErrorKind::NotFound => Ok(()),
+        let Some(id) = self.id else {
+            return Err(io::Error::other(crate::i18n::tf("st.not_ours", &[&self.path.display()])));
+        };
+        match crate::sysinfo::remove_if_same(&self.path, &id) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(io::Error::other(crate::i18n::tf("st.not_ours", &[&self.path.display()]))),
             Err(x) => Err(io::Error::new(
                 x.kind(),
                 crate::i18n::tf("st.delete_failed", &[&self.path.display(), &x]),
@@ -254,7 +261,9 @@ impl Seek for SecTemp {
 
 impl Drop for SecTemp {
     fn drop(&mut self) {
-        let _ = self.wipe();
+        if let Err(x) = self.wipe() {
+            crate::progress::cleanup_warning(x.to_string());
+        }
     }
 }
 
@@ -358,6 +367,31 @@ mod tests {
         let p = t.path.clone();
         t.destroy().unwrap();
         assert!(!p.exists());
+    }
+
+    /// 3.1.0 #12: a different file put under the temporary name is never deleted.
+    #[test]
+    fn destroy_leaves_a_file_that_took_the_name() {
+        let (t, _) = filled();
+        let p = t.path.clone();
+        let moved = p.with_extension("moved");
+        fs::rename(&p, &moved).unwrap();
+        fs::write(&p, b"somebody else's").unwrap();
+        let err = t.destroy().unwrap_err().to_string();
+        assert!(err.contains(&p.display().to_string()), "{err}");
+        assert_eq!(fs::read(&p).unwrap(), b"somebody else's");
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(&moved);
+        // dropped instead of destroyed: no panic, the warning is queued
+        let (t, _) = filled();
+        let p = t.path.clone();
+        fs::rename(&p, &moved).unwrap();
+        fs::write(&p, b"other").unwrap();
+        drop(t);
+        assert!(p.exists());
+        assert!(crate::progress::take_cleanup_warnings().iter().any(|w| w.contains(&p.display().to_string())));
+        let _ = fs::remove_file(&p);
+        let _ = fs::remove_file(&moved);
     }
 
     /// Another program holding the file without delete sharing: destroy must report it, not hide it.

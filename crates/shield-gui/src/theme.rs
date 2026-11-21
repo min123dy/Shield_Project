@@ -122,10 +122,14 @@ fn height_per_em(bytes: &[u8], index: u32) -> Option<f32> {
 /// A Hangul-capable system font first (Windows: Malgun Gothic; Linux: Noto Sans CJK / Nanum /
 /// Un fonts, see `shield_platform::sys::font_candidates`), egui's fonts after. The same on both
 /// systems: the font is scaled to the letter size of Malgun Gothic (`glyph_scale`).
+/// Largest font file loaded (CJK collections are about 20-30 MB).
+const MAX_FONT: u64 = 128 << 20;
+
 pub fn load_fonts(ctx: &egui::Context) {
     let cands = shield_platform::sys::font_candidates();
     for (p, index) in cands {
-        if let Ok(b) = std::fs::read(&p) {
+        // system font files (fixed paths), read with a generous limit (3.1.0 review 3)
+        if let Ok(b) = shield_platform::bounded::read_file_limited(&p, MAX_FONT) {
             let mut f = egui::FontDefinitions::default();
             let scale = height_per_em(&b, index).map(glyph_scale).unwrap_or(1.0);
             let mut data = egui::FontData::from_owned(b);

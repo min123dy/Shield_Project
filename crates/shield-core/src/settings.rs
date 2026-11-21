@@ -101,6 +101,9 @@ pub struct Settings {
     pub update: UpdateMode,
     /// Default overwrite passes (3 or 7) offered for shredding, rekey, add and remove.
     pub shred_passes: crate::wipe::Passes,
+    /// Secure delete (tab, `shield wipe`) asks for the settings password before it deletes, when a
+    /// settings password is set. On by default; switching it off is a protected change.
+    pub wipe_needs_pw: bool,
     /// Settings password (salt, verifier); None = no password set.
     pub auth: Option<crate::settings_auth::Auth>,
     /// Runtime only: the protected values failed the MAC check at load and were reset.
@@ -125,6 +128,9 @@ pub struct Settings {
     /// Runtime only: rows of the file that were damaged or had impossible values (they got their
     /// defaults). Shown once at start-up.
     pub load_issues: Vec<String>,
+    /// Runtime only (3.1.0 final, review D): the data folder can't be used (none known, a link,
+    /// another user's). The defaults are used and nothing can be saved; shown at start-up.
+    pub data_error: Option<String>,
 }
 
 /// A feature that depends on the environment (OS, display server, build options).
@@ -167,6 +173,7 @@ impl Default for Settings {
             entropy_disabled: Vec::new(),
             update: UpdateMode::Off,
             shred_passes: crate::wipe::Passes::Seven,
+            wipe_needs_pw: true,
             auth: None,
             tampered: false,
             strength: crate::compress::Strength::Auto,
@@ -181,6 +188,7 @@ impl Default for Settings {
             ui: crate::ui_prefs::UiPrefs::default(),
             env_off: Vec::new(),
             load_issues: Vec::new(),
+            data_error: None,
         }
     }
 }
@@ -328,6 +336,7 @@ impl Settings {
         (self.allow_arg_secrets, self.update, self.shred_passes) = (d.allow_arg_secrets, d.update, d.shred_passes);
         (self.auto_lock_min, self.lock_on_minimize, self.allow_reveal, self.clipboard_clear) = (d.auto_lock_min, d.lock_on_minimize, d.allow_reveal, d.clipboard_clear);
         self.lock_on_focus_loss = d.lock_on_focus_loss;
+        self.wipe_needs_pw = d.wipe_needs_pw;
         self.entropy_disabled.clear();
     }
 
@@ -336,7 +345,7 @@ impl Settings {
     pub fn protected_is_default(&self) -> bool {
         let mut d = Settings::default();
         d.auth.clone_from(&self.auth);
-        d.protected_text() == self.protected_text()
+        d.mac_text() == self.mac_text()
     }
 
     /// Takes over the protected values of `o` (used to undo a change the password did not allow).
@@ -345,12 +354,25 @@ impl Settings {
         (self.allow_arg_secrets, self.update, self.shred_passes) = (o.allow_arg_secrets, o.update, o.shred_passes);
         (self.auto_lock_min, self.lock_on_minimize, self.allow_reveal, self.clipboard_clear) = (o.auto_lock_min, o.lock_on_minimize, o.allow_reveal, o.clipboard_clear);
         self.lock_on_focus_loss = o.lock_on_focus_loss;
+        self.wipe_needs_pw = o.wipe_needs_pw;
         self.entropy_disabled.clone_from(&o.entropy_disabled);
         self.auth.clone_from(&o.auth);
     }
 
-    /// Canonical text of the protected values: what the settings MAC covers and what a change
-    /// without the settings password may not alter.
+    /// What the settings MAC covers and what a change without the settings password may not
+    /// alter: the 3.0.0 text (`protected_text`, kept as it was so 3.0.0 files keep their MAC) and
+    /// the protected values added later, each only while it differs from its default (a file
+    /// that never had the value gives the same text). Use this, never `protected_text` alone, for
+    /// MACs and comparisons.
+    pub fn mac_text(&self) -> String {
+        let mut s = self.protected_text();
+        if !self.wipe_needs_pw {
+            s.push_str("wipe_needs_settings_pw=false\n");
+        }
+        s
+    }
+
+    /// Canonical text of the protected values of 3.0.0 (part of `mac_text`).
     pub fn protected_text(&self) -> String {
         if !self.env_off.is_empty() {
             return self.file_view().protected_text();
@@ -403,6 +425,7 @@ impl Settings {
             ("entropy_disabled", q(&self.entropy_disabled.join(","))),
             ("update", q(self.update.code())),
             ("shred_passes", self.shred_passes.count().to_string()),
+            ("wipe_needs_settings_pw", b(self.wipe_needs_pw).into()),
             ("strength", q(strength_code(self.strength))),
             ("default_pim", self.default_pim.to_string()),
             ("keyfile_kib", self.keyfile_kib.to_string()),
@@ -476,6 +499,7 @@ impl Settings {
                 }
                 "update" => put(&mut s.update, UpdateMode::parse(sv)),
                 "shred_passes" => put(&mut s.shred_passes, v.parse().ok().and_then(crate::wipe::Passes::from_count)),
+                "wipe_needs_settings_pw" => put(&mut s.wipe_needs_pw, bv),
                 k if k.starts_with("auth_") => {
                     crate::settings_auth::Auth::parse_line(&mut s.auth, k, sv);
                     true
@@ -504,7 +528,16 @@ impl Settings {
     pub fn load_from(p: &Path) -> Settings {
         let damaged = || Settings { load_issues: vec![FILE.into()], ..Default::default() };
         let mut legacy = false;
-        let mut s = match std::fs::read(p) {
+        // 3.1.0 review 3: the size limit applies to the open handle and to the read itself
+        // 3.1.0 final (review D): on Linux a settings file another user owns or may write is not used
+        let read = shield_platform::bounded::open_read(p).and_then(|f| {
+            if shield_platform::fs::private_file_ok(&f, false) {
+                shield_platform::bounded::read_open_limited(&f, MAX_FILE as u64)
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "settings file of another user or writable by others"))
+            }
+        });
+        let mut s = match read {
             Ok(b) if b.len() <= MAX_FILE => match std::str::from_utf8(&b) {
                 Ok(text) => {
                     legacy = file_schema(text).is_some_and(|v| v < SCHEMA);
@@ -526,11 +559,12 @@ impl Settings {
     /// Returns the settings now on disk (with this process's runtime state), to use as the new
     /// `base` and current settings.
     pub fn save_merged(&self, base: &Settings, p: &Path, unlocked: Option<&crate::settings_auth::Unlocked>) -> Result<Settings, String> {
+        usable_path(p)?;
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir).map_err(|x| crate::i18n::tf("set.save_failed", &[&x]))?;
         }
         let _guard = crate::lock::acquire(&p.with_file_name("settings.lock"), crate::lock::Mode::Exclusive, std::time::Duration::from_secs(3))?;
-        let disk = match std::fs::read(p) {
+        let disk = match shield_platform::bounded::read_file_limited(p, MAX_FILE as u64) {
             Ok(b) if b.len() <= MAX_FILE => std::str::from_utf8(&b).ok().map(Settings::from_toml),
             _ => None,
         };
@@ -565,6 +599,7 @@ impl Settings {
     /// Saves. Refused when the protected values differ from the file on disk and `unlocked` is
     /// None (the settings password was not given) while a password is set; see `settings_auth`.
     pub fn save_to_with(&self, p: &Path, unlocked: Option<&crate::settings_auth::Unlocked>) -> Result<(), String> {
+        usable_path(p)?;
         crate::settings_auth::authorize(self, p, unlocked)?;
         let sealed = crate::settings_auth::with_mac(self, p, unlocked)?;
         sealed.write_file(p)
@@ -601,14 +636,19 @@ impl Settings {
         r.map_err(|x| crate::i18n::tf("set.save_failed", &[&x]))
     }
 
+    /// The settings of this user. A data folder that can't be used gives the defaults with
+    /// `data_error` set (never settings from a folder somebody else controls).
     pub fn load() -> Settings {
-        Settings::load_from(&settings_path())
+        match settings_path() {
+            Ok(p) => Settings::load_from(&p),
+            Err(e) => Settings { data_error: Some(e), ..Default::default() },
+        }
     }
     pub fn save(&self) -> Result<(), String> {
-        self.save_to(&settings_path())
+        self.save_to(&settings_path()?)
     }
     pub fn save_unlocked(&self, u: &crate::settings_auth::Unlocked) -> Result<(), String> {
-        self.save_to_with(&settings_path(), Some(u))
+        self.save_to_with(&settings_path()?, Some(u))
     }
 
     /// Language to use (System = the OS UI language).
@@ -618,6 +658,16 @@ impl Settings {
             LangPref::En => crate::i18n::Lang::En,
             LangPref::System => crate::i18n::system_lang(),
         }
+    }
+}
+
+/// A settings path to write: absolute (review D: an unusable data folder must never turn into a
+/// relative path that writes into the current folder).
+fn usable_path(p: &Path) -> Result<(), String> {
+    if p.is_absolute() {
+        Ok(())
+    } else {
+        Err(crate::i18n::t("set.no_save_dir").into())
     }
 }
 
@@ -687,23 +737,28 @@ pub fn portable_dir() -> Option<PathBuf> {
 }
 
 /// Folder for settings, the staging journal and lock files (Windows `%LOCALAPPDATA%\Shield`, Linux
-/// `$XDG_CONFIG_HOME/shield`; 2.x on Linux wrongly used `$HOME/Shield`).
-pub fn data_dir() -> PathBuf {
-    if let Some(p) = portable_dir() {
-        return p;
-    }
-    shield_platform::platform().config_dir()
+/// `$XDG_CONFIG_HOME/shield`; 2.x on Linux wrongly used `$HOME/Shield`). Created when missing and
+/// checked every time (3.1.0 final, review D): Linux: a real 0700 folder owned by this user (looser
+/// permissions are tightened, another owner or a link is an error); Windows: no junction / link.
+/// There is no fallback folder: without one, settings are not read or saved (an error).
+pub fn data_dir() -> Result<PathBuf, String> {
+    let d = match portable_dir() {
+        Some(p) => p,
+        None => shield_platform::platform().config_dir().map_err(|x| crate::i18n::tf("set.no_data_dir", &[&x]))?,
+    };
+    shield_platform::fs::ensure_data_dir(&d).map_err(|x| crate::i18n::tf("set.data_dir_bad", &[&x]))?;
+    Ok(d)
 }
 
-pub fn settings_path() -> PathBuf {
-    data_dir().join(FILE)
+pub fn settings_path() -> Result<PathBuf, String> {
+    Ok(data_dir()?.join(FILE))
 }
 
 /// "Delete settings file" button: the defaults apply from the next start.
 /// Also the recovery for a forgotten settings password: every setting returns to its default and
 /// the password is gone. Containers are not affected (their keys never depend on settings).
 pub fn delete_file() -> Result<(), String> {
-    let p = settings_path();
+    let p = settings_path()?;
     crate::settings_auth::forget_key(&p);
     match std::fs::remove_file(p) {
         Ok(()) => Ok(()),

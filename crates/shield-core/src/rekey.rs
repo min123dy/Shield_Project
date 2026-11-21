@@ -115,8 +115,7 @@ pub fn do_full_rekey(path: &Path, old: &Cred, new: &Cred, passes: Passes) -> R<S
     st.seek(SeekFrom::Start(0)).map_err(e)?;
 
     set_stage(ST_ENCRYPT);
-    let part = PartGuard::new(dir.join(format!(".shd_{}.part", rand_hex()?)));
-    let out = OpenOptions::new().write(true).create_new(true).open(&part.path).map_err(e)?;
+    let (part, out) = PartGuard::create(dir.join(format!(".shd_{}.part", rand_hex()?))).map_err(e)?;
     let mut w = BufWriter::with_capacity(1 << 20, out);
     let mut meta = h.meta.clone();
     let nh = encrypt_stream(&mut st, &mut w, new, &mut meta)?;

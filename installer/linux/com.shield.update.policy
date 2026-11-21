@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  Shield 3.1.0 #1: the only program pkexec runs for an update is Shield's own root-owned
+  /usr/bin/shield with the hidden helper command `update-install` (argv1). The helper copies the
+  downloaded files into /var/lib/shield/update/<random>, verifies the copies with its embedded
+  release keys and installs only the copy. Installed by the .deb to /usr/share/polkit-1/actions/.
+-->
+<policyconfig>
+  <vendor>Shield</vendor>
+  <action id="com.shield.update.install">
+    <description>Install a Shield update</description>
+    <description xml:lang="ko">Shield 업데이트 설치</description>
+    <message>Authentication is required to install a Shield update (signature checked again as root)</message>
+    <message xml:lang="ko">Shield 업데이트 설치에는 관리자 인증이 필요합니다 (서명은 관리자 권한으로 다시 확인합니다)</message>
+    <icon_name>shield</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/shield</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">update-install</annotate>
+  </action>
+</policyconfig>

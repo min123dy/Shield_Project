@@ -47,33 +47,121 @@ pub fn kdf_params(pim: u32) -> R<Params> {
     Ok(p)
 }
 
-/// KEK = Argon2id(password, salt, secret = key file digest). The 256 MiB work memory is supplied by
-/// us so it can be locked in RAM (best effort) and is zeroized right after use.
-fn kek(c: &Cred, salt: &[u8]) -> R<XChaCha20Poly1305> {
-    if c.is_empty() {
-        return Err(t("crypto.need_cred").into());
+/// One key derivation at a time (3.1.0 #13): each needs 256 MiB, and a cancelled one keeps running
+/// on its worker until Argon2 returns. The slot is held by the worker, so the next derivation
+/// waits until the previous one really ended and its memory was wiped.
+struct KdfSlot {
+    busy: std::sync::Mutex<bool>,
+    freed: std::sync::Condvar,
+}
+
+static KDF_SLOT: KdfSlot = KdfSlot { busy: std::sync::Mutex::new(false), freed: std::sync::Condvar::new() };
+
+/// Owned (Send) right to run one key derivation; released on drop.
+struct SlotToken;
+
+impl KdfSlot {
+    /// Waits for the slot; gives up when `cancel` says so.
+    fn acquire(&'static self, cancel: &dyn Fn() -> bool) -> R<SlotToken> {
+        let mut b = self.busy.lock().unwrap_or_else(|p| p.into_inner());
+        while *b {
+            if cancel() {
+                return Err(cancelled_msg());
+            }
+            b = self.freed.wait_timeout(b, std::time::Duration::from_millis(50)).unwrap_or_else(|p| p.into_inner()).0;
+        }
+        *b = true;
+        Ok(SlotToken)
     }
-    let params = kdf_params(c.pim)?;
+}
+
+impl Drop for SlotToken {
+    fn drop(&mut self) {
+        let mut b = KDF_SLOT.busy.lock().unwrap_or_else(|p| p.into_inner());
+        *b = false;
+        KDF_SLOT.freed.notify_all();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod kdf_probe {
+    //! Test instrumentation: workers running at the same time, and whether that ever exceeded one.
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    pub static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    pub static OVERLAP: AtomicBool = AtomicBool::new(false);
+    pub static FINISHED: AtomicUsize = AtomicUsize::new(0);
+}
+
+/// Argon2id into `out` with locked, zeroized work memory. Runs on the KDF worker.
+fn argon2_into(pw: &[u8], secret: &[u8], salt: &[u8], params: &Params, out: &mut [u8; KEY]) -> R<()> {
     let _busy = KdfGuard::new();
-    let secret: &[u8] = c.kf.as_ref().map(|k| &k[..]).unwrap_or(&[]);
     let a = Argon2::new_with_secret(secret, Algorithm::Argon2id, Version::V0x13, params.clone()).map_err(e)?;
     let mut mem: Zeroizing<Vec<Block>> = Zeroizing::new(Vec::new());
-    mem.try_reserve_exact(params.block_count())
-        .map_err(|_| t("crypto.kdf_mem").to_string())?;
+    mem.try_reserve_exact(params.block_count()).map_err(|_| t("crypto.kdf_mem").to_string())?;
     mem.resize(params.block_count(), Block::default());
     let bytes = mem.len() * core::mem::size_of::<Block>();
     let locked = lock_large(mem.as_ptr() as *const u8, bytes);
-    let mut out = Zeroizing::new([0u8; KEY]);
-    lock_mem(out.as_ptr(), KEY);
-    let r = a.hash_password_into_with_memory(&c.pw, salt, &mut *out, &mut mem[..]);
+    let r = a.hash_password_into_with_memory(pw, salt, &mut out[..], &mut mem[..]);
     // zeroize while still locked, then unlock, then free
     mem.iter_mut().for_each(zeroize::Zeroize::zeroize);
     unlock_large(mem.as_ptr() as *const u8, bytes, locked);
     drop(mem);
-    r.map_err(e)?;
-    let k = XChaCha20Poly1305::new_from_slice(&*out).map_err(e);
-    unlock_mem(out.as_ptr(), KEY);
-    k
+    r.map_err(e)
+}
+
+/// KEK = Argon2id(password, salt, secret = key file digest). The 256 MiB work memory is supplied by
+/// us so it can be locked in RAM (best effort) and is zeroized right after use.
+///
+/// 3.1.0 #13: the derivation runs on a worker thread and the caller waits on a channel, checking
+/// `cancel`: Cancel returns at once (the worker finishes alone, wipes its copies and frees the
+/// slot; a key it sends to nobody is zeroized when the message is dropped).
+fn kek(c: &Cred, salt: &[u8]) -> R<XChaCha20Poly1305> {
+    kek_with(c, salt, &cancelled)
+}
+
+fn kek_with(c: &Cred, salt: &[u8], cancel: &dyn Fn() -> bool) -> R<XChaCha20Poly1305> {
+    if c.is_empty() {
+        return Err(t("crypto.need_cred").into());
+    }
+    let params = kdf_params(c.pim)?;
+    let slot = KDF_SLOT.acquire(cancel)?;
+    let pw = c.pw.clone();
+    let secret: Zeroizing<Vec<u8>> = Zeroizing::new(c.kf.as_ref().map(|k| k.to_vec()).unwrap_or_default());
+    let salt = salt.to_vec();
+    let (tx, rx) = std::sync::mpsc::channel::<R<Zeroizing<[u8; KEY]>>>();
+    std::thread::Builder::new()
+        .name("shield-kdf".into())
+        .spawn(move || {
+            let _slot = slot;
+            #[cfg(test)]
+            if kdf_probe::ACTIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
+                kdf_probe::OVERLAP.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let mut out = Zeroizing::new([0u8; KEY]);
+            lock_mem(out.as_ptr(), KEY);
+            let r = argon2_into(&pw, &secret, &salt, &params, &mut out);
+            unlock_mem(out.as_ptr(), KEY);
+            drop(pw);
+            drop(secret);
+            #[cfg(test)]
+            {
+                kdf_probe::ACTIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                kdf_probe::FINISHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            let _ = tx.send(r.map(|_| out));
+        })
+        .map_err(e)?;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Ok(r) => {
+                let out = r?;
+                return XChaCha20Poly1305::new_from_slice(&out[..]).map_err(e);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if cancel() => return Err(cancelled_msg()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(crate::job::panic_msg()),
+        }
+    }
 }
 
 pub fn make_slot(c: &Cred, dek: &[u8; KEY]) -> R<[u8; SLOT]> {
@@ -135,7 +223,8 @@ impl Header {
 /// Reads slots + meta, authenticates, validates the meta and the exact file size.
 pub fn read_header(f: &mut File, c: &Cred) -> R<Header> {
     let file_len = f.metadata().map_err(e)?.len();
-    if file_len < (HEADER + TAG + 1) as u64 {
+    // 3.1.0 #13: too short to be a container: no 256 MiB key derivation for it
+    if file_len < MIN_CONTAINER {
         return Err(bad());
     }
     let mut head = Zeroizing::new(vec![0u8; HEADER]);
@@ -354,5 +443,93 @@ impl Seek for ChunkReader {
         }
         self.pos = np as u64;
         Ok(self.pos)
+    }
+}
+
+#[cfg(test)]
+mod kdf_tests {
+    //! 3.1.0 #13: size check before the KDF, cancel, one derivation at a time.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// 3.1.0 #9-A: the AEAD wipes its key when dropped (compile-time check of the trait) and the
+    /// poly1305 `zeroize` feature stays enabled in the manifest.
+    #[test]
+    fn aead_key_and_mac_state_are_wiped_on_drop() {
+        fn wiped_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        wiped_on_drop::<XChaCha20Poly1305>();
+        let toml = include_str!("../Cargo.toml");
+        assert!(toml.contains("poly1305 = { version = \"0.8\", default-features = false, features = [\"zeroize\"] }"));
+    }
+
+    fn cred(pim: u32) -> Cred {
+        Cred { pw: Zeroizing::new(b"kdf test password words".to_vec()), kf: None, pim }
+    }
+
+    fn cancel_after(ms: u64) -> Arc<AtomicBool> {
+        let f = Arc::new(AtomicBool::new(false));
+        let g = f.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(ms));
+            g.store(true, SeqCst);
+        });
+        f
+    }
+
+    #[test]
+    fn cancel_returns_before_the_derivation_ends() {
+        let salt = [7u8; SALT];
+        let t0 = Instant::now();
+        kek_with(&cred(4), &salt, &|| false).unwrap();
+        let full = t0.elapsed();
+        let f = cancel_after(20);
+        let t1 = Instant::now();
+        let r = kek_with(&cred(4), &salt, &|| f.load(SeqCst));
+        let took = t1.elapsed();
+        assert_eq!(r.err(), Some(cancelled_msg()));
+        assert!(took < Duration::from_millis(400) && took < full, "cancel took {took:?}, a full derivation {full:?}");
+        assert!(!kdf_probe::OVERLAP.load(SeqCst), "two derivations ran at once");
+    }
+
+    #[test]
+    fn next_derivation_waits_for_the_previous_one() {
+        let salt = [9u8; SALT];
+        let held = KDF_SLOT.acquire(&|| false).unwrap(); // a derivation in progress
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(kek_with(&cred(0), &salt, &|| false).is_ok());
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "started while another derivation held the slot");
+        // waiting is cancellable too
+        let f = cancel_after(20);
+        assert_eq!(kek_with(&cred(0), &salt, &|| f.load(SeqCst)).err(), Some(cancelled_msg()));
+        drop(held);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(60)), Ok(true), "runs once the slot is free");
+        // a cancelled derivation keeps the slot until its worker really ended
+        let before = kdf_probe::FINISHED.load(SeqCst);
+        let f = cancel_after(10);
+        let _ = kek_with(&cred(2), &salt, &|| f.load(SeqCst));
+        kek_with(&cred(0), &salt, &|| false).unwrap();
+        assert!(kdf_probe::FINISHED.load(SeqCst) > before);
+        assert!(!kdf_probe::OVERLAP.load(SeqCst), "two derivations ran at once");
+    }
+
+    #[test]
+    fn files_shorter_than_any_container_are_refused_without_a_derivation() {
+        let d = std::env::temp_dir().join(format!("shield_kdf_{}", crate::entropy::rand_hex().unwrap()));
+        std::fs::create_dir_all(&d).unwrap();
+        for len in [0u64, 1, (HEADER + TAG) as u64, MIN_CONTAINER - 1] {
+            let p = d.join(format!("f{len}.shd"));
+            std::fs::write(&p, vec![0x5Au8; len as usize]).unwrap();
+            // PIM 64 would take minutes: an immediate answer shows no derivation ran
+            let t0 = Instant::now();
+            let err = read_header(&mut File::open(&p).unwrap(), &cred(MAX_PIM)).err().unwrap();
+            assert_eq!(err, bad(), "same message as a wrong password ({len} bytes)");
+            assert!(t0.elapsed() < Duration::from_secs(2), "{len} bytes");
+        }
+        assert_eq!(MIN_CONTAINER, (HEADER + TAG + 32) as u64);
+        let _ = std::fs::remove_dir_all(d);
     }
 }

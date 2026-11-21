@@ -1,0 +1,421 @@
+SHIELD 3.1.0 - Changes (3.0.0 -> 3.1.0)
+======================================
+한국어: docs\06_3.1.0_수정_기록.txt. The 3.0 design and changes: 06_changes_3.0.0.txt. Key rotation: 07_key_rotation.txt
+This file records the "earlier 3.1.0 build". What 3.1.0 final (after the fixes) adds is in 08_changes_3.1.0_final.txt,
+the security analysis in 09_security_report.txt. "Password policy unchanged" and "manifest format unchanged" in
+section 0 describe the earlier 3.1.0 build; the final build adds CLI --allow-weak and a v2 manifest (v1 still published).
+
+This release takes items 1-5 and 7-13 of two static reviews plus the new feature 14 ("Open in SHIELD"). Item 6 (password
+policy) was out of scope and is unchanged. Order of work: 10 -> 1 -> 3 -> 4 -> 5 -> 11 -> 12 -> 13 -> 14 -> 2 -> 8 -> 9 -> 7 -> 15.
+
+0. Invariants kept
+------------------
+- Password policy (engine.rs min_password_len, password.rs check_new/weak_reasons, strings, tests) unchanged.
+- 3.0.0 -> 3.1.0 auto-update: manifest format ("Shield release manifest 1" / "version X.Y.Z" / "sha256 <hex> <name>"),
+  asset names with their .sig, signing with the main key - all unchanged. compat_tests checks that 3.0.0's
+  parse_manifest text (kept as test data) is still in the code verbatim and reads a 3.1.0 manifest.
+- FORMAT_VERSION 2, settings SCHEMA 2, Settings::protected_text (compared with 3.0.0's text by compat_tests), the MSI
+  UpgradeCode: unchanged. No existing component GUID was changed; only the .shd-only "Open" component was replaced by a
+  new component (item 14).
+- XChaCha20-Poly1305 use, nonces, per-file DEK, Argon2id (256 MiB, p=4, t=3+PIM), metadata authentication, full
+  authentication before extraction, restore verification, archive path/size checks: unchanged.
+- No test was deleted or weakened: all 230 tests of 3.0.0 are still there (by name) and 47 were added. The 5 existing
+  tests whose bodies changed are explained in section 16.
+
+1. Update: swap between verification and installation [medium] (3.1.0 #1)
+-------------------------------------------------------------------------
+Problem: 3.0.0 handed the package it verified in a user folder (%TEMP%, runtime dir) to msiexec / pkexec apt-get. While
+the UAC / password dialog was open, a program running as the user could replace the file and have it installed with
+administrator rights.
+Fix:
+- Common (shield-core update.rs): privileged helper update::helper_main. It treats the four files (package, .sig,
+  manifest, .sig) as untrusted, reads them without following links, copies them into a new folder only
+  administrators/root can write, verifies the COPIES with its embedded keys and the running version and installs only the
+  copy (verify_and_install_privileged, verify_copies). On failure the folder is removed.
+- Windows (windows/install.rs, sys.rs): only the installed shield-gui.exe (below Program Files) is started elevated with
+  --install-update <4 files>; portable and development builds are never elevated. Private folder
+  %ProgramData%\Shield\update\<random> with a protected DACL (SYSTEM and Administrators, no inheritance). So that msiexec
+  does not meet a Shield file in use, the helper copies itself there and starts that copy (--install-update-run
+  <folder>), which runs System32's msiexec on the copied MSI and removes the files (its own exe and the folder at the
+  next restart).
+- Linux deb (linux/install.rs, sys.rs, shield-cli): pkexec runs only the root-owned /usr/bin/shield update-install
+  <4 files> (polkit policy installer/linux/com.shield.update.policy, auth_admin). Private folder
+  /var/lib/shield/update/<random> (root; changed by review 2, 19-1: folders 0711, copies 0600, only package.deb 0644 after verification). The helper only works when
+  run as root by pkexec. postrm purge removes /var/lib/shield.
+- AppImage: the new AppImage is written next to the old one (0755, fsync) and its SHA-256 is compared with the signed
+  manifest once more right before the rename.
+Tests: update_tests (helper_arguments_are_checked, copies_are_verified_and_later_changes_to_the_originals_do_not_matter,
+helper_refuses_to_run_unprivileged_and_reports_outcomes), windows/tests (update_private_folder_has_admin_only_protected_
+dacl, helper_command_line_quoting_refuses_what_it_cannot_quote, only_programs_below_program_files_are_elevated_for_updates,
+second_stage_arguments_are_checked), linux/tests (update_helper_runs_only_as_root_from_pkexec, update_folders_must_be_
+root_owned_and_closed, update_files_are_new_and_world_readable).
+Limits: attackers with administrator/root rights are outside the threat model. Installing through a real UAC / MSI and a
+real pkexec / polkit was not run (section 17).
+
+2. Signing key separation and CI hardening [medium] (3.1.0 #2)
+-------------------------------------------------------------
+- build.ps1 -Stage all|build|package|manifest (-BinDir), build.sh --stage ... (--bin-dir). The default "all" works as
+  before. The package stage never signs; the programs' .sig files must be there for both or neither. --locked on every
+  cargo call.
+- .github/workflows/release.yml rewritten: audit -> build-windows / build-linux -> sign-binaries -> package-windows /
+  package-linux -> sign-release -> publish. Only the signing jobs use the environment release-signing, and only on v*
+  tag pushes. Build and package jobs see no secrets; signing jobs run no cargo, no package installs and no third-party
+  actions. The passphrase only goes through --passphrase-fd 0 (no file). Every uses: is pinned to a commit SHA (looked up
+  with git ls-remote: actions/checkout v4.3.1 34e1148..., upload-artifact v4.6.2 ea165f8..., download-artifact v4.3.0
+  d3f86a1...; no TODO-PIN). workflow_dispatch skips signing and publishing.
+- .github/dependabot.yml (cargo, github-actions, weekly), deny.toml (cargo-deny 0.20.2: advisories, bans, sources,
+  licenses), cargo audit --deny warnings in CI. For that, .cargo/audit.toml lists 5 "unmaintained" notices (paste,
+  ttf-parser, zbus_names, zvariant, zvariant_derive) with where they come from. publish = false on the internal crates
+  (so cargo deny does not count path dependencies as wildcards).
+- Checks (release_tests): release_workflow_keeps_secrets_out_of_builds, every_cargo_build_is_locked,
+  release_manifest_and_asset_names_are_unchanged.
+- Verified: the three build.ps1 stages ran on Windows in a copy of the repository and produced MSI, portable, console,
+  source zip and a manifest in the 3.0.0 format. Linux stages: section 18. The workflow itself was not run on GitHub
+  (unverified).
+- docs/02 section 7 describes the structure, the environment setup, SHA pinning and dependabot.
+
+3. Release signature verification: time rules and a backup key [low-medium] (3.1.0 #3)
+-------------------------------------------------------------------------------------
+- rPGP (pgp 0.21) source checked: verify looks at the issuer, hash strength and prefix and the signature value, not at
+  times. sigverify.rs check_times therefore checks: a creation time is present, not before the signing key was made, at
+  most one day in the future, the signature has not expired, the signing key (and the primary) had not expired when the
+  signature was made. A signature made directly by the primary needs the sign flag (subkeys: checked by the binding).
+  Time errors carry E_SIGTIME and a "check the system clock" hint (sig.before_key/future/expired/key_expired).
+- Backup public key: keys/release_key_backup.asc or SHIELD_PUBKEY_BACKUP_PATH. build.rs embeds public keys only (stops
+  on secret key material); buildinfo::release_keys() returns main, then backup. Either key verifying is enough; Verified
+  says which. The About screen and shield version show both fingerprints (JSON: backup_fingerprint).
+- The repository has no backup key yet. How to create it and what to do after a leak: docs/07. 3.0.0 does not know the
+  backup key, so it only helps after 3.1.0 is widely installed.
+Tests: sigverify_tests (plain_and_far_expiring_signatures_still_verify, expired_future_and_early_signatures_are_refused_
+with_a_clock_hint, time_rules_table, revoked_signing_subkey_is_refused, primary_without_sign_flag_is_refused,
+backup_key_signature_is_accepted_and_named). Test keys are made inside the tests or reused fixtures; no private key was
+added to the repository.
+
+4. Spoofing characters in file names [low-medium] (3.1.0 #4)
+-----------------------------------------------------------
+- archive.rs: bidi controls (U+202A-202E, 2066-2069, 200E, 200F, 061C) and U+FEFF count as spoofing characters (ZWJ/ZWNJ
+  do not: Hangul, emoji and others use them). Lists, the location bar and the info view show them escaped ("<U+202E>",
+  display_name); extraction replaces them with '_' in every path component (sanitize_component). If names collide after
+  that, extraction stops (arc.spoof_clash). Renamed files and risky Windows types (desktop.ini, .library-ms,
+  .searchconnector-ms, .scf, .url) are reported.
+- The single-file decryption name (engine.rs) follows the same rule. The GUI manager and CLI list show the escaped name;
+  JSON keeps the real one.
+Tests: container_tests (spoof_characters_are_listed_but_replaced_on_extraction, names_that_collide_after_replacement_
+stop_the_extraction, spoof_set_and_display_escaping, decrypted_single_file_name_is_cleaned_too).
+
+5. CLI argument injection [low] (3.1.0 #5)
+-----------------------------------------
+- An option-like argument (-y, --output ...) that is the name of an existing file is refused instead of interpreted
+  (cli.ambiguous_arg, with a hint to put names after "--").
+- The --shred question lists the targets first (at most 20, then a count). Without a terminal nothing is removed
+  unless -y is given. Help snapshots re-blessed with SHIELD_BLESS=1; only cli.h_end_opts and cli.o_shred changed.
+Tests: args (option_like_names_of_existing_files_are_refused), cli_tests (shred_question_names_at_most_twenty_targets,
+shred_without_terminal_needs_yes_and_touches_nothing).
+
+6. (Skipped) password policy - unchanged per 0-1.
+
+7. Limits of settings protection [info] (3.1.0 #7)
+-------------------------------------------------
+No code change (counters or delays don't stop an attacker with the same user rights). docs/01 section 7 now states MAC
+forgery, the undetected rollback to an older settings file, the retry delay kept per process, and that the real
+protection is the Argon2id cost; the settings_auth.rs module comment mentions the rollback.
+
+8. Repository hygiene [low] (3.1.0 #8)
+-------------------------------------
+- Removed crates/shield-cli/.claude-flow/ and crates/.claude-flow/ (tool state with local paths). The top-level
+  .claude-flow/ is a tool's working folder and stays; .gitignore and the source zip exclude it.
+- New .gitignore (target, dist, tool/editor folders, keys, signatures, .env, *.tmp/*.part ...; test fixtures and the
+  public key are kept). Checked with git add --dry-run in a scratch repository: 34 fixture files in, tool folders out.
+- The source zip of build.ps1 and build.sh leaves out tool/editor folders (.claude-flow, .claude, .vs, .idea, .vscode,
+  node_modules, target ...) at any depth (a planted crates/shield-cli/.claude-flow did not reach the zip).
+- grep for local paths and account names (C:\Users, /home/<name>, the account name, mail addresses) in sources, docs and
+  tests: the only hit is the fake test path /home/u/x.
+- If the repository was already public, the removed files remain in its git history. Rewriting history is out of scope;
+  the user decides if it is needed.
+
+9. Other checks (3.1.0 #9)
+-------------------------
+9-A Key copies: chacha20poly1305 0.10.1 source (registry) - ChaChaPoly1305 has Drop (key.zeroize) and ZeroizeOnDrop and
+    turns on chacha20's zeroize feature, but not poly1305's, so the per-message MAC state (r, h, pad) was not wiped.
+    shield-core now names poly1305 = { features = ["zeroize"] } directly (Cargo.lock: two dependency lines, no new
+    crate). Test aead_key_and_mac_state_are_wiped_on_drop (ZeroizeOnDrop trait, the setting stays). Memory contents
+    themselves cannot be shown by a test and are not claimed (docs/01 section 7).
+9-B Nemo: Nemo's source (linuxmint/nemo master, nemo-action.c, eel-string.c) was read. With Quote=double each %F path is
+    wrapped in double quotes with only " and \ escaped, and the Exec line is split without a shell by
+    g_spawn_command_line_async (g_shell_parse_argv). A check that builds the Exec line the same way and splits it with
+    real GLib (2.84.4, Debian trixie; installer/linux/tests/nemo_quote_check.c) turned 12 names - spaces, quotes, $(...),
+    backticks, \, newline, ;|&>, a trailing \, $HOME, "--open" - into exactly one unchanged argument each, and nothing
+    ran. Quote=double therefore stays, on all three Nemo actions (encrypt, decrypt, open) and the per-user ones. Real Nemo
+    was not run (the distribution's Nemo may differ from master; unverified).
+9-C build.ps1 stops in the build stage when the rustc host is not x86_64-pc-windows-msvc or CARGO_BUILD_TARGET is not
+    MSVC (/DEPENDENTLOADFLAG is MSVC only). release_tests checks that the check is there.
+9-D MSI Authenticode: not implemented; docs/02 section 7 describes it as an optional task (order: MSI -> Authenticode ->
+    manifest hash -> OpenPGP; the certificate key only inside the signing environment).
+9-E Advisories: (1) RUSTSEC-2023-0071 rsa 0.9 - no fixed release. (2) RUSTSEC-2026-0387 crypto-bigint - patched
+    >= 0.7.6. Cargo.lock holds 0.7.10 (bp256/bp384 -> elliptic-curve 0.14; not affected) and 0.5.5 (pgp 0.21 -> cx448,
+    elliptic-curve 0.13; affected); 0.5.5 cannot be raised while pgp needs 0.5. (3) RUSTSEC-2026-0257 webbrowser 0.8 -
+    via egui-winit. The reasons are written in audit.toml, deny.toml and docs/01 ("only on the public-key signature
+    verification path, no secret-key operation" / "egui URL requests are dropped"). The webbrowser defence is guarded by
+    links_never_reach_the_webbrowser_crate and the new every_window_drops_links_at_the_end_of_each_frame (every eframe
+    window ends its frame with end_frame and never returns early; no extra viewports, no direct webbrowser calls).
+
+10. Fail-open directory walk on Linux [medium, first] (3.1.0 #10)
+----------------------------------------------------------------
+Problem: when the real path of an opened entry could not be read (Linux without /proc ...), manifest.rs counted it as
+"inside".
+Fix: entries are looked up and opened relative to the held folder handle (Linux fdopendir/fstatat/openat + O_NOFOLLOW;
+on Windows the held folder can't be renamed). The real path of every opened folder and file is compared with its
+parent's; one that cannot be read stops the whole scan (directly_in no longer treats "unknown" as inside). Right before
+shredding, every original is checked again by handle to still be inside a selected item (recheck_roots); if that cannot
+be confirmed nothing is overwritten (the encrypted result stays, ShredReport.refused). Links and FIFOs inside are
+skipped, never followed.
+Tests: manifest (directly_in_is_fail_closed, unknown_real_path_stops_the_scan, entry_of_a_folder_without_known_real_path_
+is_refused, shred_is_refused_when_originals_cannot_be_rechecked, encrypt_with_shred_does_nothing_without_real_paths,
+links_and_fifos_inside_are_skipped_not_followed).
+
+11. Overwrite race in the Linux folder-move fallback [low] (3.1.0 #11)
+---------------------------------------------------------------------
+Fallback where renameat2(RENAME_NOREPLACE) is not available: files are hard-linked (fails if the name exists), then the
+old name is removed, and the link is undone if that fails. Folders are only moved when the target's parent is owned by
+the current user and not writable by group or others (dir_fallback_ok); otherwise a translated refusal (eng.noreplace_dir).
+Tests: linux/tests (folder_fallback_rule_table, fallback_moves_files_by_link_and_folders_only_into_closed_folders),
+engine_tests (refused_folder_move_reads_as_a_translated_message).
+
+12. Re-check when removing temporary files [low] (3.1.0 #12)
+-----------------------------------------------------------
+SecTemp and PartGuard remember the file ID (volume, index) at creation and, before removing, open the name without
+following links and compare (sysinfo::remove_if_same). If another file took the name it is left alone and a warning
+(st.not_ours) is added to the result (cleanup warning queue in progress; shown in CLI and GUI results).
+Tests: sectemp (destroy_leaves_a_file_that_took_the_name), engine_tests (part_guard_removes_only_its_own_file).
+
+13. KDF cost before authentication, and cancel [low] (3.1.0 #13)
+---------------------------------------------------------------
+- Files shorter than header + tag + the smallest archive (format::MIN_CONTAINER) are refused before the KDF.
+- One derivation at a time (KDF_SLOT). It runs on its own thread; the caller checks for cancel every 50 ms and returns at
+  once. A derivation already running keeps its memory (256 MiB, locked, zeroed) until it ends; the next one starts
+  after it (docs/01 limits).
+Tests: crypto kdf_tests (cancel_returns_before_the_derivation_ends, next_derivation_waits_for_the_previous_one,
+files_shorter_than_any_container_are_refused_without_a_derivation).
+
+14. New: "Open in SHIELD" on every file (3.1.0 #14)
+--------------------------------------------------
+- Windows (installer.wxs, windows/shell.rs): classic menu entry HKLM Software\Classes\*\shell\Shield.Open (icon,
+  MultiSelectModel=Single, shield-gui.exe --open "%1"). The .shd ProgID, its default open action and icon, and
+  "Encrypt" are unchanged; nothing is registered for the Windows 11 new menu. 3.0.0's .shd-only open entry (component
+  ShellOpen, key SystemFileAssociations\.shd\shell\Shield.Open) has a different key path, so it became the new component
+  ShellOpenAny {4FFE6B85-5A92-46BC-AB60-BA9877B1BB95} (a different key under the same GUID breaks MSI component rules).
+  The old GUID is not reused; release_tests checks that it is gone. The portable registration (shell.rs) removes the old
+  key when registering and both keys when unregistering.
+- Linux: Nemo action (shield-open.nemo_action, Selection=s, Extensions=any, Quote=double), Dolphin service menu
+  (shield-open-dolphin.desktop, KF6 kio and KF5 kservices5), Nautilus script (nautilus-open.sh), Thunar action
+  (thunar-uca.xml shield-open-3; integrate.sh adds missing actions by unique-id). The per-user registration
+  (linux/shell.rs) does the same.
+- App: shield-gui --open <path> opens that file in the manager window whatever its extension (Start::Open,
+  MgrApp::new_open). Anything that is not a regular file (folder, link, FIFO, device, \\.\ path) gets cont.not_regular; a
+  regular file that is not a container gets the usual "not a container" error. --open without a path opens the manager.
+Tests: lib argument_dispatch (changed, section 16), mgr_tests (open_in_shield_takes_any_regular_file_and_refuses_the_
+rest), container_tests (only_regular_files_are_opened), release_tests (open_in_shield_is_offered_on_every_file,
+installer_components_are_stable_and_single), linux/shell tests.
+Unverified: the real Explorer, Nemo, Dolphin, Nautilus and Thunar menus; that upgrading an installed 3.0.0 MSI to 3.1.0
+leaves no duplicate entries (checklist: docs/02 section 8).
+
+15. Version, documents, compatibility (3.1.0 #15)
+------------------------------------------------
+- Version 3.1.0: Cargo.toml (workspace) and the internal crates in Cargo.lock, MSI version (from Cargo.toml), README,
+  doc headings and artifact names. Records (what 3.0.0 said, past audits in 05) are left as they were. Help snapshots and
+  i18n strings hold no version number (buildinfo::VERSION at run time).
+- Documents: this file (+ko), docs/07 (key rotation, new), docs/01 section 7 (7, 9-A, 9-E, 13, update, Authenticode),
+  docs/02 (CI structure, --stage, environment, SHA pinning, dependabot, checklists), docs/05 section 9, docs/04.
+- Compatibility:
+  (1) 3.1.0 manifest through 3.0.0's parser: compat_tests::the_3_0_0_manifest_parser_is_unchanged_and_reads_3_1_0_manifests
+  (2) containers made by 3.0.0: cross_os_tests (fixtures 3.0.x wrote on Windows and Linux), plus a container made with
+      the real 3.0.0 console program and opened with 3.1.0 (docs/05 section 9)
+  (3) 3.0.0 settings files: compat_tests::the_settings_mac_input_is_the_one_3_0_0_wrote + settings_auth_tests::
+      a_3_0_0_mac_without_lock_on_focus_loss_still_opens (no "tampered")
+  (4) duplicate context menu entries after 3.0.0 MSI -> 3.1.0 MSI: needs a real machine, unverified (docs/02 section 8)
+- Found and fixed in the final checks:
+  * build.sh: the EXIT trap's cleanup ended with a false [ -n ... ] && when not signing, which under set -e made the
+    script exit with 1 (present since 3.0.0: every unsigned build "failed", and the CI build jobs would have stopped).
+    cleanup now always ends with return 0; release_tests::build_sh_exit_trap_cannot_fail_the_build guards it.
+  * "Open in SHIELD" (item 14) called a missing file "not a regular file". Now a missing file gets the system's "not
+    found" as in 3.0.0, a regular file that cannot be opened gets the reason (access denied ...), and only links,
+    folders, FIFOs and devices get cont.not_regular.
+  * The Windows device paths in that test (only_regular_files_are_opened) had lost one leading backslash (\\.\X had
+    become \.\X), so they only tested "missing", not devices. The data is fixed (\\.\PhysicalDrive0, \\?\GLOBALROOT,
+    \\.\pipe) and its form is checked; the missing case is tested on its own.
+  * 4 clippy warnings fixed (items after a test module, >= x + 1, an if that fits the match guard, an enum with very
+    different variant sizes). No change in behaviour.
+
+16. Existing tests that changed (0-4)
+------------------------------------
+- manifest::entries_outside_the_listed_folder_are_refused: walk takes At::In{held folder handle, name, real path}
+  instead of Option<&Path> (item 10); only the calls were adapted. What it checks (outside refused, inside allowed) is
+  the same.
+- shield-gui lib::argument_dispatch: --open a.shd now expects Start::Open instead of Explorer(Some) (item 14: --open
+  opens any file). Cases added: --open photo.jpg, no extension, no path, --manager a.shd.
+- linux/shell::thunar_block_insert_and_strip_round_trip: also checks that the block holds the shield-open action.
+- release_tests::installer_components_are_stable_and_single: in the pinned GUID list ShellOpen
+  {FAD7429D-1362-5A6A-BA62-507E092764CC} became ShellOpenAny {4FFE6B85-5A92-46BC-AB60-BA9877B1BB95} (item 14); it also
+  checks that the old GUID is not reused and that the verb key is *\shell\Shield.Open. The other GUIDs and the
+  UpgradeCode check are unchanged.
+- release_tests::one_version_and_no_pre_release_labels: the change log that must name the version moved from
+  docs/06_3.0.0 to this release's docs/06_<version> (name built from the version). The docs/04 and beta-label checks are
+  unchanged.
+- cross_os_tests::containers_from_windows_and_linux_open_everywhere (3.0.0 test): with review 2 #4 one folder inside
+  an archive of another name comes out inside a folder named after the archive, so the fixture ("Shield 샘플" in
+  windows_v3.shd / linux_v3.shd) is now read below out/<os>_v3/, and a "one item at the destination" check was added.
+  The byte comparison of every file, the empty folder and the wrong-password check are unchanged.
+- (a test new in 3.1.0) linux::update_files_are_new_and_world_readable -> update_files_are_new_and_private_until_verified:
+  copies are created 0600 instead of 0644, become 0644 only through open_to_apt after verification, and never through
+  a link (review 2 #1).
+
+17. Unverified (not run or not looked up)
+----------------------------------------
+- Windows: an update through a real UAC elevation (second stage, msiexec, removal at restart); MSI install, upgrade,
+  uninstall; duplicate context menu entries after 3.0.0 MSI -> 3.1.0 MSI; "Open in SHIELD" in the real Explorer.
+- Linux: real pkexec / polkit dialog and deb install; AppImage self-update; the real Nemo, Dolphin, Nautilus and Thunar
+  menus (Nemo quoting only by source and the GLib check); GNOME, KDE, Xfce by hand.
+- CI: the new release.yml was not run on GitHub (environment approval, artifact hand-over, tag release, arm runner).
+  Action SHAs come from git ls-remote; none could not be looked up.
+- Backup key: not in the repository yet (has to be created and added, docs/07).
+- Memory wiping: 9-A covers the source check and the trait check only; copies in registers, on the stack or in swap
+  cannot be checked.
+- Authenticode: not implemented (optional task).
+- External security audit: none.
+- Review 2: whether apt really reads the 0644 package.deb inside 0711 folders as its _apt user (a real install);
+  whether the MSI's PermissionEx is really applied to %ProgramData%\Shield; the path that re-locks an
+  administrator-owned folder through its handle (needs an elevated test; only the refusal of a normal account's folder
+  and of a junction were tested).
+
+18. Test results
+----------------
+  (after review 2, 2026-11-09)
+  Windows 10, rust 1.99.1:
+    cargo test --workspace --release --locked      268 passed, 0 failed, 2 ignored (fixture generators), 180 s
+                                                   (cli 21, core 193, gui 29, platform 25)
+    cargo clippy --workspace --release --locked --all-targets   0 warnings
+    cargo audit --deny warnings / cargo deny (0.20.2)   passes / all ok
+    build.ps1 -Stage build, -Stage package -Variants msi (copy of the repository)   succeeded. The MSI's
+                                                   MsiLockPermissionsEx table holds one row SHIELDDATAFOLDER /
+                                                   CreateFolder / O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA) (read through
+                                                   the Windows Installer COM API)
+  Linux container (rust:latest, rust 1.99.1, no DISPLAY):
+    cargo test --workspace --release --locked      265 passed, 0 failed, 1 ignored, 222 s
+    cargo clippy --workspace --release --locked --all-targets   0 warnings
+    build.sh --stage build / package / manifest (deb, console, zip)   all three stages exit 0, source zip 215 files
+  (First round: Windows 258/0/2 173 s, Linux 255/0/1 199 s. A container made by the 3.0.0 console decrypted by 3.1.0
+   byte for byte; GLib 2.84.4 Nemo quoting check 12/12.)
+  Not run: the GitHub Actions workflow, real UAC / MSI install / pkexec / polkit / apt installs, real file manager menus
+  (section 17).
+
+19. Review 2 (2026-11-09)
+-------------------------
+Three findings of a second review of the 3.1.0 result and one feature request. All go into 3.1.0 (not released yet).
+
+19-1. Linux update helper read other users' files as root and copied them 0644 [medium]
+  What: calling pkexec /usr/bin/shield update-install <4 files> directly could leave a world-readable copy (0644, folder
+        0755) of a root-only file of at most 64 KiB under /var/lib/shield/update/<random> for a while. (Needs
+        administrator authentication; same-user malware talking the admin into it. Not reproduced; a possibility in the
+        code.)
+  Fix: (1) every input file must belong to PKEXEC_UID, checked on the path (parse_helper_args) and on the opened handle
+        (copy_inputs -> read_checked). Missing, someone else's, a folder or too large all read the same "not a usable
+        update file", so the root helper does not tell what exists. (2) copies are created 0600; only after verification
+        does install_from_private make package.deb 0644 through its handle (apt reads it as _apt). (3) /var/lib/shield/
+        update and each random folder are 0711 (others cannot list them). Windows has no owner rule: the copy folder is
+        SYSTEM/Administrators only, so nobody new can read a copy, and with over-the-shoulder elevation the elevated
+        account is not the one that downloaded the files (update_input_owner_ok).
+  Files: shield-core/src/update.rs, shield-platform/src/linux/install.rs, linux/mod.rs, windows/install.rs, windows/mod.rs
+  Tests: linux::update_inputs_must_belong_to_the_pkexec_caller, update_folders_cannot_be_listed_by_others,
+        update_files_are_new_and_private_until_verified, update::helper_refusals_do_not_tell_what_exists
+  Limits: not tried with a real apt (section 17).
+
+19-2. Update signature policy [low-medium]
+  What: (a) key expiry was checked against the signature time only, which the signer chooses: a leaked release key that
+        has expired or was replaced could sign a fake installer with a back-dated time. (b) text signatures (0x01) were
+        accepted. (c) the manifest has no issue time or expiry, so an older signed intermediate release can be replayed.
+  Fix: sigverify::Policy::Release. Every update signature check (the dialog's check, the download, the helper's check of
+        the copies; manifest and installer, 5 places) uses it: binary (0x00) signatures only, and primary key and signing
+        subkey must also be unexpired today. shield verify and the self-check keep Policy::Any (valid when signed). The
+        current release key (8898 D3D9 ...) has no expiry, so nothing changes for it. New message sig.key_expired_now
+        (ko/en). (c) is not fixed: an extra line makes 3.0.0's manifest parser refuse the manifest and breaks the 3.0.0
+        -> 3.1.0 update (0-2). Written down as a limit in docs/01 section 7.
+  Files: shield-core/src/sigverify.rs, update.rs, lang/ko_v3.rs, lang/en_v3.rs
+  Fixtures: tests/fixtures/pgp/k5_expired_later.asc (made 2020-01-01, expires 2021-01-01), data.k5.sig (2020-06-01).
+        Made with GnuPG 2.4 --faked-system-time in a throwaway keyring; only the public key and signature were kept.
+  Tests: sigverify::release_policy_refuses_keys_that_have_expired_since_signing, release_policy_takes_binary_signatures_only,
+        key_expiry_now_rule_table, update::every_update_signature_uses_the_release_policy
+        (time_rules_table's "key expired after signing is fine" is the general policy's rule and stays.)
+  Limits: (c); a badly wrong system clock can make updates fail.
+
+19-3. Windows helper's secure_parent [low]
+  What: a normal user could create %ProgramData%\Shield first, and the MSI did not create it. The helper took an
+        existing folder over by path (symlink_metadata check, then SetNamedSecurityInfoW on the path string), so a
+        junction swapped in between redirected an administrator's owner/DACL change to another folder (denial of access,
+        ACL tampering).
+  Fix: (1) the MSI creates %ProgramData%\Shield owned by Administrators, SYSTEM/Administrators only, not inherited (the
+        same SDDL as the helper's ADMIN_DACL; component UpdateDataFolder, new GUID 975C4053-...; existing GUIDs unchanged).
+        (2) an existing folder is opened through a handle that does not follow junctions or links (FILE_FLAG_OPEN_
+        REPARSE_POINT | BACKUP_SEMANTICS); folder type and owner are checked on that handle. An owner other than SYSTEM,
+        Administrators or TrustedInstaller means: not taken over, stop (that account could keep using handles it opened
+        before). An administrator-owned folder gets the DACL again through SetSecurityInfo on the same handle. No
+        security change by path is left.
+  Files: shield-platform/src/windows/install.rs, installer/windows/installer.wxs
+  Tests: windows::update_folder_owners_that_count, a_folder_made_by_a_normal_account_or_a_junction_is_refused_unchanged,
+        release_tests::the_msi_creates_the_update_folder_with_the_helper_dacl, installer_components_are_stable_and_single
+        (UpdateDataFolder added to the pinned GUIDs)
+  Limits: a folder a normal account made before the installation blocks updates until an administrator deletes it
+        (docs/01). The elevated path (re-locking an administrator-owned folder) and the MSI permission were not tried
+        for real (section 17).
+
+19-4. New: a folder or several items decrypt into a folder named after the archive
+  What: full decryption (encryption window, context-menu decrypt, shield decrypt, [Extract all] in the manager) places
+        the result by the .shd's name. Rule agreed with the user ("auto"): one file -> the file itself. One folder -> the
+        folder itself when it has the .shd's name (letter case ignored; no photos/photos), otherwise inside a folder named
+        after the .shd. Several items or an empty archive -> inside a folder named after the .shd. Up to 3.0.0 several
+        items used the name stored in the container and one folder always came out as is; now the folder name comes from
+        the .shd file's current name. [Extract selected] still extracts straight into the chosen folder. The wrapping
+        folder is the private staging folder moved out, as it was for several items before, so only the user can open
+        it. A taken name gets "(decrypted)"; nothing is overwritten.
+  Files: shield-core/src/engine.rs (out_folder, do_decrypt), docs/03 section 5 (+ko)
+  Tests: engine::several_items_or_a_renamed_folder_come_out_in_a_folder_named_after_the_archive, output_folder_rule_table,
+        cross_os_tests expectation moved (section 16)
+
+19-5. Further look
+  Looked at again from the same angle (privileged code, paths, caller input): the polkit policy (auth_admin, no cached
+  authorization), device and pipe paths as helper arguments (regular files only), the Windows second stage (elevation and
+  folder location checked), the removal of old update folders (inside the administrators-only folder), the archive entry
+  name checks (archive::component_ok, entry_ok). Nothing new to fix was found. Not finding something does not mean there
+  is nothing (no external audit).
+
+
+20. Settings password for secure delete, follow-up review (2026-11-21)
+-------------------------------------------------------------------
+20-1. New: ask for the settings password before secure delete
+  What: Settings > Security > Secure delete "Ask for the settings password before secure delete" (key
+        wipe_needs_settings_pw, on by default, protected). With a settings password set, the Secure delete tab and
+        shield wipe ask for it after the code, right before deleting, every time. Three wrong answers abort. The console
+        reads it on a terminal only (token runs too); without a terminal the run is refused (exit code 8).
+  Structure: secure_delete::permit -> sealed WipePermit, execute(ConfirmedWipePlan, WipePermit). Asked when either the
+        current settings or the settings file on disk asks for it. Design and limits: docs/10 2-5.
+  Settings MAC: Settings::mac_text = 3.0.0's protected_text (unchanged) + new protected values that are not at their
+        default. MAC, save authorization and "is default" all use mac_text; so does the 3.0.0 v1 MAC (docs/09 S-12).
+  Files: shield-core/src/{secure_delete.rs, settings.rs, settings_auth.rs, release_tests.rs, lang/*},
+        shield-gui/src/{wipe_view.rs, settings_view.rs, enc_app.rs, enc_views.rs}, shield-cli/src/wipe_cmd.rs,
+        shield-cli/snapshots/help_*.txt, docs/03, 09, 10 (+ko)
+  Tests: secure_delete::the_settings_password_is_needed_only_when_set_and_asked_for, the_file_password_counts_when_both_ask,
+        settings_auth::the_secure_delete_password_switch_is_protected, switching_secure_delete_off_by_editing_the_file_is_noticed,
+        cli_tests::wipe_needs_the_settings_password_when_the_settings_ask_for_it, WipePermit compile_fail doc test,
+        release_tests::no_setting_skips_the_secure_delete_confirmation (new key listed, on by default)
+  Compatibility: 3.0.0 and earlier 3.1.0 settings files open as before (same MAC input). A file with this value off
+        reads as "changed outside Shield" in 3.0.0, which resets its protected values (only when going back).
+
+20-2. Secure delete: the folder of a directly selected link was not resolved [low] (docs/09 S-11)
+  Fix: the link's folder is canonicalized (its name kept) and the resolved path is checked to be the same link (file ID).
+  Test: secure_delete::a_selected_link_is_checked_and_shown_where_it_really_is
+
+20-3. One stale test (failing before, no code change)
+  update_tests::every_update_signature_uses_the_release_policy expected 5 verify_release calls in update.rs, but the
+  2026-11-11 follow-up added a sixth in the privileged helper's rollback-floor re-check (update.rs
+  verify_and_install_privileged), when the tests could not be run (docs/09 section 8). The sixth uses the release policy
+  too, so the test now expects 6. Setting keys must not contain "password" (settings::nothing_sensitive_is_written), so
+  the new key is wipe_needs_settings_pw.

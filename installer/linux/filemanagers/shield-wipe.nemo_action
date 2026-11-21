@@ -1,0 +1,10 @@
+[Nemo Action]
+Name=Secure delete with SHIELD
+Name[ko]=SHIELD로 완전삭제
+Comment=Opens Shield; it asks three confirmations before overwriting anything
+Comment[ko]=Shield 창을 엽니다. 덮어쓰기 전에 세 번 확인합니다
+Exec=shield-gui --wipe %F
+Icon-Name=shield
+Selection=notnone
+Extensions=any;
+Quote=double

@@ -19,4 +19,5 @@
   <String Id="VerbEncrypt" Value="Shield로 암호화" />
   <String Id="VerbDecrypt" Value="Shield로 복호화" />
   <String Id="VerbOpen" Value="SHIELD에서 열기" />
+  <String Id="VerbWipe" Value="SHIELD로 완전삭제" />
 </WixLocalization>

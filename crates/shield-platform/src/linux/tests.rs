@@ -147,3 +147,205 @@ fn only_own_closed_folders_count_as_private() {
     assert!(!fs::is_private_dir(&d.join("missing")));
     let _ = sfs::remove_dir_all(d);
 }
+
+// ---- 3.1.0 #1: update helper ----
+
+#[test]
+fn update_helper_runs_only_as_root_from_pkexec() {
+    use std::ffi::OsStr;
+    assert!(install::helper_allowed(0, Some(OsStr::new("1000"))));
+    assert!(!install::helper_allowed(1000, Some(OsStr::new("1000"))), "euid != 0 refused");
+    assert!(!install::helper_allowed(0, None), "root without pkexec refused");
+    assert!(!install::helper_allowed(0, Some(OsStr::new(""))));
+    assert!(!install::helper_allowed(0, Some(OsStr::new("10x0"))));
+    // a test run is not started by pkexec
+    if std::env::var_os("PKEXEC_UID").is_none() {
+        assert!(!install::update_helper_allowed());
+    }
+}
+
+#[test]
+fn update_folders_must_be_root_owned_and_closed() {
+    assert!(install::root_dir_ok(0, 0o040755, true, false));
+    assert!(install::root_dir_ok(0, 0o040700, true, false));
+    for (uid, mode, dir, link) in [(1000, 0o040755, true, false), (0, 0o040775, true, false), (0, 0o040777, true, false), (0, 0o041777, true, false), (0, 0o040755, false, false), (0, 0o120777, true, true)] {
+        assert!(!install::root_dir_ok(uid, mode, dir, link), "{uid} {mode:o} {dir} {link}");
+    }
+}
+
+#[test]
+fn update_files_are_new_and_private_until_verified() {
+    // (3.1.0 first version: "update_files_are_new_and_world_readable", 0644 at creation; changed
+    // by review 2 #1, see docs/06_3.1.0 section 16)
+    let d = dir();
+    let p = d.join("package.deb");
+    drop(install::create_update_file(&p).unwrap());
+    assert_eq!(sfs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600, "nobody else reads an unverified copy");
+    assert!(install::create_update_file(&p).is_err(), "existing file refused");
+    // after verification the package is opened to apt's _apt user
+    install::open_to_apt(&p).unwrap();
+    assert_eq!(sfs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o644, "apt's _apt user must read it");
+    let link = d.join("link.deb");
+    std::os::unix::fs::symlink(&p, &link).unwrap();
+    assert!(install::create_update_file(&link).is_err(), "a link is never written through");
+    sfs::set_permissions(&p, sfs::Permissions::from_mode(0o600)).unwrap();
+    assert!(install::open_to_apt(&link).is_err(), "never through a link");
+    assert_eq!(sfs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+    // an AppImage copy that fails the hash check is not renamed over the target
+    assert!(install::install_package(&p, &|_| false).is_err());
+    let _ = sfs::remove_dir_all(d);
+}
+
+// ---- 3.1.0 review 2 #1: the helper reads only the caller's own files ----
+
+#[test]
+fn update_inputs_must_belong_to_the_pkexec_caller() {
+    use std::ffi::OsStr;
+    assert!(install::input_owner_ok(1000, Some(OsStr::new("1000")), 0));
+    assert!(!install::input_owner_ok(0, Some(OsStr::new("1000")), 0), "a root file is refused although the helper is root");
+    assert!(!install::input_owner_ok(1001, Some(OsStr::new("1000")), 1001), "PKEXEC_UID decides, not the real uid");
+    for bad in ["", "10x0", "-1", " 1000", "99999999999"] {
+        assert!(!install::input_owner_ok(1000, Some(OsStr::new(bad)), 1000), "{bad:?}");
+    }
+    assert!(install::input_owner_ok(1000, None, 1000) && !install::input_owner_ok(0, None, 1000));
+    // the real check: our own file passes; as a normal user, a root file does not
+    if std::env::var_os("PKEXEC_UID").is_none() {
+        let d = dir();
+        let p = d.join("own");
+        sfs::write(&p, b"x").unwrap();
+        assert!(install::update_input_owner_ok(&sfs::metadata(&p).unwrap()));
+        if unsafe { libc::getuid() } != 0 {
+            assert!(!install::update_input_owner_ok(&sfs::metadata("/etc/passwd").unwrap()));
+        }
+        let _ = sfs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn update_folders_cannot_be_listed_by_others() {
+    assert_eq!(install::PRIVATE_DIR_MODE, 0o711);
+    assert!(install::root_dir_ok(0, 0o040000 | install::PRIVATE_DIR_MODE, true, false));
+    let src = include_str!("install.rs");
+    assert!(!src.contains("mode(0o644).custom_flags"), "copies are not created readable");
+    let i = src.find("pub fn install_from_private").unwrap();
+    let body = &src[i..];
+    assert!(body.find("open_to_apt(pkg)").unwrap() < body.find("apt-get").unwrap(), "opened to apt only here, after verification");
+}
+
+// ---- 3.1.0 #11: rename without RENAME_NOREPLACE ----
+
+#[test]
+fn folder_fallback_rule_table() {
+    for (uid, mode, euid, ok) in [
+        (1000, 0o040700, 1000, true),
+        (1000, 0o040755, 1000, true),
+        (1000, 0o040750, 1000, true),
+        (1000, 0o040775, 1000, false), // group may create the name in between
+        (1000, 0o040757, 1000, false), // others may
+        (1000, 0o041777, 1000, false), // sticky /tmp-like: still writable by all
+        (0, 0o040755, 1000, false),    // somebody else's folder
+        (1000, 0o040700, 0, false),
+        (0, 0o040755, 0, true),
+    ] {
+        assert_eq!(fs::dir_fallback_ok(uid, mode, euid), ok, "{uid} {mode:o} {euid}");
+    }
+}
+
+#[test]
+fn fallback_moves_files_by_link_and_folders_only_into_closed_folders() {
+    let d = dir();
+    sfs::set_permissions(&d, sfs::Permissions::from_mode(0o700)).unwrap();
+    // files: never replace
+    let (a, b) = (d.join("a"), d.join("b"));
+    sfs::write(&a, b"A").unwrap();
+    sfs::write(&b, b"B").unwrap();
+    assert_eq!(fs::rename_noreplace_fallback(&a, &b).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(sfs::read(&b).unwrap(), b"B");
+    fs::rename_noreplace_fallback(&a, &d.join("c")).unwrap();
+    assert!(!a.exists() && sfs::read(d.join("c")).unwrap() == b"A");
+    // folders: into an owner-only folder
+    let src = d.join("dir1");
+    sfs::create_dir(&src).unwrap();
+    fs::rename_noreplace_fallback(&src, &d.join("dir2")).unwrap();
+    assert!(d.join("dir2").is_dir());
+    assert_eq!(fs::rename_noreplace_fallback(&d.join("dir2"), &b).unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+    // into a folder others can write: refused, nothing moved
+    let open = d.join("open");
+    sfs::create_dir(&open).unwrap();
+    sfs::set_permissions(&open, sfs::Permissions::from_mode(0o777)).unwrap();
+    let e = fs::rename_noreplace_fallback(&d.join("dir2"), &open.join("dir3")).unwrap_err();
+    assert_eq!(e.to_string(), crate::NOREPLACE_DIR_REFUSED);
+    assert!(d.join("dir2").is_dir() && !open.join("dir3").exists());
+    // a file may still go there (link(2) never replaces)
+    fs::rename_noreplace_fallback(&d.join("c"), &open.join("c")).unwrap();
+    let _ = sfs::remove_dir_all(d);
+}
+
+/// 3.1.0 final (review D): no /tmp fallback. XDG_CONFIG_HOME only when absolute, else
+/// <home>/.config, else an error.
+#[test]
+fn config_folder_has_no_fallback() {
+    let home = Some(PathBuf::from("/home/u"));
+    assert_eq!(config_base(Some("/x/cfg".into()), home.clone()).unwrap(), PathBuf::from("/x/cfg"));
+    assert_eq!(config_base(Some("relative/cfg".into()), home.clone()).unwrap(), PathBuf::from("/home/u/.config"), "a relative XDG value is ignored");
+    assert_eq!(config_base(None, home).unwrap(), PathBuf::from("/home/u/.config"));
+    assert!(config_base(None, None).is_err(), "neither set: an error, not /tmp");
+    assert!(config_base(Some("rel".into()), Some(PathBuf::from("rel_home"))).is_err());
+}
+
+/// 3.1.0 final (review D): the data folder is a real 0700 folder of this user; looser permissions
+/// are tightened, a link, a file or another owner's folder is refused (and left unchanged).
+#[test]
+fn data_folder_must_be_own_private_real_folder() {
+    use std::os::unix::fs::MetadataExt;
+    let d = dir();
+    let fresh = d.join("new").join("shield");
+    erase::ensure_data_dir(&fresh).unwrap();
+    assert_eq!(sfs::symlink_metadata(&fresh).unwrap().mode() & 0o777, 0o700);
+    let loose = d.join("loose");
+    sfs::create_dir(&loose).unwrap();
+    sfs::set_permissions(&loose, sfs::Permissions::from_mode(0o775)).unwrap();
+    erase::ensure_data_dir(&loose).unwrap();
+    assert_eq!(sfs::symlink_metadata(&loose).unwrap().mode() & 0o777, 0o700, "tightened");
+    let link = d.join("link");
+    std::os::unix::fs::symlink(&loose, &link).unwrap();
+    assert!(erase::ensure_data_dir(&link).is_err(), "a link to a folder");
+    let file = d.join("file");
+    sfs::write(&file, b"x").unwrap();
+    assert!(erase::ensure_data_dir(&file).is_err(), "a file");
+    // another owner: only possible to set up as root (the Docker test run); skipped otherwise
+    let other = d.join("other");
+    sfs::create_dir(&other).unwrap();
+    sfs::set_permissions(&other, sfs::Permissions::from_mode(0o755)).unwrap();
+    let c = std::ffi::CString::new(other.as_os_str().as_encoded_bytes()).unwrap();
+    if unsafe { libc::chown(c.as_ptr(), 4242, 4242) } == 0 {
+        let e = erase::ensure_data_dir(&other).unwrap_err();
+        assert!(e.to_string().contains("another user"), "{e}");
+        assert_eq!(sfs::symlink_metadata(&other).unwrap().mode() & 0o777, 0o755, "left unchanged");
+    } else {
+        eprintln!("not root: the other-owner case is not checked here");
+    }
+    let _ = sfs::remove_dir_all(d);
+}
+
+/// 3.1.0 final (review D): settings and settings.key are used only when they are this user's own
+/// files that others can't change (the key: not readable by others either).
+#[test]
+fn settings_files_must_be_own_and_not_writable_by_others() {
+    let d = dir();
+    let f = d.join("settings.toml");
+    sfs::write(&f, b"x").unwrap();
+    let check = |mode: u32, key: bool| {
+        sfs::set_permissions(&f, sfs::Permissions::from_mode(mode)).unwrap();
+        erase::private_file_ok(&sfs::File::open(&f).unwrap(), key)
+    };
+    assert!(check(0o600, true) && check(0o600, false));
+    assert!(!check(0o640, true) && check(0o644, false), "key 0600 only; settings may be readable");
+    assert!(!check(0o664, false) && !check(0o646, false), "writable by group / others");
+    let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).unwrap();
+    sfs::set_permissions(&f, sfs::Permissions::from_mode(0o600)).unwrap();
+    if unsafe { libc::chown(c.as_ptr(), 4242, 4242) } == 0 {
+        assert!(!erase::private_file_ok(&sfs::File::open(&f).unwrap(), false), "another owner");
+    }
+    let _ = sfs::remove_dir_all(d);
+}

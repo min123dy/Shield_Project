@@ -5,6 +5,33 @@
 use crate::settings::DateFmt;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+/// Longest path drawn or printed in full; longer ones keep their start and end (3.1.0 final 4-6:
+/// a huge name must not stall the window or flood the terminal).
+pub const PATH_SHOWN_MAX: usize = 400;
+
+/// A path as it may be shown on screen or printed to a terminal: control characters (including
+/// ESC, so no ANSI sequence from a file name reaches the terminal) as `\u{..}`, look-alike and
+/// invisible characters as `<U+XXXX>` (`archive::display_name`), and at most `PATH_SHOWN_MAX`
+/// characters. Never used to open anything: comparisons keep the real path.
+pub fn path_shown(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy();
+    let mut out = String::with_capacity(s.len());
+    for c in crate::archive::display_name(&s).chars() {
+        if c.is_control() {
+            out.push_str(&format!("\\u{{{:x}}}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    let n = out.chars().count();
+    if n > PATH_SHOWN_MAX {
+        let head: String = out.chars().take(PATH_SHOWN_MAX / 2).collect();
+        let tail: String = out.chars().skip(n - PATH_SHOWN_MAX / 2).collect();
+        out = format!("{head}...{tail}");
+    }
+    out
+}
+
 pub fn human(n: u64) -> String {
     let mut v = n as f64;
     for u in ["B", "KB", "MB", "GB", "TB"] {

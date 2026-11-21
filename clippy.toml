@@ -1,0 +1,10 @@
+# 3.1.0 final, review A: files and pipes are read through shield_platform::bounded (a size limit
+# per read), never with the unbounded std helpers. Tests may use them (they read files they made);
+# CI runs `cargo clippy --workspace --release --locked --all-targets -- -D warnings` (Windows and
+# Linux); test code opts out with `#![cfg_attr(test, allow(clippy::disallowed_methods))]`.
+disallowed-methods = [
+    { path = "std::fs::read", reason = "unbounded: use shield_platform::bounded::read_file_limited" },
+    { path = "std::fs::read_to_string", reason = "unbounded: use shield_platform::bounded::read_text_limited" },
+    { path = "std::io::Read::read_to_end", reason = "unbounded: use shield_platform::bounded::read_limited" },
+    { path = "std::io::Read::read_to_string", reason = "unbounded: use shield_platform::bounded::read_limited" },
+]

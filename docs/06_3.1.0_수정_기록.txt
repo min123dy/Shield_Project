@@ -1,0 +1,394 @@
+SHIELD 3.1.0 - 수정 기록 (3.0.0 -> 3.1.0)
+=======================================
+English: docs\en\06_changes_3.1.0.txt. 3.0 설계와 변경: 06_3.0.0_수정_기록.txt. 키 교체: 07_서명키_교체.txt
+이 문서는 "이전 3.1.0 빌드"까지의 기록입니다. 3.1.0 최종(수정 후)에서 더한 변경은 08_3.1.0_최종_변경_내역.txt,
+보안 분석은 09_보안_분석_보고서.txt에 있습니다. 아래 0절의 "비밀번호 정책 그대로"와 "매니페스트 형식 그대로"는
+이전 3.1.0 빌드 기준이며, 최종에서는 CLI --allow-weak와 v2 매니페스트(v1은 그대로 함께 게시)가 더해졌습니다.
+
+두 번의 정적 점검에서 나온 항목 1~5, 7~13과 새 기능 14("SHIELD에서 열기")를 반영한 릴리스입니다. 항목 6(비밀번호
+정책)은 범위 밖이라 바꾸지 않았습니다. 작업 순서는 10 -> 1 -> 3 -> 4 -> 5 -> 11 -> 12 -> 13 -> 14 -> 2 -> 8 -> 9 -> 7 -> 15.
+
+0. 지킨 불변 조건
+-----------------
+- 비밀번호 정책(engine.rs min_password_len, password.rs check_new/weak_reasons, 번역·테스트)은 그대로입니다.
+- 3.0.0 -> 3.1.0 자동 업데이트: 매니페스트 형식("Shield release manifest 1" / "version X.Y.Z" / "sha256 <hex> <이름>"),
+  배포 파일 이름과 .sig 쌍, 주 키 서명이 그대로입니다. compat_tests가 3.0.0의 parse_manifest 원문(테스트 자료로
+  보관)이 지금 코드에 그대로 있는지, 3.1.0 매니페스트를 읽는지 확인합니다.
+- FORMAT_VERSION 2, 설정 SCHEMA 2, Settings::protected_text(compat_tests가 3.0.0 원문과 비교), MSI UpgradeCode는
+  그대로입니다. 기존 구성 요소 GUID는 바꾸지 않았고, .shd 전용 "열기" 구성 요소 하나만 새 구성 요소로 대체했습니다(14번).
+- XChaCha20-Poly1305 사용, nonce 방식, 파일별 DEK, Argon2id(256 MiB, p=4, t=3+PIM), 메타데이터 인증, 추출 전 전체
+  인증, 복원 검증, 아카이브 경로·크기 검사는 바뀌지 않았습니다.
+- 테스트는 지우거나 약하게 바꾸지 않았습니다. 3.0.0의 테스트 230개는 모두 남아 있고(이름 비교), 47개를 더했습니다.
+  내용이 바뀐 기존 테스트 5개는 12절에 이유를 적었습니다.
+
+1. 업데이트: 검증과 설치 사이의 바꿔치기 [중간] (3.1.0 #1)
+----------------------------------------------------------
+문제: 3.0.0은 사용자 폴더(%TEMP%, 런타임 폴더)에서 검증한 패키지를 msiexec / pkexec apt-get에 그대로 넘겼습니다.
+UAC·암호 창이 떠 있는 동안 같은 사용자 권한의 프로그램이 파일을 바꾸면 바뀐 패키지가 관리자 권한으로 설치될 수
+있었습니다.
+수정:
+- 공통(shield-core update.rs): 권한 있는 도우미 update::helper_main. 받은 네 파일(패키지, .sig, 매니페스트, .sig)을
+  믿지 않고 링크를 따르지 않고 읽어, 관리자/root만 쓸 수 있는 새 폴더로 복사한 뒤 "복사본"을 내장 키·현재 버전으로
+  다시 검증하고 복사본으로만 설치합니다(verify_and_install_privileged, verify_copies). 실패하면 폴더를 지웁니다.
+- Windows(shield-platform windows/install.rs, sys.rs): 설치된 shield-gui.exe(Program Files 아래)만 UAC로
+  --install-update <4 파일>을 실행합니다. 포터블·개발 빌드는 승격하지 않습니다. 복사 폴더는
+  %ProgramData%\Shield\update\<난수>, 보호된 DACL(SYSTEM·Administrators만, 상속 없음). msiexec가 실행 중인 Shield
+  파일과 부딪히지 않도록 도우미가 자신을 그 폴더로 복사해 2단계(--install-update-run <폴더>)를 실행하고, 2단계가
+  System32의 msiexec로 복사한 MSI를 설치한 뒤 파일을 지웁니다(실행 중인 exe와 폴더는 다음 재부팅 때).
+- Linux deb(linux/install.rs, sys.rs, shield-cli): pkexec는 root 소유 /usr/bin/shield update-install <4 파일>만
+  실행합니다(polkit 정책 installer/linux/com.shield.update.policy, auth_admin). 복사 폴더는
+  /var/lib/shield/update/<난수>(root 소유; 2차 검토 19-1에서 폴더 0711, 사본 0600, 검증 뒤 package.deb만 0644로 바뀜). 도우미는 pkexec로
+  root로 실행된 경우에만 동작합니다. postrm purge에서 /var/lib/shield를 지웁니다.
+- AppImage: 새 AppImage를 기존 파일 옆에 쓰고(0755, fsync), 이름을 바꾸기 직전에 그 파일의 SHA-256을 서명된
+  매니페스트와 한 번 더 비교합니다.
+테스트: update_tests(helper_arguments_are_checked, copies_are_verified_and_later_changes_to_the_originals_do_not_matter,
+helper_refuses_to_run_unprivileged_and_reports_outcomes), windows/tests(update_private_folder_has_admin_only_protected_dacl,
+helper_command_line_quoting_refuses_what_it_cannot_quote, only_programs_below_program_files_are_elevated_for_updates,
+second_stage_arguments_are_checked), linux/tests(update_helper_runs_only_as_root_from_pkexec,
+update_folders_must_be_root_owned_and_closed, update_files_are_new_and_world_readable).
+남은 한계: 관리자/root 권한의 공격자는 위협 모델 밖입니다. 실제 UAC·MSI와 실제 pkexec·polkit으로 하는 설치는 직접
+실행하지 못했습니다(14절 미확인).
+
+2. 릴리스 서명 키 분리와 CI 강화 [중간] (3.1.0 #2)
+-------------------------------------------------
+- build.ps1 -Stage all|build|package|manifest(-BinDir), build.sh --stage ...(--bin-dir). 기본 all은 예전과 같습니다.
+  package 단계는 서명하지 않고 프로그램 .sig는 둘 다 있거나 둘 다 없어야 합니다. 모든 cargo 호출에 --locked.
+- .github/workflows/release.yml을 audit -> build-windows / build-linux -> sign-binaries -> package-windows /
+  package-linux -> sign-release -> publish로 다시 썼습니다. 서명 작업만 environment release-signing을 쓰고 v* 태그
+  push에서만 실행됩니다. 빌드·패키지 작업에는 비밀 정보가 없고, 서명 작업에는 cargo·패키지 설치·서드파티 액션이
+  없습니다. 비밀번호는 --passphrase-fd 0으로만 전달(파일 없음). 모든 uses:는 커밋 SHA로 고정했습니다(git ls-remote로
+  조회: actions/checkout v4.3.1 34e1148..., upload-artifact v4.6.2 ea165f8..., download-artifact v4.3.0 d3f86a1...;
+  TODO-PIN 없음). workflow_dispatch는 서명·게시를 건너뜁니다.
+- .github/dependabot.yml(cargo, github-actions 매주), deny.toml(cargo-deny 0.20.2: advisories·bans·sources·licenses),
+  CI에서 cargo audit --deny warnings. 이를 위해 .cargo/audit.toml에 "유지보수 중단" 알림 5건(paste, ttf-parser,
+  zbus_names, zvariant, zvariant_derive)을 출처와 함께 추가했습니다. 내부 크레이트에 publish = false(cargo deny가
+  path 의존성을 와일드카드로 보지 않도록).
+- 검사 테스트(release_tests): release_workflow_keeps_secrets_out_of_builds, every_cargo_build_is_locked,
+  release_manifest_and_asset_names_are_unchanged.
+- 확인: Windows에서 build.ps1 세 단계를 저장소 복사본으로 실행해 MSI·포터블·콘솔·소스 zip과 3.0.0과 같은 형식의
+  매니페스트를 만들었습니다. Linux 단계 결과는 13절. 워크플로 자체는 GitHub에서 실행하지 못했습니다(미확인).
+- docs/02 7절에 구조, environment 설정 절차, SHA 고정·dependabot 운영을 적었습니다.
+
+3. 릴리스 서명 검증: 시각·만료 확인과 백업 키 [낮음~중간] (3.1.0 #3)
+-------------------------------------------------------------------
+- rPGP(pgp 0.21) 소스 확인 결과: verify는 발급자, 해시 강도·접두사, 서명값만 보고 시각·만료는 보지 않습니다.
+  그래서 sigverify.rs check_times가 직접 확인합니다: 생성 시각 있음, 서명 키 생성 이후, 현재보다 하루 넘게 미래가
+  아님, 서명 만료 전, 서명 당시 서명 키(와 주 키)가 만료 전. 주 키로 직접 서명한 경우 sign 플래그 필요(부키는
+  바인딩에서 확인). 시각 오류는 E_SIGTIME 코드와 "시스템 시계 확인" 안내(sig.before_key/future/expired/key_expired).
+- 백업 공개키: keys/release_key_backup.asc 또는 SHIELD_PUBKEY_BACKUP_PATH. build.rs가 공개키만 받아 내장(비밀키면
+  중단), buildinfo::release_keys()가 주 키, 백업 키 순서로 돌려줍니다. 둘 중 하나로 검증되면 통과하고 Verified에
+  어느 키인지 담깁니다. 정보 화면과 shield version이 두 지문을 보여 줍니다(JSON: backup_fingerprint).
+- 저장소에는 아직 백업 키가 없습니다. 만들고 넣는 절차와 유출 대응은 docs/07. 3.0.0은 백업 키를 모르므로 3.1.0이
+  먼저 퍼져야 효력이 있습니다.
+테스트: sigverify_tests(plain_and_far_expiring_signatures_still_verify, expired_future_and_early_signatures_are_refused_
+with_a_clock_hint, time_rules_table, revoked_signing_subkey_is_refused, primary_without_sign_flag_is_refused,
+backup_key_signature_is_accepted_and_named). 테스트 키는 테스트 안에서 만들거나 기존 자료를 썼고 개인키를 저장소에
+넣지 않았습니다.
+
+4. 파일 이름 위장 문자 [낮음~중간] (3.1.0 #4)
+--------------------------------------------
+- archive.rs: 방향 제어 문자(U+202A~202E, 2066~2069, 200E, 200F, 061C)와 U+FEFF를 위장 문자로 봅니다(ZWJ/ZWNJ는
+  한글·이모지 등에 쓰이므로 제외). 목록·위치 표시줄·정보 창은 "<U+202E>"처럼 보이게 표시하고(display_name), 추출할
+  때는 '_'로 바꿉니다(sanitize_component, 모든 경로 조각). 바꾼 뒤 이름이 겹치면 추출을 멈춥니다(arc.spoof_clash).
+  바꾼 파일과 desktop.ini, .library-ms, .searchconnector-ms, .scf, .url 같은 위험한 Windows 형식은 결과에 알립니다.
+- 단일 파일 복호화(engine.rs)의 이름도 같은 규칙. GUI 관리자 창과 CLI list는 표시용 이름을 쓰고, JSON은 실제 이름.
+테스트: container_tests(spoof_characters_are_listed_but_replaced_on_extraction, names_that_collide_after_replacement_
+stop_the_extraction, spoof_set_and_display_escaping, decrypted_single_file_name_is_cleaned_too).
+
+5. CLI 인자 주입 [낮음] (3.1.0 #5)
+--------------------------------
+- 옵션처럼 보이는 인자(-y, --output 등)가 실제로 있는 파일 이름이면 해석하지 않고 거부합니다(cli.ambiguous_arg:
+  "--" 뒤에 쓰라는 안내).
+- --shred 확인 질문에 대상(최대 20개, 나머지는 개수)을 먼저 보여 줍니다. 터미널이 없으면 -y 없이는 아무것도
+  지우지 않습니다. 도움말 스냅숏은 SHIELD_BLESS=1로 다시 만들었고 바뀐 것은 cli.h_end_opts, cli.o_shred 두 줄입니다.
+테스트: args(option_like_names_of_existing_files_are_refused), cli_tests(shred_question_names_at_most_twenty_targets,
+shred_without_terminal_needs_yes_and_touches_nothing).
+
+6. (건너뜀) 비밀번호 정책 - 0-1에 따라 바꾸지 않음.
+
+7. 설정 보호의 한계 [정보] (3.1.0 #7)
+-----------------------------------
+코드는 바꾸지 않았습니다(같은 사용자 권한의 공격자에게 카운터·지연을 더해도 효과가 없음). docs/01 7절에 MAC 위조,
+이전 설정 파일로의 롤백 미탐지, 프로세스 안에서만 세는 재시도 지연, "실질 방어는 Argon2id 비용"을 적고,
+settings_auth.rs 모듈 주석에 롤백 미탐지를 더했습니다.
+
+8. 저장소 위생 [낮음] (3.1.0 #8)
+------------------------------
+- crates/shield-cli/.claude-flow/와 crates/.claude-flow/(개발 도구 상태, 로컬 경로 포함)를 지웠습니다. 최상위
+  .claude-flow/는 도구가 쓰는 작업 폴더라 남겼고, .gitignore와 소스 zip에서 제외됩니다.
+- .gitignore 새로 작성(target, dist, 도구·편집기 폴더, 키·서명·.env, *.tmp/*.part 등. 테스트 자료와 공개키는 포함).
+  시험 git 저장소에서 git add --dry-run으로 확인: 테스트 자료 34개 포함, 도구 폴더 제외.
+- build.ps1·build.sh의 소스 zip이 도구·편집기 폴더(.claude-flow, .claude, .vs, .idea, .vscode, node_modules, target
+  등)를 어느 깊이에서든 뺍니다(심어 둔 crates/shield-cli/.claude-flow가 zip에 들어가지 않는 것 확인).
+- 로컬 경로·계정 이름 grep(C:\Users, /home/<이름>, 계정 이름, 메일 주소): 소스·문서·테스트에서 나온 것은 테스트의
+  가짜 경로 /home/u/x 하나뿐입니다.
+- 이미 공개된 저장소라면 지운 파일이 git 기록에 남아 있습니다. 기록 재작성은 범위 밖이며 필요하면 사용자가 직접
+  판단합니다.
+
+9. 기타 확인·보강 (3.1.0 #9)
+---------------------------
+9-A 키 복사본: chacha20poly1305 0.10.1 소스(레지스트리) 확인 - ChaChaPoly1305에 Drop(key.zeroize)과 ZeroizeOnDrop이
+    있고 chacha20의 zeroize 기능을 켭니다. poly1305의 zeroize 기능은 켜지 않아 메시지별 MAC 상태(r, h, pad)는
+    지워지지 않았습니다. shield-core가 poly1305 = { features = ["zeroize"] }를 직접 지정해 켰습니다(Cargo.lock은
+    의존 관계 두 줄만 바뀜, 새 크레이트 없음). 테스트 aead_key_and_mac_state_are_wiped_on_drop(ZeroizeOnDrop 트레이트
+    확인, 설정 유지). 메모리 내용 자체는 테스트로 증명할 수 없으며 그렇게 주장하지 않습니다(docs/01 7절).
+9-B Nemo: Nemo 소스(linuxmint/nemo master, nemo-action.c, eel-string.c)를 확인했습니다. Quote=double이면 %F의 각
+    경로를 큰따옴표로 감싸고 안의 " 와 \ 만 이스케이프하며, Exec 줄은 셸 없이 g_spawn_command_line_async
+    (g_shell_parse_argv)로 나눕니다. 같은 방식으로 Exec 줄을 만들어 실제 GLib(2.84.4, Debian trixie)로 나눠 보는
+    검사(installer/linux/tests/nemo_quote_check.c)에서 공백, 따옴표, $(...), 백틱, \, 줄바꿈, ;|&>, 끝의 \,
+    $HOME, "--open" 이름 12개가 모두 원래 이름 그대로 인자 하나가 되었고 아무것도 실행되지 않았습니다. 그래서
+    Quote=double을 유지했고, 세 Nemo 액션(암호화·복호화·열기)과 사용자별 액션 모두 Quote=double입니다. 실제 Nemo
+    화면에서의 동작은 확인하지 못했습니다(배포판의 Nemo 버전이 master와 다를 수 있음, 미확인).
+9-C build.ps1은 빌드 단계에서 rustc 호스트가 x86_64-pc-windows-msvc가 아니거나 CARGO_BUILD_TARGET이 MSVC가 아니면
+    중단합니다(/DEPENDENTLOADFLAG는 MSVC 전용). release_tests가 검사 문장이 있는지 확인합니다.
+9-D MSI Authenticode: 구현하지 않고 docs/02 7절에 선택 과제(순서: MSI -> Authenticode -> 매니페스트 해시 ->
+    OpenPGP, 인증서 키는 서명 environment 안에서만)로 적었습니다.
+9-E 의존성 권고: (1) RUSTSEC-2023-0071 rsa 0.9 - 고쳐진 버전 없음. (2) RUSTSEC-2026-0387 crypto-bigint - 권고의
+    patched 범위는 >= 0.7.6. Cargo.lock에는 0.7.10(bp256/bp384 -> elliptic-curve 0.14, 해당 없음)과 0.5.5(pgp 0.21
+    -> cx448, elliptic-curve 0.13, 해당)가 함께 있고, 0.5.5는 pgp가 0.5를 요구해 올릴 수 없습니다. (3) RUSTSEC-2026-
+    0257 webbrowser 0.8 - egui-winit가 끌어옴. 세 건 모두 무시 사유를 audit.toml·deny.toml·docs/01에 "공개키 서명 검증
+    경로에서만 사용, 비밀키 연산 없음" / "egui URL 요청을 버림"처럼 적었습니다. webbrowser 방어는 기존 테스트
+    links_never_reach_the_webbrowser_crate에 더해 every_window_drops_links_at_the_end_of_each_frame(모든 eframe 창이
+    프레임 끝에 end_frame을 부르고 중간에 return하지 않으며, 추가 viewport와 webbrowser 직접 호출이 없음)로 지킵니다.
+
+10. Linux 디렉터리 순회의 fail-open [중간, 가장 먼저] (3.1.0 #10)
+-----------------------------------------------------------------
+문제: manifest.rs는 열린 항목의 실제 경로를 읽지 못하면(/proc이 없는 Linux 등) "안에 있음"으로 보았습니다.
+수정: 항목을 잡고 있는 폴더 핸들 기준으로 찾고 엽니다(Linux fdopendir/fstatat/openat + O_NOFOLLOW, Windows는 잡은
+폴더의 이름을 바꿀 수 없음). 열린 폴더·파일마다 실제 경로를 부모와 비교하고, 읽지 못하면 전체 검사를 멈춥니다
+(directly_in에서 "알 수 없음 = 안"이 사라짐). 파쇄 직전에 모든 원본이 선택한 항목 안에 그대로 있는지 핸들로 다시
+확인하고(recheck_roots), 확인할 수 없으면 아무것도 덮어쓰지 않습니다(암호화 결과는 남음, ShredReport.refused).
+목록 안의 링크와 FIFO는 따라가지 않고 건너뜁니다.
+테스트: manifest(directly_in_is_fail_closed, unknown_real_path_stops_the_scan, entry_of_a_folder_without_known_real_path_
+is_refused, shred_is_refused_when_originals_cannot_be_rechecked, encrypt_with_shred_does_nothing_without_real_paths,
+links_and_fifos_inside_are_skipped_not_followed).
+
+11. Linux 폴더 이동 폴백의 덮어쓰기 경쟁 [낮음] (3.1.0 #11)
+---------------------------------------------------------
+renameat2(RENAME_NOREPLACE)를 못 쓰는 파일 시스템의 폴백: 파일은 hard_link(이미 있으면 실패) 후 원래 이름을
+지우고, 지우지 못하면 링크를 되돌립니다. 폴더는 대상의 부모가 현재 사용자 소유이고 그룹·다른 사용자가 쓸 수 없을
+때만(dir_fallback_ok) 옮기고, 아니면 번역된 메시지(eng.noreplace_dir)로 거부합니다.
+테스트: linux/tests(folder_fallback_rule_table, fallback_moves_files_by_link_and_folders_only_into_closed_folders),
+engine_tests(refused_folder_move_reads_as_a_translated_message).
+
+12. 임시 파일 정리 시 재확인 [낮음] (3.1.0 #12)
+----------------------------------------------
+SecTemp와 PartGuard는 만들 때의 파일 ID(볼륨·인덱스)를 기억하고, 지우기 전에 링크를 따르지 않고 열어 같은 파일인지
+확인합니다(sysinfo::remove_if_same). 다른 파일이 그 이름을 차지했으면 지우지 않고 경고(st.not_ours)를 결과에
+붙입니다(progress의 정리 경고 대기열, CLI·GUI 작업 결과에 표시).
+테스트: sectemp(destroy_leaves_a_file_that_took_the_name), engine_tests(part_guard_removes_only_its_own_file).
+
+13. 인증 전 KDF 자원과 취소 [낮음] (3.1.0 #13)
+---------------------------------------------
+- 헤더+태그+최소 아카이브(format::MIN_CONTAINER)보다 짧은 파일은 KDF 전에 거부합니다.
+- 키 유도는 한 번에 하나(KDF_SLOT). 별도 스레드에서 계산하고 호출한 쪽은 50 ms마다 취소를 확인해 바로 돌아옵니다.
+  이미 시작한 계산은 끝날 때까지 메모리(256 MiB, 잠금·0으로 지움)를 쓰고, 다음 유도는 그 뒤에 시작합니다(docs/01 한계).
+테스트: crypto kdf_tests(cancel_returns_before_the_derivation_ends, next_derivation_waits_for_the_previous_one,
+files_shorter_than_any_container_are_refused_without_a_derivation).
+
+14. 새 기능: 모든 파일에 "SHIELD에서 열기" (3.1.0 #14)
+-----------------------------------------------------
+- Windows(installer.wxs, windows/shell.rs): 클래식 메뉴에 HKLM Software\Classes\*\shell\Shield.Open(아이콘,
+  MultiSelectModel=Single, shield-gui.exe --open "%1"). .shd ProgID, 기본 열기 동작, 아이콘, "암호화" 항목은 그대로이며
+  Windows 11 새 메뉴 등록은 하지 않습니다. 3.0.0의 .shd 전용 열기 항목(구성 요소 ShellOpen, 키
+  SystemFileAssociations\.shd\shell\Shield.Open)은 키 경로가 달라 새 구성 요소 ShellOpenAny
+  {4FFE6B85-5A92-46BC-AB60-BA9877B1BB95}로 바꿨습니다(같은 GUID에 다른 키를 넣으면 MSI 구성 요소 규칙 위반). 옛 GUID는
+  다시 쓰지 않으며 release_tests가 없음을 확인합니다. 포터블 등록(shell.rs)은 등록할 때 옛 키를 먼저 지우고, 해제할
+  때 두 키를 모두 지웁니다.
+- Linux: Nemo 액션(shield-open.nemo_action, Selection=s, Extensions=any, Quote=double), Dolphin 서비스 메뉴
+  (shield-open-dolphin.desktop, KF6 kio와 KF5 kservices5), Nautilus 스크립트(nautilus-open.sh), Thunar 동작
+  (thunar-uca.xml shield-open-3, integrate.sh가 unique-id로 빠진 동작만 추가). 사용자별 등록(linux/shell.rs)도 같습니다.
+- 앱: shield-gui --open <경로>는 확장자와 관계없이 그 파일을 관리자 창에서 엽니다(Start::Open, MgrApp::new_open).
+  일반 파일이 아니면(폴더, 링크, FIFO, 장치, \\.\ 경로) cont.not_regular로 안내하고, 일반 파일이지만 컨테이너가 아니면
+  기존 "컨테이너가 아님" 오류입니다. --open 뒤에 경로가 없으면 파일 관리자 창.
+테스트: lib argument_dispatch(변경, 12절), mgr_tests(open_in_shield_takes_any_regular_file_and_refuses_the_rest),
+container_tests(only_regular_files_are_opened), release_tests(open_in_shield_is_offered_on_every_file,
+installer_components_are_stable_and_single), linux/shell 테스트.
+미확인: 실제 탐색기·Nemo·Dolphin·Nautilus·Thunar 메뉴, 3.0.0 MSI가 설치된 상태에서 3.1.0으로 올렸을 때 항목이
+겹치지 않는지(점검 목록: docs/02 8절).
+
+15. 버전·문서·호환 점검 (3.1.0 #15)
+----------------------------------
+- 버전 3.1.0: Cargo.toml(workspace)과 Cargo.lock의 내부 크레이트, MSI 버전(Cargo.toml에서), README, docs 머리말과
+  배포 파일 이름. 기록(3.0.0 당시의 설명, 05의 과거 점검)은 바꾸지 않았습니다. 도움말 스냅숏과 i18n 문자열에는 버전
+  숫자가 없습니다(실행 시 buildinfo::VERSION).
+- 문서: 이 파일(+en), docs/07(키 교체, 새로 씀), docs/01 7절 한계(7, 9-A, 9-E, 13, 업데이트, Authenticode),
+  docs/02(CI 구조, --stage, environment, SHA 고정, dependabot, 점검 목록), docs/05 9절(이번 점검), docs/04 설치 안내.
+- 호환 점검:
+  (1) 3.0.0 매니페스트 파서로 3.1.0 매니페스트: compat_tests::the_3_0_0_manifest_parser_is_unchanged_and_reads_3_1_0_manifests
+  (2) 3.0.0으로 만든 컨테이너: cross_os_tests(3.0.x가 Windows·Linux에서 만든 자료), 그리고 실제 3.0.0 콘솔 프로그램으로
+      만든 컨테이너를 3.1.0으로 연 결과는 docs/05 9절
+  (3) 3.0.0 설정 파일: compat_tests::the_settings_mac_input_is_the_one_3_0_0_wrote + settings_auth_tests::a_3_0_0_mac_
+      without_lock_on_focus_loss_still_opens (tampered가 뜨지 않음)
+  (4) 3.0.0 MSI -> 3.1.0 MSI 우클릭 항목 중복: 실기 필요, 미확인(점검 목록 docs/02 8절)
+- 마지막 점검에서 찾아 고친 것:
+  * build.sh: EXIT trap의 cleanup이 서명하지 않을 때 거짓인 [ -n ... ] &&로 끝나 set -e 아래에서 스크립트 종료
+    코드가 1이 되었습니다(3.0.0부터 있던 문제: 서명 없는 빌드가 모두 "실패"로 끝나 CI 빌드 작업이 멈췄을 것).
+    cleanup이 항상 return 0으로 끝나게 고치고 release_tests::build_sh_exit_trap_cannot_fail_the_build로 지킵니다.
+  * "SHIELD에서 열기"(14번)가 없는 파일에도 "일반 파일이 아님"이라고 했습니다. 이제 없는 파일은 3.0.0처럼 시스템의
+    "찾을 수 없음", 열 수 없는 일반 파일은 그 이유(접근 거부 등), 링크·폴더·FIFO·장치만 cont.not_regular입니다.
+  * 같은 테스트(only_regular_files_are_opened)의 Windows 장치 경로 자료가 앞의 \ 하나를 잃어(\\.\X가 \.\X로)
+    장치가 아닌 "없는 파일"만 시험하고 있었습니다. 자료를 고치고(\\.\PhysicalDrive0, \\?\GLOBALROOT, \\.\pipe)
+    자료 형식 검사를 더했습니다. 없는 파일 경우는 따로 시험합니다.
+  * clippy 경고 4건(테스트 모듈 뒤의 항목, >= x + 1, match로 합칠 수 있는 if, 크기 차이가 큰 enum 변형)을
+    고쳤습니다. 동작은 바뀌지 않습니다.
+
+16. 바뀐 기존 테스트 (0-4)
+--------------------------
+- manifest::entries_outside_the_listed_folder_are_refused: walk의 인자가 Option<&Path>에서 At::In{잡은 폴더 핸들,
+  이름, 실제 경로}로 바뀌어(10번) 호출만 맞췄습니다. 확인하는 내용(밖의 항목 거부, 안의 항목 허용)은 같습니다.
+- shield-gui lib::argument_dispatch: --open a.shd의 기대값이 Explorer(Some)에서 Start::Open으로(14번: --open은 이제
+  모든 파일을 여는 동작). --open photo.jpg, 확장자 없음, 경로 없음, --manager a.shd 경우를 더했습니다.
+- linux/shell::thunar_block_insert_and_strip_round_trip: shield-open 동작이 블록에 있는지 확인을 더했습니다.
+- release_tests::installer_components_are_stable_and_single: 고정 GUID 목록의 ShellOpen {FAD7429D-1362-5A6A-BA62-
+  507E092764CC}을 ShellOpenAny {4FFE6B85-5A92-46BC-AB60-BA9877B1BB95}로 바꾸고(14번), 옛 GUID가 다시 쓰이지 않는지,
+  동사 목록의 키가 *\shell\Shield.Open인지 확인합니다. 다른 구성 요소 GUID와 UpgradeCode 검사는 그대로입니다.
+- release_tests::one_version_and_no_pre_release_labels: 버전을 적어야 하는 변경 기록이 docs/06_3.0.0에서 이번
+  릴리스의 docs/06_<버전>으로(버전에서 이름을 만듦). docs/04 검사와 베타 문구 검사는 그대로입니다.
+- cross_os_tests::containers_from_windows_and_linux_open_everywhere (3.0.0 테스트): 2차 검토 #4로 폴더 하나가
+  다른 이름의 아카이브에 들어 있으면 아카이브 이름의 폴더 안에 풀리므로, 픽스처(windows_v3.shd / linux_v3.shd 안의
+  "Shield 샘플")를 읽는 위치를 out/<os>_v3/ 아래로 바꾸고 "도착 폴더에 항목 하나" 확인을 더했습니다. 모든 파일의
+  바이트 비교, 빈 폴더, 틀린 비밀번호 검사는 그대로입니다.
+- (3.1.0에서 새로 만든 테스트) linux::update_files_are_new_and_world_readable ->
+  update_files_are_new_and_private_until_verified: 사본을 0644가 아니라 0600으로 만들고, 검증 뒤 open_to_apt로만
+  0644가 되는지, 링크를 통해서는 바뀌지 않는지 확인합니다(2차 검토 #1).
+
+17. 미확인 (직접 실행·조회하지 못한 것)
+--------------------------------------
+- Windows: 실제 UAC 승격으로 하는 업데이트 설치(2단계, msiexec, 재부팅 시 삭제), MSI 설치·업그레이드·제거, 3.0.0 MSI
+  -> 3.1.0 MSI에서 우클릭 항목 중복 여부, 탐색기의 "SHIELD에서 열기" 실제 동작.
+- Linux: 실제 pkexec·polkit 대화 상자와 deb 설치, AppImage 자체 업데이트, Nemo·Dolphin·Nautilus·Thunar 메뉴의 실제
+  동작(Nemo 인용 방식은 소스와 GLib 검사로만 확인), GNOME·KDE·Xfce 실기.
+- CI: 새 release.yml을 GitHub에서 실행하지 않았습니다(environment 승인, 아티팩트 전달, 태그 릴리스, arm 러너).
+  액션 SHA는 git ls-remote로 조회한 값이며 조회 못 한 SHA는 없습니다.
+- 백업 키: 저장소에 아직 없음(만들어 넣어야 효력, docs/07).
+- 메모리 지우기: 9-A의 소스 확인과 트레이트 검사까지만. 레지스터·스택·스왑에 남는 사본은 확인할 수 없음.
+- Authenticode: 구현하지 않음(선택 과제).
+- 외부 보안 감사: 없음.
+- 2차 검토: apt가 0711 폴더 안의 0644 package.deb를 _apt 사용자로 실제로 읽는지(설치 실기), MSI의 PermissionEx가
+  %ProgramData%\Shield에 실제로 적용되는지, 관리자 소유 폴더를 handle로 다시 잠그는 경로(승격된 테스트가 필요; 일반
+  계정 폴더 거부와 정션 거부만 시험함).
+
+18. 테스트 결과
+---------------
+  (2차 검토 반영 후, 2026-11-09)
+  Windows 10, rust 1.99.1:
+    cargo test --workspace --release --locked      268 통과, 0 실패, 2 무시(픽스처 생성용), 180초
+                                                   (cli 21, core 193, gui 29, platform 25)
+    cargo clippy --workspace --release --locked --all-targets   경고 0
+    cargo audit --deny warnings / cargo deny (0.20.2)   통과 / 모두 ok
+    build.ps1 -Stage build, -Stage package -Variants msi (저장소 복사본)   성공. MSI의 MsiLockPermissionsEx 표에
+                                                   SHIELDDATAFOLDER / CreateFolder / O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)
+                                                   한 줄이 있음(Windows Installer COM으로 조회)
+  Linux 컨테이너(rust:latest, rust 1.99.1, DISPLAY 없음):
+    cargo test --workspace --release --locked      265 통과, 0 실패, 1 무시, 222초
+    cargo clippy --workspace --release --locked --all-targets   경고 0
+    build.sh --stage build / package / manifest (deb, console, zip)   세 단계 모두 종료 코드 0, 소스 zip 215개 파일
+  (1차 결과: Windows 258/0/2 173초, Linux 255/0/1 199초. 3.0.0 콘솔로 만든 컨테이너를 3.1.0으로 풀어 바이트 단위로 같음,
+   GLib 2.84.4 Nemo 인용 검사 12/12.)
+  실행하지 못함: GitHub Actions 워크플로, 실제 UAC·MSI 설치·pkexec·polkit·apt 설치, 실제 파일 관리자 메뉴(17절).
+
+19. 2차 검토 반영 (2026-11-09)
+-----------------------------
+3.1.0 결과물에 대한 2차 검토 3건과 기능 요청 1건입니다. 모두 3.1.0에 포함합니다(아직 배포 전).
+
+19-1. Linux 업데이트 헬퍼가 남의 파일을 root로 읽어 0644로 복사 [중간]
+  무엇: pkexec /usr/bin/shield update-install <파일 4개>를 직접 부르면, root만 읽을 수 있는 64KiB 이하 파일이
+        /var/lib/shield/update/<무작위> 아래 누구나 읽을 수 있는 사본(0644, 폴더 0755)으로 잠깐 남을 수 있었습니다.
+        (관리자 인증 필요. 같은 사용자 권한의 악성 프로그램이 인증을 유도하는 경우. 재현은 하지 않았고 코드상 가능성.)
+  수정: (1) 입력 파일의 소유자가 PKEXEC_UID와 같아야 합니다. 경로 단계(parse_helper_args)와 열린 핸들 단계
+        (copy_inputs -> read_checked) 두 번 확인합니다. 없는 파일·남의 파일·폴더·큰 파일은 모두 같은 문장
+        "not a usable update file"로 거부해 root 헬퍼가 무엇이 있는지 알려 주지 않습니다.
+        (2) 사본은 0600으로 만들고, 검증을 통과한 뒤 install_from_private에서 package.deb만 핸들로 0644로 바꿉니다
+        (apt가 _apt 사용자로 읽음). (3) /var/lib/shield/update와 각 무작위 폴더는 0711(남은 목록을 못 봄).
+        Windows는 사본 폴더가 SYSTEM·Administrators 전용이라 새로 읽히는 사람이 없고, 다른 관리자 계정으로 승격하는
+        경우(over the shoulder) 다운로드한 계정과 승격 계정이 달라 소유자 규칙을 두지 않았습니다(update_input_owner_ok).
+  파일: shield-core/src/update.rs, shield-platform/src/linux/install.rs, linux/mod.rs, windows/install.rs, windows/mod.rs
+  테스트: linux::update_inputs_must_belong_to_the_pkexec_caller, update_folders_cannot_be_listed_by_others,
+        update_files_are_new_and_private_until_verified, update::helper_refusals_do_not_tell_what_exists
+  남은 한계: apt 실기 확인은 못 함(17절).
+
+19-2. 업데이트 서명 정책 [낮음~중간]
+  무엇: (a) 키 만료를 서명 시각 기준으로만 봤습니다. 서명 시각은 서명하는 쪽이 정하므로, 만료·교체된 배포 키가 새면
+        과거 시각으로 서명한 가짜 설치 파일이 통과할 수 있었습니다. (b) 텍스트 서명(0x01)도 받았습니다.
+        (c) 매니페스트에 발행 시각·만료가 없어 예전에 서명된 중간 버전을 다시 내밀 수 있습니다.
+  수정: sigverify::Policy::Release를 더했습니다. 업데이트의 모든 서명 확인(대화 상자용 확인, 다운로드, 헬퍼의 사본
+        확인; 매니페스트와 설치 파일 5곳)이 이 정책을 씁니다: 바이너리 서명(0x00)만, 주 키와 서명 부키가 오늘 기준으로도
+        만료되지 않았을 것. shield verify와 자체 무결성 확인은 지금까지처럼 Policy::Any(서명 당시 유효하면 통과).
+        현재 배포 키(8898 D3D9 ...)는 만료일이 없어 영향이 없습니다. 오류 문구 sig.key_expired_now(ko/en)를 더했습니다.
+        (c)는 고치지 않았습니다: 줄을 더하면 3.0.0의 매니페스트 파서가 거부해 3.0.0 -> 3.1.0 업데이트가 끊깁니다(0-2).
+        docs/01 7절에 한계로 적었습니다.
+  파일: shield-core/src/sigverify.rs, update.rs, lang/ko_v3.rs, lang/en_v3.rs
+  픽스처: tests/fixtures/pgp/k5_expired_later.asc(2020-01-01 생성, 2021-01-01 만료), data.k5.sig(2020-06-01).
+        GnuPG 2.4 --faked-system-time과 버린 키링으로 만들고 공개키와 서명만 남겼습니다.
+  테스트: sigverify::release_policy_refuses_keys_that_have_expired_since_signing, release_policy_takes_binary_signatures_only,
+        key_expiry_now_rule_table, update::every_update_signature_uses_the_release_policy
+        (기존 time_rules_table의 "key expired after signing is fine"은 일반 정책의 규칙이라 그대로 둡니다.)
+  남은 한계: (c), 그리고 시스템 시계가 크게 틀리면 업데이트가 거부될 수 있음.
+
+19-3. Windows 헬퍼의 secure_parent [낮음]
+  무엇: 일반 사용자가 %ProgramData%\Shield를 미리 만들 수 있었고 MSI는 이 폴더를 만들지 않았습니다. 헬퍼는 이미 있는
+        폴더를 symlink_metadata로 확인한 뒤 경로 문자열로 SetNamedSecurityInfoW를 불러 "인수"했으므로, 그 사이 정션으로
+        바꾸면 관리자 권한으로 다른 폴더의 소유자와 DACL이 바뀔 수 있었습니다(접근 차단·ACL 변조).
+  수정: (1) MSI가 %ProgramData%\Shield를 소유자 Administrators, SYSTEM·Administrators 전용, 상속 없음(헬퍼의
+        ADMIN_DACL과 같은 SDDL)으로 만듭니다(구성 요소 UpdateDataFolder, 새 GUID 975C4053-...; 기존 GUID는 그대로).
+        (2) 이미 있는 폴더는 정션·링크를 따라가지 않는 핸들(FILE_FLAG_OPEN_REPARSE_POINT | BACKUP_SEMANTICS)로 열고,
+        그 핸들에서 실제 폴더인지와 소유자를 확인합니다. 소유자가 SYSTEM·Administrators·TrustedInstaller가 아니면
+        넘겨받지 않고 중단합니다(그 계정이 미리 열어 둔 핸들로 계속 접근할 수 있으므로). 관리자 소유면 같은 핸들에
+        SetSecurityInfo로 DACL만 다시 씌웁니다. 경로로 보안 정보를 바꾸는 코드는 없습니다.
+  파일: shield-platform/src/windows/install.rs, installer/windows/installer.wxs
+  테스트: windows::update_folder_owners_that_count, a_folder_made_by_a_normal_account_or_a_junction_is_refused_unchanged,
+        release_tests::the_msi_creates_the_update_folder_with_the_helper_dacl, installer_components_are_stable_and_single
+        (고정 GUID 목록에 UpdateDataFolder 추가)
+  남은 한계: 설치 전에 일반 계정이 만든 폴더가 있으면 관리자가 지울 때까지 업데이트가 안 됩니다(docs/01). 승격된 경로
+        (관리자 소유 폴더 다시 잠그기)와 MSI 권한 적용은 실기 확인 못 함(17절).
+
+19-4. 새 기능: 폴더나 여러 항목은 아카이브 이름의 폴더 안에 복호화
+  무엇: 전체 복호화(암호화 창, 우클릭 복호화, shield decrypt, 관리자 창 [전체 풀기])가 결과를 .shd 이름에 맞춰
+        놓습니다. 사용자와 정한 규칙("자동"): 파일 하나 -> 그 파일 그대로. 폴더 하나 -> 이름이 .shd 이름과 같으면(대소문자
+        무시) 그 폴더 그대로(photos/photos를 만들지 않음), 다르면 .shd 이름의 폴더 안에. 여러 항목·빈 아카이브 -> .shd
+        이름의 폴더 안에. 3.0.0까지는 여러 항목일 때 컨테이너 안에 기록된 이름의 폴더를 썼고, 폴더 하나는 항상 그대로였습니다.
+        이제 폴더 이름은 지금의 .shd 파일 이름에서 정합니다. [선택 항목 풀기]는 사용자가 고른 폴더에 그대로 풉니다.
+        감싸는 폴더는 지금까지 여러 항목일 때처럼 사용자 전용 준비 폴더를 그대로 옮긴 것이라 본인만 접근할 수 있습니다.
+        이름이 이미 있으면 "(decrypted)"를 붙이고 덮어쓰지 않습니다.
+  파일: shield-core/src/engine.rs(out_folder, do_decrypt), docs/03 5절(+en)
+  테스트: engine::several_items_or_a_renamed_folder_come_out_in_a_folder_named_after_the_archive, output_folder_rule_table,
+        cross_os_tests 기대 위치 변경(16절)
+
+19-5. 추가 점검
+  같은 관점(권한 있는 코드, 경로, 사용자가 넘기는 입력)으로 다시 본 곳: polkit 정책(auth_admin, 인증을 기억하지 않음),
+  헬퍼 인자의 장치·파이프 경로(일반 파일만), Windows 2단계(승격 상태와 폴더 위치 확인), 오래된 업데이트 폴더 정리
+  (관리자 전용 폴더 안), 보관 항목 이름 검사(archive::component_ok·entry_ok). 새로 고칠 것은 찾지 못했습니다. 찾지
+  못했다는 것이 없다는 뜻은 아닙니다(외부 감사 없음).
+
+
+20. 완전삭제 설정 비밀번호와 후속 점검 (2026-11-21)
+------------------------------------------------
+20-1. 새 기능: 완전삭제 전에 설정 비밀번호 묻기
+  무엇: 설정 > 보안 > 완전삭제 "완전삭제 전에 설정 비밀번호 묻기"(키 wipe_needs_settings_pw, 기본 켜짐, 보호 값).
+        설정 비밀번호가 있으면 완전삭제 탭과 shield wipe가 코드 확인 뒤, 삭제 직전에 설정 비밀번호를 매번 묻습니다.
+        3번 틀리면 중단. 콘솔은 터미널에서만 입력받고(토큰 실행 포함), 터미널이 없으면 거부(종료 코드 8).
+  구조: secure_delete::permit -> 봉인된 WipePermit, execute(ConfirmedWipePlan, WipePermit). 지금 설정과 디스크의 설정
+        파일 중 하나라도 요구하면 묻습니다. 자세한 설계와 한계: docs/10 2-5.
+  설정 MAC: Settings::mac_text = 3.0.0 protected_text(그대로) + 기본값이 아닌 새 보호 값. MAC·저장 권한 검사·기본값
+        판단이 모두 mac_text를 씁니다. 3.0.0 v1 MAC도 mac_text에서 계산(docs/09 S-12).
+  파일: shield-core/src/{secure_delete.rs, settings.rs, settings_auth.rs, release_tests.rs, lang/*},
+        shield-gui/src/{wipe_view.rs, settings_view.rs, enc_app.rs, enc_views.rs}, shield-cli/src/wipe_cmd.rs,
+        shield-cli/snapshots/help_*.txt, docs/03·09·10(+en)
+  테스트: secure_delete::the_settings_password_is_needed_only_when_set_and_asked_for, the_file_password_counts_when_both_ask,
+        settings_auth::the_secure_delete_password_switch_is_protected, switching_secure_delete_off_by_editing_the_file_is_noticed,
+        cli_tests::wipe_needs_the_settings_password_when_the_settings_ask_for_it, WipePermit compile_fail 문서 테스트,
+        release_tests::no_setting_skips_the_secure_delete_confirmation(새 키 등록, 기본 켜짐 확인)
+  호환: 3.0.0·이전 3.1.0 설정 파일은 그대로 열립니다(MAC 입력 동일). 이 값을 끈 파일을 3.0.0이 읽으면 "Shield 밖에서
+        바뀜"으로 보고 보호 설정을 기본값으로 되돌립니다(되돌아가는 경우만).
+
+20-2. 완전삭제: 직접 고른 링크의 상위 폴더를 해석하지 않음 [낮음] (docs/09 S-11)
+  수정: 링크의 상위 폴더를 canonicalize하고 이름은 유지, 해석한 경로가 같은 링크인지 파일 ID로 재확인.
+  테스트: secure_delete::a_selected_link_is_checked_and_shown_where_it_really_is
+
+20-3. 멈춰 있던 테스트 하나 (기존 실패, 코드 변경 없음)
+  update_tests::every_update_signature_uses_the_release_policy가 update.rs의 verify_release 호출을 5개로 기대했지만,
+  2026-11-11 후속 수정이 권한 헬퍼의 롤백 기준 재확인(update.rs verify_and_install_privileged)에 6번째 호출을
+  더했습니다(그때는 테스트를 실행하지 못함, docs/09 8절). 6번째도 릴리스 정책을 쓰므로 테스트 기대값을 6으로 고쳤습니다.
+  설정 키 이름에 "password"가 들어가면 settings::nothing_sensitive_is_written이 실패하므로 새 키는
+  wipe_needs_settings_pw입니다.

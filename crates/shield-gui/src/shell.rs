@@ -81,7 +81,8 @@ impl Shell {
             saved: set.clone(),
             dirty_since: None,
             save_failed: None,
-            settings_file: crate::settings::settings_path(),
+            // no usable data folder (review D): an empty path, which saving refuses
+            settings_file: crate::settings::settings_path().unwrap_or_default(),
             degraded_ack: false,
             gate_wait: None,
             tracker: crate::window::Tracker::new(crate::window::WinKind::Encrypt, None),
@@ -103,6 +104,9 @@ impl Shell {
         };
         if !issues.is_empty() {
             sh.msg(false, tf("set.load_issues", &[&issues.join(", ")]));
+        }
+        if let Some(e) = sh.set.data_error.clone() {
+            sh.msg(false, e);
         }
         sh
     }
@@ -339,5 +343,46 @@ mod link_tests {
             super::end_frame(ctx);
         });
         assert!(out.platform_output.open_url.is_none());
+    }
+
+    /// 3.1.0 #9-E: the defence above only works if every window calls it on every frame. Each
+    /// `eframe::App::update` must end with `end_frame(ctx)` and must not return before it; no
+    /// extra viewports (they would have their own output) and no other route to `webbrowser`.
+    #[test]
+    fn every_window_drops_links_at_the_end_of_each_frame() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut apps = 0;
+        for e in std::fs::read_dir(&src).unwrap() {
+            let p = e.unwrap().path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") {
+                continue;
+            }
+            let t = std::fs::read_to_string(&p).unwrap().replace('\r', "");
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            for bad in ["show_viewport_immediate", "show_viewport_deferred", "webbrowser::"] {
+                let hits = t.matches(bad).count();
+                let allowed = if name == "shell.rs" { t.matches(&format!("\"{bad}\"")).count() } else { 0 };
+                assert_eq!(hits, allowed, "{name} uses {bad}");
+            }
+            // body of the method `fn <f>(` that starts at `from` (it ends at the first line that
+            // closes a method at impl indent)
+            let method = |from: &str, f: &str| -> String {
+                let s = &from[from.find(&format!("fn {f}(")).unwrap_or_else(|| panic!("{name}: fn {f}"))..];
+                s[..s.find("\n    }\n").unwrap_or_else(|| panic!("{name}: end of {f}"))].to_string()
+            };
+            let mut rest = t.as_str();
+            while let Some(i) = rest.find("\nimpl eframe::App for ") {
+                rest = &rest[i + 1..];
+                let mut body = method(rest, "update");
+                // `update` may hand the whole frame to `ui_frame` (kept testable without eframe)
+                if body.lines().skip(1).map(str::trim).filter(|l| !l.is_empty()).eq(["self.ui_frame(ctx);"]) {
+                    body = method(&t, "ui_frame");
+                }
+                assert!(!body.contains("return"), "{name}: the frame returns early");
+                assert!(body.trim_end().ends_with("crate::shell::end_frame(ctx);"), "{name}: the frame must end with end_frame");
+                apps += 1;
+            }
+        }
+        assert!(apps >= 2, "found {apps} windows");
     }
 }

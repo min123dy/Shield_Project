@@ -1,28 +1,34 @@
-SHIELD 3.0.0 - 프로젝트 설명
+SHIELD 3.1.0 - 프로젝트 설명
 ============================
 
 1. 범위
 -------
-이 문서는 소스 구조, 실행 파일, 암호 구성, 파일 형식, 안전 장치와 알려진 한계를 설명합니다.
-2.1.0에서 3.0.0으로 바뀐 내용과 OS별 지원 표는 06_3.0.0_수정_기록.txt, 테스트와 보안 점검 결과는
-05_테스트_및_점검_기록.txt에 있습니다. 2.x 기록은 docs\history에 그대로 남겼습니다.
+이 문서는 소스 구조, 실행 파일, 암호 구성, 파일 형식, 안전 장치와 알려진 한계를 설명합니다(3.1.0 최종 기준).
+3.1.0 최종에서 바뀐 내용은 08_3.1.0_최종_변경_내역.txt, 보안 분석은 09_보안_분석_보고서.txt, 완전삭제 설계는
+10_완전삭제_설계.txt, 그 전의 3.1.0 수정은 06_3.1.0_수정_기록.txt, 2.1.0에서 3.0.0으로 바뀐 내용과 OS별 지원 표는
+06_3.0.0_수정_기록.txt, 테스트와 보안 점검 결과는 05_테스트_및_점검_기록.txt, 서명 키 운영은 07_서명키_교체.txt에
+있습니다. 2.x 기록은 docs\history에 그대로 남겼습니다.
 English: docs\en\01_overview.txt
 
 2. 실행 파일과 창 (Windows · Linux)
 -----------------------------------
 - shield-gui (Windows: shield-gui.exe, 콘솔 창 없음): 창 두 개
-  · 암호화 창: 암호화 / 복호화 / 비밀번호·키 교체 / 디스크 정리 / 알고리즘·정보 / 설정 / 사용법
+  · 암호화 창: 암호화 / 복호화 / 비밀번호·키 교체 / 완전삭제 / 디스크 정리 / 알고리즘·정보 / 설정 / 사용법
   · 파일 관리자 창(--manager, --open): 폴더 탐색, .shd 열기, 선택·전체 추출, 추가, 삭제, 본문 검사
-  · 탐색기·파일 관리자 메뉴가 부르는 인수: --encrypt-multi <항목...>, --decrypt <c>, --open <c>, --manager, --settings
+  · 탐색기·파일 관리자 메뉴가 부르는 인수: --encrypt-multi <항목...>, --decrypt <c>, --open <c>, --manager, --settings,
+    --wipe [--] <항목...>(완전삭제 탭을 열기만 함; 검사와 세 단계 확인은 창에서, docs/10)
 - shield (Windows: shield.exe, 콘솔): 명령줄 프로그램. MSI는 설치 폴더를 시스템 PATH에 추가하고,
   deb는 /usr/bin/shield로 설치합니다. gui 기능을 넣은 빌드는 "shield gui ..."로 창도 엽니다.
-- 콘솔 전용 빌드(shield-console_v3.0.0_*): GUI 의존성(eframe, rfd 등)이 전혀 없는 단일 파일.
+- 콘솔 전용 빌드(shield-console_v3.1.0_*): GUI 의존성(eframe, rfd 등)이 전혀 없는 단일 파일.
   Linux 판은 musl 정적 링크입니다.
-- 포터블: Shield_v3.0.0_x64_portable.exe(이름이 _portable로 끝나면 설정을 exe 옆 Shield_data에 저장),
-  Linux AppImage(Shield_v3.0.0_x86_64.AppImage, "cli <명령>"으로 콘솔 명령).
+- 포터블: Shield_v3.1.0_x64_portable.exe(이름이 _portable로 끝나면 설정을 exe 옆 Shield_data에 저장),
+  Linux AppImage(Shield_v3.1.0_x86_64.AppImage, "cli <명령>"으로 콘솔 명령).
 - 여러 항목을 탐색기에서 골라 암호화하면 프로세스가 항목마다 하나씩 뜹니다. 각 프로세스는 사용자 전용
-  data_dir\spool에 목록을 쓰고, leader.lck을 잡은 하나만 0.7초 동안 조용해질 때까지(최대 8초) 모아
-  창 하나를 엽니다. 창은 "하나로 묶기 / 각각 따로"를 묻고, 목록에서 항목을 빼거나 더할 수 있습니다.
+  data_dir\spool(완전삭제는 data_dir\spool_wipe)에 목록을 쓰고, leader.lck을 잡은 하나만 0.7초 동안 조용해질
+  때까지(최대 8초) 모아 창 하나를 엽니다. 창은 "하나로 묶기 / 각각 따로"를 묻고, 목록에서 항목을 빼거나 더할 수
+  있습니다. 목록은 경로만 NUL로 구분해 담고(3.1.0 최종: 줄바꿈이 들어간 이름도 한 항목), 상대 경로·file:// URI는
+  절대 경로로 바꿉니다. 쓸 수 없었던 항목(없음, UTF-8이 아닌 이름, 너무 많음)은 버리고 그 개수를 창에 표시합니다.
+  spool 내용은 신뢰하지 않는 입력이며, 사용자 전용 폴더가 아니면 쓰지 않습니다.
 
 3. 워크스페이스와 크레이트
 --------------------------
@@ -35,22 +41,28 @@ crates/shield-platform  OS 코드만 (Windows: windows-sys, Linux: libc). trait 
               FITRIM, LUKS discard 확인, btrfs·ZFS·LVM·Timeshift·Snapper 스냅숏 확인, 빈 공간 채우기),
               shell(.desktop, MIME, Nautilus·Nemo·Dolphin·Thunar), sys(XDG 경로, /proc 시작 시각, pkexec),
               entropy, install(deb: pkexec apt-get, AppImage: 같은 폴더에 쓰고 rename)
+    windows/erase.rs, linux/erase.rs  완전삭제용: 링크를 따라가지 않는 조회·열기(파일 ID), 핸들 기준 폴더 목록,
+              보호 경로 목록, 압축·스파스·EFS·클라우드·네트워크·COW·tmpfs 감지, 설정 폴더 검사(Linux 0700·소유자)
+    bounded.rs 크기 제한 읽기(열고 -> 핸들로 종류·크기 확인 -> take(최대+1)). clippy.toml이 무제한 읽기를 금지
 crates/shield-core      OS 분기 없음(cfg(windows) 없음). 엔진과 모든 문자열 표.
     crypto, format, engine, rekey, container, archive, compress, manifest, staging, sectemp, keyfile,
     password, lock(std File::try_lock = Windows LockFileEx / Linux flock), wipe, ads, harden, progress,
     job, i18n + lang\(ko/en × core/ui/v3/cli, 사용법), help, ui_fmt, outname(출력 이름 규칙),
     entropy\(풀 v4, health 검사), settings(+ settings_auth: 설정 비밀번호), sigverify(OpenPGP 검증),
     buildinfo(저장소 URL, 내장 공개키, 자체 무결성 검사), update(GitHub 릴리스 확인·다운로드·검증·설치),
-    spool(여러 항목 모으기), cross_os_tests(두 OS에서 만든 컨테이너 상호 열기)
+    spool(여러 항목 모으기), cross_os_tests(두 OS에서 만든 컨테이너 상호 열기),
+    secure_delete(완전삭제: 계획·확인 상태 기계·ConfirmedWipePlan·실행, docs/10),
+    manifest2(업데이트 매니페스트 v2: 발행·만료·최소 버전·릴리스 ID·폐기 키, 롤백 상태 update_seen.txt)
     build.rs: SHIELD_REPO_URL(https://github.com/<owner>/<repo>만 허용, 그 밖은 빌드 중단)과
               SHIELD_PUBKEY_PATH(기본 keys/release_key.asc, 비밀키가 들어 있으면 빌드 중단)를 내장
 crates/shield-gui       egui 창. lib(run(Start)) + bin shield-gui.
-    enc_app/enc_jobs/enc_views(암호화 창), mgr_app/mgr_ops/mgr_views(파일 관리자), settings_view,
+    enc_app/enc_jobs/enc_views(암호화 창), wipe_view(완전삭제 탭), mgr_app/mgr_ops/mgr_views(파일 관리자), settings_view,
     settings_pw(설정 비밀번호, Argon2id는 작업 스레드), update_ui(업데이트·개발 정보·무결성 검사),
     shell(공통 틀, 자동 잠금, 입력 시간 엔트로피), dialogs/ui/ui_table/theme/capture/icon
     examples/export_icon.rs: 패키지용 PNG 아이콘을 만드는 빌드 도구(배포 파일에 들어가지 않음)
 crates/shield-cli       콘솔 프로그램 shield. args(표 기반 해석), secret(비밀 입력), cred(자격 증명 규칙),
-    cmds(컨테이너 명령), tools(keyfile/verify/update/entropy/version), out(출력·종료 코드·진행률)
+    cmds(컨테이너 명령), tools(keyfile/verify/update/entropy/version), wipe_cmd(shield wipe),
+    out(출력·종료 코드·진행률)
     기능 gui(기본): shield-gui에 의존, "shield gui ..."와 창이 쓰는 실행 인수 처리. 끄면 콘솔 전용.
 installer/windows  installer.wxs + installer.ko-KR.wxl / installer.en-US.wxl
 installer/linux    shield.desktop, shield-open.desktop, shield-mime.xml, postinst/postrm, filemanagers\
@@ -89,10 +101,20 @@ build.ps1 / build.sh / .github/workflows/release.yml
   (실패는 표시만 하고 작업은 성공). 전체 키 교체·파일 추가·삭제 뒤의 이전 컨테이너도 덮어씀(2.1은 하지 않았음).
 - 업데이트: 기본 꺼짐, 확인만/자동 다운로드 선택, 설치 전 항상 확인, 엄격한 vX.Y.Z 태그, 같은·낮은 버전 거부,
   서명 실패 시 파일 삭제 후 중단, 식별 정보 전송 없음(User-Agent "Shield-Updater"만), 오프라인이면 조용히 실패,
-  설치 전에 비밀 정보 삭제, 사용자 전용 임시 폴더.
+  설치 전에 비밀 정보 삭제, 사용자 전용 임시 폴더. 3.1.0 최종: 자동 설치에는 서명된 v2 매니페스트가 필요하고
+  만료·미래 발행·최소 버전·폐기 키·롤백(지금까지 본 release_id)을 검사합니다(docs/08 B).
 - 콘솔: 에코 없는 비밀 입력, 민감 화면(--reveal)은 Enter 후 화면과 스크롤 기록 삭제, 인자 비밀번호는 기본 꺼짐
   (설정 + --allow-arg-secrets + 매번 경고), 환경 변수·파일 입력 미지원, 첫 Ctrl+C·SIGTERM·SIGHUP은 작업 취소,
   두 번째는 엔트로피 풀을 지우고 종료.
+- 완전삭제(3.1.0 최종): 경고 -> 한계 고지(확인란) -> 6자 코드(3초 대기, 3회 오답 중단)를 모두 거쳐야만 만들어지는
+  ConfirmedWipePlan으로만 실행, 차단 목록(시스템 폴더, 드라이브 루트, 홈 루트, Shield 자체 파일), 링크·마운트
+  비추종, 실행 직전 파일 ID 재확인, 약화 옵션 없음, --yes 무시(docs/10).
+- 설정 폴더(3.1.0 최종, Linux): $XDG_CONFIG_HOME/shield 또는 ~/.config/shield만(둘 다 없으면 오류, /tmp 폴백 없음).
+  실제 폴더·본인 소유·0700이어야 하고(느슨하면 0700으로 조임), 다른 사람이 쓸 수 있는 설정 파일과 0600이 아닌
+  settings.key는 쓰지 않습니다. Windows는 %LOCALAPPDATA%\Shield(정션·링크 거부).
+- 새 비밀번호 기준(한 곳, password::check_new): 거부 = 빈 비밀번호(키 파일 없을 때), 기본보다 낮은 PIM + 키 파일 없음 +
+  20자 미만, 확인 불일치. 경고 = 13자 미만, 한 종류 문자, 흔한 비밀번호, 패턴, 이름 포함 등. GUI는 경고 후 사용 허용,
+  콘솔은 터미널에서 직접 답하거나 --allow-weak가 있을 때만(--yes로는 안 됨).
 - 설정 보호: 보안 설정(캡처 방지, 마우스 엔트로피, 엔트로피 소스, 인자 비밀번호, 기본 덮어쓰기 횟수, 업데이트,
   자동 잠금, 포커스를 잃을 때 잠금 등)은 설정 비밀번호를 넣어야 바뀜. 파일이 밖에서 바뀌면 MAC 불일치로 보호
   항목을 안전한 기본값으로 되돌림. 설정 비밀번호가 없는 파일에는 기본값만 유효함(auth 줄과 settings.key를 지워도
@@ -103,9 +125,13 @@ build.ps1 / build.sh / .github/workflows/release.yml
 - 같은 사용자 권한의 악성 프로그램, 관리자/root, 커널, 물리적 접근은 막지 못합니다.
 - Linux의 설정 MAC 키 파일(settings.key)은 0600 권한 파일일 뿐 봉인되지 않습니다(Windows는 DPAPI + 추가
   엔트로피: 모든 DPAPI 데이터를 한꺼번에 푸는 도구는 막지만, Shield를 아는 같은 사용자 프로그램은 막지 못함).
-  같은 사용자 권한이면 키를 읽어 MAC을 새로 만들 수 있습니다. 설정 보호는 다른 계정과 실수를 막는 장치입니다.
-- 설정 비밀번호의 재시도 지연은 프로세스 안에서만 셉니다. 콘솔을 다시 실행하면 0부터 시작하며,
-  그때는 Argon2id(128 MiB) 비용만 남습니다.
+  같은 사용자 권한이면 키를 읽어(Linux) 또는 DPAPI 봉인을 풀어(Windows) MAC을 새로 만들 수 있습니다.
+  설정 보호는 다른 계정과 실수를 막는 장치입니다.
+- 이전에 유효했던 설정 파일(과 settings.key)을 다시 가져다 놓는 롤백은 감지하지 못합니다. 그 사이 설정
+  비밀번호를 바꾸지 않았다면 옛 파일의 MAC도 맞기 때문입니다.
+- 설정 비밀번호의 재시도 지연은 프로세스 메모리 안에서만 셉니다. 콘솔을 다시 실행하면 0부터 시작합니다.
+  같은 사용자 권한의 공격자는 디스크에 둔 카운터나 지연도 지울 수 있으므로 더하지 않았습니다. 실질적인 방어는
+  Argon2id(128 MiB) 비용입니다.
 - 자체 무결성 검사는 바뀐·손상된 실행 파일을 찾지만, 내장 공개키까지 바꾼 프로그램은 찾지 못합니다.
   화면에 표시된 지문을 개발자가 따로 공개한 지문과 비교해야 합니다.
 - brainpoolP512r1 서명 키는 지원하지 않습니다(256/384, Ed25519, NIST P 곡선, RSA는 rPGP가 지원).
@@ -120,10 +146,48 @@ build.ps1 / build.sh / .github/workflows/release.yml
 - AppImage와 GUI는 시스템의 GTK3를 씁니다. Linux 스왑이 암호화되지 않았다면 mlock이 실패한 메모리는
   디스크로 나갈 수 있습니다(암호화된 스왑 또는 스왑 없음 권장).
 - egui가 입력 이벤트와 그린 텍스트를 내부에 복사하는 한계(2.x와 같음)는 그대로입니다.
-- 독립적인 외부 보안 감사를 받지 않았습니다.
+- 키 복사본: chacha20poly1305 0.10.1은 drop할 때 AEAD 객체 안의 키를 지우고(소스 확인), 3.1.0부터 poly1305의
+  zeroize 기능도 켜서 메시지별 MAC 상태도 지웁니다. 다만 컴파일러가 레지스터·스택에 남긴 사본, 스왑으로 나간
+  페이지까지 지워진다는 것은 테스트로 증명할 수 없으며 증명했다고 하지 않습니다.
+- KDF 취소: 비밀번호를 넣은 뒤 취소하면 작업은 곧바로 끝나지만, 이미 시작한 Argon2id 계산(256 MiB)은 끝날
+  때까지(보통 몇 초) 백그라운드에서 계속되고 메모리를 씁니다. 다음 키 유도는 그 계산이 끝난 뒤 시작합니다
+  (한 번에 하나). 컨테이너가 될 수 없을 만큼 짧은 파일은 KDF 전에 거부합니다.
+- 의존성 권고: rsa 0.9(RUSTSEC-2023-0071)와 crypto-bigint 0.5.5(RUSTSEC-2026-0387)는 pgp를 통해 릴리스 서명을
+  공개키로 검증하는 경로에서만 쓰이며 Shield는 이 라이브러리로 비밀키 연산(복호화·서명)을 하지 않습니다. 고쳐진
+  버전이 없거나(rsa) pgp가 0.5에 묶여 있어(crypto-bigint) 올리지 못했습니다. webbrowser 0.8(RUSTSEC-2026-0257)은
+  egui-winit이 끌어오며, Shield는 매 프레임 egui의 URL 열기 요청을 버리고 자체 경로(Platform::open_url)를 씁니다
+  (테스트로 지킴). 이 판단은 .cargo/audit.toml과 docs/05에 적혀 있으며, 새 권고가 나오면 CI가 실패합니다.
+- 업데이트 설치(3.1.0 #1): 검증한 패키지를 관리자·root만 쓸 수 있는 폴더로 복사한 뒤 다시 검증하고 설치합니다.
+  관리자·root 권한의 공격자는 이 폴더도 바꿀 수 있으므로 위협 모델 밖입니다. 실제 UAC·pkexec 환경에서의 설치는
+  직접 확인하지 못했습니다(docs/06의 미확인 목록).
+- 업데이트 재생: 3.1.0 최종부터 v2 매니페스트(발행·만료·최소 버전·릴리스 ID·폐기 키)로 막습니다. 다만 3.0.0과 이전
+  3.1.0 빌드는 v1만 읽으므로(형식을 바꾸면 3.0.0 파서가 거부) 그 버전에서는 여전히 예전에 정상 서명된 중간 버전을
+  다시 내밀 수 있습니다. 롤백 상태 파일(update_seen.txt)은 사용자 파일이라 같은 사용자 권한이면 지울 수 있습니다
+  (지우면 사용자 영역의 롤백 이력만 초기화됨). 권한 상승 설치 헬퍼는 Windows의 관리자 전용 ProgramData 또는 Linux의
+  root 전용 /var/lib/shield/update에도 별도 롤백 기준을 저장하고 다시 확인합니다. 3.0.0과 이전 3.1.0 빌드는 v1만
+  읽으므로 새 보호는 3.1.0 최종 이후 빌드부터 적용됩니다. 1년 안에 새 릴리스가 없으면 매니페스트를 다시 서명해야 합니다.
+- 번들 릴리스 키: keys\release_key.asc는 유효한 OpenPGP 공개키여야 합니다. 주 키의 직접 서명, 만료 없는 키, 개인
+  이메일 사용자 ID도 허용하며 별도 서명 부키·프로젝트 ID·백업 키는 빌드나 검증의 필수 조건이 아닙니다. 다만 서명된
+  태그 릴리스에는 해당 공개키와 일치하는 서명 가능한 비밀키가 필요합니다. 전용 서명 부키와 오프라인 백업 키는 권장 사항입니다.
+- 완전삭제: SSD/NVMe·스냅숏·COW·클라우드·백업·휴지통 사본에는 옛 데이터가 남을 수 있습니다(화면에 항상 표시,
+  docs/10 5절). 확인 절차는 실수 방지 장치이며 같은 사용자 권한의 악성 프로그램을 막지 않습니다.
+- 업데이트 서명은 바이너리 서명만, 그리고 오늘 기준으로 만료되지 않은 배포 키만 받습니다(2차 검토 #2). 시스템 시계가
+  크게 틀리면 업데이트가 거부될 수 있습니다(오류에 시계 안내가 붙습니다).
+- Windows: 일반 계정이 %ProgramData%\Shield를 Shield 설치 전에 먼저 만들어 두면, 헬퍼는 그 폴더를 넘겨받지 않고
+  업데이트를 중단합니다(2차 검토 #3). 관리자가 그 폴더를 지워야 업데이트가 됩니다. 설치 후에는 MSI가 관리자 전용
+  권한으로 만들어 두므로 일반 계정이 먼저 만들 수 없습니다.
+- MSI에는 Authenticode 서명이 없어 UAC 창에 "게시자를 알 수 없음"으로 표시됩니다. 무결성은 OpenPGP 서명과
+  매니페스트로 확인합니다(docs/02의 선택 과제 참고).
+- 독립적인 외부(제3자) 보안 감사를 받지 않았습니다. 점검은 정적 분석과 자동 테스트 중심이며 실기 미검증 항목이
+  있습니다(docs/09).
 
 8. 검증 상태
 ------------
-05_테스트_및_점검_기록.txt에 있습니다. 요약: Windows와 Linux(Docker, Debian bookworm)에서 cargo test
---workspace 전부 통과, clippy 경고 0, Linux musl 정적 콘솔 빌드 확인. 실제 MSI 설치·제거, 실제 GitHub 릴리스로
-하는 업데이트, 실제 데스크톱(GNOME·KDE·Xfce)에서의 메뉴 동작은 직접 확인하지 못했습니다.
+05_테스트_및_점검_기록.txt에 있습니다. 요약: Windows와 Linux(Docker)에서 cargo test --workspace 전부 통과,
+clippy 경고 0(두 OS), cargo audit·cargo deny 통과, Nautilus 스크립트 검사 통과. cargo fmt --check는 통과하지 않습니다
+(코드 정리 안 됨, 동작과 무관). 실제 MSI 설치·제거, 실제 GitHub 릴리스로 하는 업데이트, 실제 데스크톱(GNOME·KDE·
+Xfce)에서의 메뉴 동작, 실제 SSD에서의 완전삭제 결과는 직접 확인하지 못했습니다.
+
+8. 라이선스
+---------
+프로젝트와 모든 Rust 크레이트는 Apache License 2.0으로 배포합니다. 루트 LICENSE가 법적 전문이며 Cargo 메타데이터도 Apache-2.0입니다.

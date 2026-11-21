@@ -42,7 +42,14 @@ fn best_clock() -> &'static dyn Fn() -> u64 {
 fn read_small(p: &str, buf: &mut Vec<u8>) -> bool {
     buf.clear();
     match fs::File::open(p) {
-        Ok(f) => f.take(256 * 1024).read_to_end(buf).is_ok() && !buf.is_empty(),
+        // truncated at 256 KiB (`take`), so the limit is never an error here
+        Ok(f) => match crate::bounded::read_limited(f.take(256 * 1024), 256 * 1024) {
+            Ok(v) => {
+                *buf = v;
+                !buf.is_empty()
+            }
+            Err(_) => false,
+        },
         Err(_) => false,
     }
 }

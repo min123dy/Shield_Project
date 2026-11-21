@@ -1,0 +1,24 @@
+    pub fn protected_text(&self) -> String {
+        if !self.env_off.is_empty() {
+            return self.file_view().protected_text();
+        }
+        let mut dis = self.entropy_disabled.clone();
+        dis.sort();
+        dis.dedup();
+        format!(
+            "capture_protect={}\nmouse_entropy={}\nstrict_motw={}\nallow_arg_secrets={}\nupdate={}\nshred_passes={}\nauto_lock_minutes={}\nlock_on_minimize={}\nlock_on_focus_loss={}\nallow_reveal={}\nclipboard_clear={}\nentropy_disabled={}\nauth={}\n",
+            self.capture_protect,
+            self.mouse_entropy,
+            self.strict_motw,
+            self.allow_arg_secrets,
+            self.update.code(),
+            self.shred_passes.count(),
+            self.auto_lock_min,
+            self.lock_on_minimize,
+            self.lock_on_focus_loss,
+            self.allow_reveal,
+            self.clipboard_clear,
+            dis.join(","),
+            self.auth.as_ref().map(|a| a.text()).unwrap_or_default(),
+        )
+    }

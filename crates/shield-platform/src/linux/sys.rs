@@ -5,7 +5,7 @@
 use crate::{Civil, PResult, Sealed};
 use std::{
     ffi::OsStr,
-    fs, io,
+    io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -13,7 +13,7 @@ use std::{
 
 /// MemAvailable from /proc/meminfo (what the kernel thinks can be allocated without swapping).
 pub fn avail_mem() -> u64 {
-    fs::read_to_string("/proc/meminfo")
+    crate::bounded::read_text_limited(Path::new("/proc/meminfo"), 1 << 20)
         .ok()
         .and_then(|s| {
             s.lines().find_map(|l| {
@@ -30,7 +30,7 @@ pub fn process_start(pid: u32) -> Option<u64> {
     if pid == 0 {
         return None;
     }
-    let s = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let s = crate::bounded::read_text_limited(Path::new(&format!("/proc/{pid}/stat")), 64 << 10).ok()?;
     // the command name (field 2) may contain spaces and ')': split after the LAST ')'
     let rest = &s[s.rfind(')')? + 1..];
     let f: Vec<&str> = rest.split_whitespace().collect();
@@ -62,9 +62,9 @@ pub(crate) fn run_quiet(candidates: &[&str], args: &[&OsStr], limit: Duration) -
     loop {
         match child.try_wait().ok()? {
             Some(st) if st.success() => {
-                let mut out = String::new();
-                io::Read::read_to_string(child.stdout.as_mut()?, &mut out).ok()?;
-                return Some(out);
+                // the helpers print a line or two; 1 MiB at most is read
+                let out = crate::bounded::read_limited(child.stdout.as_mut()?, 1 << 20).ok()?;
+                return String::from_utf8(out).ok();
             }
             Some(_) => return None,
             None if t0.elapsed() > limit => {

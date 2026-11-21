@@ -35,6 +35,13 @@ pub const META_PT: usize = 512;
 pub const META_CT: usize = META_PT + TAG;
 pub const HEADER: usize = SLOTS + PREFIX + META_CT; // 719
 pub const CHUNK: usize = 64 * 1024;
+/// Every container holds a 7z archive (FLAG_ARCHIVE is required), and a 7z archive is at least
+/// its 32-byte signature header.
+pub const MIN_ARCHIVE: usize = 32;
+/// Smallest possible container: header, one chunk tag, the smallest archive (no padding). Shorter
+/// files are refused before the key derivation (3.1.0 #13), with the same message as a wrong
+/// password.
+pub const MIN_CONTAINER: u64 = (HEADER + TAG + MIN_ARCHIVE) as u64;
 pub const NAME_MAX: usize = 255;
 
 pub const KDF_MEM_KIB: u32 = 256 * 1024;

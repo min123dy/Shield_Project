@@ -19,4 +19,5 @@
   <String Id="VerbEncrypt" Value="Encrypt with Shield" />
   <String Id="VerbDecrypt" Value="Decrypt with Shield" />
   <String Id="VerbOpen" Value="Open in SHIELD" />
+  <String Id="VerbWipe" Value="Secure delete with SHIELD" />
 </WixLocalization>

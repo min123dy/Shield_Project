@@ -27,6 +27,7 @@ pub const CMDS: &[(&str, &str, &str)] = &[
     ("version", "", "cli.h_version"),
     ("help", "cli.s_help", "cli.h_help"),
     ("gui", "cli.s_gui", "cli.h_gui"),
+    ("wipe", "cli.s_wipe", "cli.h_wipe"),
 ];
 
 /// (command or "" for all, option, value placeholder key or "", description key). Every option
@@ -60,6 +61,12 @@ pub const OPTS: &[(&str, &str, &str, &str)] = &[
     ("", "check", "", "cli.o_check"),
     ("", "enable", "cli.v_source", "cli.o_enable"),
     ("", "disable", "cli.v_source", "cli.o_disable"),
+    ("", "allow-weak", "", "cli.o_allow_weak"),
+    ("wipe", "passes", "cli.v_passes", "cli.o_passes_wipe"),
+    ("", "recursive", "", "cli.o_recursive"),
+    ("", "dry-run", "", "cli.o_dry_run"),
+    ("", "confirm-token", "cli.v_token", "cli.o_confirm_token"),
+    ("", "i-understand-irreversible", "", "cli.o_understand"),
 ];
 
 #[derive(Clone, Copy, Debug)]

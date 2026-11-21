@@ -27,7 +27,7 @@ fn explorer_multi_selection_asks_separately_or_bundled() {
     let (f1, f2) = (d.join("a.txt"), d.join("b.txt"));
     std::fs::write(&f1, b"1").unwrap();
     std::fs::write(&f2, b"2").unwrap();
-    let a = EncApp::new(Settings::default(), Start::Encrypt(vec![f1.clone(), f2.clone(), f1.clone()]));
+    let a = EncApp::new(Settings::default(), Start::Encrypt { items: vec![f1.clone(), f2.clone(), f1.clone()], dropped: 0 });
     assert_eq!(a.items, vec![f1.clone(), f2.clone()], "duplicates are dropped");
     assert_eq!(a.pending, Some(Pending::Multi(2)));
     assert_eq!(a.tab, Tab::Encrypt);
@@ -36,6 +36,15 @@ fn explorer_multi_selection_asks_separately_or_bundled() {
     std::fs::write(d.join("Reports.shd"), b"taken").unwrap();
     assert_eq!(bundle_output(&a.items).unwrap(), d.join("Reports (2).shd"));
     let _ = std::fs::remove_dir_all(d.parent().unwrap());
+}
+
+#[test]
+fn unusable_selection_items_are_reported_in_the_encrypt_window() {
+    // review F: the spool's dropped count reaches the window instead of being lost
+    let a = EncApp::new(Settings::default(), Start::Encrypt { items: vec![], dropped: 3 });
+    assert!(!a.sh.ok && a.sh.status.contains('3'), "{}", a.sh.status);
+    let b = EncApp::new(Settings::default(), Start::Encrypt { items: vec![], dropped: 0 });
+    assert!(b.sh.status.is_empty(), "{}", b.sh.status);
 }
 
 #[test]
@@ -77,7 +86,7 @@ fn shred_confirmation_lists_storage_limits() {
     let d = tmpdir();
     let f = d.join("a.txt");
     std::fs::write(&f, b"1").unwrap();
-    let mut a = EncApp::new(Settings::default(), Start::Encrypt(vec![f]));
+    let mut a = EncApp::new(Settings::default(), Start::Encrypt { items: vec![f], dropped: 0 });
     a.sh.set.shred_default = true;
     a.shred_ack = true;
     a.pw.push_str("correct horse battery staple 1");
@@ -94,7 +103,7 @@ fn short_password_is_a_warning_and_low_pim_still_blocks() {
     let d = tmpdir();
     let f = d.join("a.txt");
     std::fs::write(&f, b"1").unwrap();
-    let mut a = EncApp::new(Settings::default(), Start::Encrypt(vec![f]));
+    let mut a = EncApp::new(Settings::default(), Start::Encrypt { items: vec![f], dropped: 0 });
     a.pw.push_str("Zk#9vQ!x");
     a.pw2.push_str("Zk#9vQ!x");
     assert!(a.encrypt_problems().is_empty(), "{:?}", a.encrypt_problems());

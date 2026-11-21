@@ -1,0 +1,7 @@
+# Pinned toolchain (3.1.0 final, review G): CI and local builds use the same compiler. Raising it
+# is a deliberate change (check `cargo clippy` and the tests, then update this file); the
+# workspace rust-version (MSRV) stays the lowest version the code builds with.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -53,6 +53,59 @@ pub struct FileId {
     pub special: bool,
 }
 
+/// What a folder entry is, looked up without following a link (3.1.0 #10: listing by handle).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EntryKind {
+    /// Symlink, junction or other reparse point (never followed).
+    Link,
+    Dir,
+    File,
+    /// FIFO, socket, device ...
+    Other,
+}
+
+/// One entry looked up by name without following it (secure delete, 3.1.0 final): its identity
+/// and what it is. `Link` is only a symbolic link or a junction; any other reparse point (cloud
+/// placeholder, deduplicated file, WIM/WOF, unknown tags) is `Other`, so it is never "removed as a
+/// link" by mistake.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EntryInfo {
+    pub id: FileId,
+    pub kind: EntryKind,
+    pub size: u64,
+    /// Windows file attributes (0 on Linux).
+    pub attrs: u32,
+}
+
+/// Why overwriting a file may not reach the place its old data is stored (secure delete warnings).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum WipeNote {
+    /// NTFS-compressed (the data lives in compressed clusters that move on rewrite).
+    Compressed,
+    /// Sparse file (unallocated ranges; rewriting allocates new clusters).
+    Sparse,
+    /// EFS-encrypted file.
+    Encrypted,
+    /// Cloud file or a folder kept in sync by a cloud client (copies in the cloud / version history).
+    Cloud,
+    /// Network drive or network file system (the server decides where data goes).
+    Network,
+    /// Copy-on-write or log-structured file system (btrfs, ZFS, ReFS, bcachefs, overlay ...): new
+    /// writes go to new blocks. Holds the file system name.
+    CopyOnWrite(String),
+    /// RAM-backed file system (tmpfs): pages may have been written to swap.
+    RamBacked,
+}
+
+/// Paths secure delete never touches (3.1.0 final 2-4), from the OS (known folders / fixed
+/// system paths). `exact`: these folders themselves (and every folder that contains one of them).
+/// `subtree`: these folders and everything below them.
+#[derive(Clone, Debug, Default)]
+pub struct Protected {
+    pub exact: Vec<PathBuf>,
+    pub subtree: Vec<PathBuf>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StorageKind {
     /// Flash storage (no seek penalty / not rotational): TRIM is useful, overwriting is not reliable.
@@ -358,6 +411,11 @@ pub fn x11_scale_choice(current: Option<&str>, xft_dpi: Option<f64>, gdk_scale: 
     let s = (g * d * 100.0).round() / 100.0;
     Some(if s.fract() == 0.0 { format!("{s:.0}") } else { format!("{s}") })
 }
+
+/// Message of the error `fs::rename_noreplace` returns on Linux when the file system has no
+/// RENAME_NOREPLACE and a folder cannot be moved safely without it (3.1.0 #11). shield-core shows
+/// a translated message instead.
+pub const NOREPLACE_DIR_REFUSED: &str = "shield:noreplace-dir-refused";
 
 #[cfg(test)]
 mod display_tests {

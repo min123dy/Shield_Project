@@ -217,6 +217,23 @@ impl MgrApp {
         self.go(parent);
     }
 
+    /// "Open in SHIELD" on any file (3.1.0 #14): the folder of `p`, and the unlock screen for it
+    /// when it is a regular file (its name and extension are not looked at). Anything else gets
+    /// one message and no password question.
+    pub fn new_open(set: Settings, p: PathBuf) -> Self {
+        let mut a = Self::new(set, None);
+        a.cwd = p.parent().filter(|d| !d.as_os_str().is_empty()).map(Path::to_path_buf).or(a.cwd.take());
+        a.refresh();
+        match container::open_regular(&p) {
+            Ok(f) => {
+                drop(f);
+                a.pending = Some(p);
+            }
+            Err(x) => a.sh.msg(false, x),
+        }
+        a
+    }
+
     /// Double click / Enter on a browse row.
     pub fn activate(&mut self, p: PathBuf, is_dir: bool) {
         if is_dir {

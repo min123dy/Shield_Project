@@ -51,7 +51,7 @@ pub(crate) fn parse_mountinfo(text: &str) -> Vec<Mount> {
 /// The mount that holds `p` (longest matching mount point; the last one wins on stacked mounts).
 pub(crate) fn mount_of(p: &Path) -> Option<Mount> {
     let c = fs::canonicalize(p).or_else(|_| p.parent().map(fs::canonicalize).unwrap_or(Ok(p.to_path_buf()))).ok()?;
-    let all = parse_mountinfo(&fs::read_to_string("/proc/self/mountinfo").ok()?);
+    let all = parse_mountinfo(&crate::bounded::read_text_limited(Path::new("/proc/self/mountinfo"), MOUNTINFO_MAX).ok()?);
     let mut best: Option<Mount> = None;
     for m in all {
         if c.starts_with(&m.point) && best.as_ref().is_none_or(|b| m.point.components().count() >= b.point.components().count()) {
@@ -81,8 +81,12 @@ fn block_dir(p: &Path) -> Option<PathBuf> {
     fs::canonicalize(d).ok()
 }
 
+/// Largest /proc/self/mountinfo read (thousands of mounts in containers stay far below).
+pub(crate) const MOUNTINFO_MAX: u64 = 16 << 20;
+
+/// A small sysfs attribute (a few bytes; 64 KiB at most is read).
 fn read_trim(p: &Path) -> Option<String> {
-    fs::read_to_string(p).ok().map(|s| s.trim().to_string())
+    crate::bounded::read_text_limited(p, 64 << 10).ok().map(|s| s.trim().to_string())
 }
 
 fn slaves(dir: &Path) -> Vec<PathBuf> {

@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 type R = Result<(), String>;
 
-fn passes(cx: &Ctx) -> Result<Passes, String> {
+pub(crate) fn passes(cx: &Ctx) -> Result<Passes, String> {
     match cx.a.val("passes") {
         None => Ok(cx.set.shred_passes),
         Some("3") => Ok(Passes::Three),
@@ -44,10 +44,28 @@ fn paths(v: &[String]) -> Vec<PathBuf> {
     out
 }
 
+/// At most this many originals are named before a shred question (3.1.0 #5).
+pub const SHRED_LIST_MAX: usize = 20;
+
+/// "will be overwritten and deleted:" + up to `SHRED_LIST_MAX` paths + "... and N more".
+pub fn shred_target_lines(targets: &[&Path]) -> Vec<String> {
+    let mut lines = vec![tf("cli.shred_targets", &[&targets.len()])];
+    for p in targets.iter().take(SHRED_LIST_MAX) {
+        lines.push(format!("  {}", crate::archive::display_name(&p.display().to_string())));
+    }
+    if targets.len() > SHRED_LIST_MAX {
+        lines.push(format!("  {}", tf("cli.shred_more", &[&(targets.len() - SHRED_LIST_MAX)])));
+    }
+    lines
+}
+
 /// Snapshot / storage warnings, then the question. Asked every time something is overwritten.
+/// The targets are always printed (also with --yes); without a terminal and without --yes the
+/// question is refused (`Out::confirm`).
 fn confirm_shred(cx: &Ctx, targets: &[&Path], p: Option<Passes>) -> R {
     let ex = wipe::exposure(targets);
-    let mut lines = ex.snapshot_lines;
+    let mut lines = shred_target_lines(targets);
+    lines.extend(ex.snapshot_lines);
     if ex.not_guaranteed {
         lines.push(t("dlg.shred_flash").into());
     }
@@ -63,7 +81,8 @@ fn confirm_shred(cx: &Ctx, targets: &[&Path], p: Option<Passes>) -> R {
 }
 
 fn run<T>(cx: &Ctx, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    crate::out::with_progress(&cx.o, f)
+    // 3.1.0 #12: temporary files that could not be removed are named in the error
+    crate::progress::with_cleanup_warnings(crate::out::with_progress(&cx.o, f))
 }
 
 pub fn encrypt(cx: &mut Ctx) -> R {
@@ -134,7 +153,8 @@ pub fn list(cx: &mut Ctx) -> R {
         for e in &entries {
             let size = if e.is_dir { "-".to_string() } else { crate::ui_fmt::human(e.size) };
             // the listing is the result: printed also with --quiet
-            println!("{size:>10}  {}{}", e.name.as_str(), if e.is_dir { "/" } else { "" });
+            // 3.1.0 #4: direction-control characters printed as <U+202E> (the JSON keeps the real name)
+            println!("{size:>10}  {}{}", crate::archive::display_name(e.name.as_str()), if e.is_dir { "/" } else { "" });
         }
         cx.o.info(&tf("cli.list_total", &[&entries.len(), &crate::ui_fmt::human(total)]));
     }

@@ -1,0 +1,8 @@
+Shield release manifest 2
+version 2.0.0
+release_id 1700000000
+issued_at 1790000000
+expires_at 1821536000
+min_allowed_version 2.0.0
+sha256 1cfb43da2cfc3f3a55d0c6623fd232903226d54ffb38a24088152cb6332d9491 Shield_v9.9.9_x64.msi
+sha256 1cfb43da2cfc3f3a55d0c6623fd232903226d54ffb38a24088152cb6332d9491 shield_v9.9.9_amd64.deb

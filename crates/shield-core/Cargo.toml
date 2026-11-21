@@ -4,11 +4,15 @@ description = "Shield: container format, cryptography, archive, shredding policy
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 shield-platform = { path = "../shield-platform" }
 chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# 3.1.0 #9-A: chacha20poly1305 0.10 wipes its key on drop and enables zeroize for chacha20, but
+# not for poly1305; this turns it on so the per-message Poly1305 state is wiped as well.
+poly1305 = { version = "0.8", default-features = false, features = ["zeroize"] }
 argon2 = { version = "0.5", features = ["zeroize"] }
 sha3 = { workspace = true }
 hkdf = "0.12"

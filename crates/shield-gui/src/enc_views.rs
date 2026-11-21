@@ -148,6 +148,7 @@ pub fn frame(a: &mut EncApp, ctx: &egui::Context) {
                         (Tab::Decrypt, t("tab.decrypt")),
                         (Tab::Rekey, t("tab.rekey")),
                         (Tab::Disk, t("tab.disk")),
+                        (Tab::Wipe, t("tab.wipe")),
                         (Tab::Settings, t("tab.settings")),
                         (Tab::Algo, t("tab.algo")),
                         (Tab::Help, t("tab.help")),
@@ -167,6 +168,10 @@ pub fn frame(a: &mut EncApp, ctx: &egui::Context) {
         ui.add_space(3.0);
         if let Some(job) = &mut a.job {
             progress_view(ui, job);
+        } else if let Some(job) = &mut a.wipe.scan {
+            progress_view(ui, job);
+        } else if let Some(job) = &mut a.wipe.run {
+            progress_view(ui, job);
         } else {
             action_bar(a, ui);
             if status_line(ui, a.sh.ok, &a.sh.status, t("v.drop_hint")) {
@@ -184,6 +189,7 @@ pub fn frame(a: &mut EncApp, ctx: &egui::Context) {
                 Tab::Decrypt => view_decrypt(a, ui),
                 Tab::Rekey => view_rekey(a, ui),
                 Tab::Disk => view_disk(a, ui),
+                Tab::Wipe => crate::wipe_view::view(a, ui),
                 Tab::Settings => crate::settings_view::view(ui, &mut a.sh),
                 Tab::Algo => view_algo(ui),
                 Tab::Help => usage_view(ui, t("help.enc_title"), help::enc_usage()),
@@ -198,6 +204,13 @@ fn action_bar(a: &mut EncApp, ui: &mut egui::Ui) {
         Tab::Encrypt => (a.encrypt_problems(), t("v.start_encrypt")),
         Tab::Decrypt => (a.decrypt_problems(), t("v.start_decrypt")),
         Tab::Rekey => (a.rekey_problems(), if a.sh.set.ui.full_rekey { t("v.start_full_rekey") } else { t("v.start_change_pw") }),
+        Tab::Wipe => {
+            // a scan only: the three confirmations come before anything is changed
+            if action_button(ui, &a.wipe_problems(), t("sd.start")) && !a.wipe.confirming() {
+                a.start_wipe_scan();
+            }
+            return;
+        }
         _ => return,
     };
     if action_button(ui, &problems, label) {

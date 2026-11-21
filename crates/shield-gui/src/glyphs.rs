@@ -21,11 +21,24 @@ pub const ALLOWED: &[(char, &str)] = &[
 
 /// Characters that appear only in code that inspects names (never drawn): superscript digits
 /// that Windows treats as device names ("COM¹").
-pub const CODE_ONLY: &[char] = &['\u{00B9}', '\u{00B2}', '\u{00B3}'];
+/// 3.1.0 #4: also the direction-control characters `archive::is_spoof_char` matches; they are
+/// only found and replaced in code, never drawn (shown as <U+202E>).
+/// 3.1.0 final (review H): ZWNJ / ZWJ, which `archive::dup_key` ignores. Everything else
+/// `archive::is_spoof_char` or `archive::is_variation_selector` matches counts as code-only too
+/// (`code_only` below): it is shown as <U+....>, never drawn.
+pub const CODE_ONLY: &[char] = &[
+    '\u{00B9}', '\u{00B2}', '\u{00B3}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', '\u{200E}',
+    '\u{200F}', '\u{061C}', '\u{FEFF}', '\u{200C}', '\u{200D}',
+];
+
+/// True for characters that only appear in code that inspects names (see `CODE_ONLY`).
+pub fn code_only(c: char) -> bool {
+    CODE_ONLY.contains(&c) || shield_core::archive::is_spoof_char(c) || shield_core::archive::is_variation_selector(c)
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{ALLOWED, CODE_ONLY};
+    use super::ALLOWED;
     use ab_glyph::{Font, FontRef};
     use std::path::Path;
 
@@ -123,7 +136,7 @@ mod tests {
         // this file names the removed emoji on purpose (font test below)
         for (name, text) in files.iter().filter(|(n, _)| !n.ends_with("glyphs.rs")) {
             for (n, line) in text.lines().enumerate() {
-                for c in unescape(code_part(line)).chars().filter(|c| special(*c) && !allowed(*c) && !CODE_ONLY.contains(c)) {
+                for c in unescape(code_part(line)).chars().filter(|c| special(*c) && !allowed(*c) && !super::code_only(*c)) {
                     bad.push(format!("{name}:{}: U+{:04X} {c}", n + 1, c as u32));
                 }
             }

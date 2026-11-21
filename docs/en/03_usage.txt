@@ -1,4 +1,4 @@
-SHIELD 3.0.0 - Usage and safety notes
+SHIELD 3.1.0 - Usage and safety notes
 ====================================
 
 This file opens again from "Shield user guide" in the Start menu and as "usage.txt" in the install folder
@@ -6,19 +6,22 @@ This file opens again from "Shield user guide" in the Start menu and as "usage.t
 
 0. Installing and upgrading
 ---------------------------
-- Windows: Shield_v3.0.0_x64.msi. Read the notes on the first page, tick the box, [Install]. Older versions are
+- Windows: Shield_v3.1.0_x64.msi. Read the notes on the first page, tick the box, [Install]. Older versions are
   upgraded. The install folder is added to PATH, so the shield command works in a new terminal.
-- Linux: sudo apt install ./shield_v3.0.0_amd64.deb (app menu, /usr/bin/shield, file manager entries, .shd type).
-  Without installing: chmod +x Shield_v3.0.0_x86_64.AppImage and run it, or the console-only
-  shield-console_v3.0.0_linux_x64.
+- Linux: sudo apt install ./shield_v3.1.0_amd64.deb (app menu, /usr/bin/shield, file manager entries, .shd type).
+  Without installing: chmod +x Shield_v3.1.0_x86_64.AppImage and run it, or the console-only
+  shield-console_v3.1.0_linux_x64.
 - 3.0 uses the 2.x file format and opens 2.x containers. The 1.x format is not opened.
 - Verify downloads first: gpg --verify <file>.sig <file>, or with an installed Shield
   shield verify <file> <file>.sig --key <key.asc>. Compare the key fingerprint with the one the developer
-  published separately. The MSI has no Authenticode signature, so SmartScreen may warn.
+  published separately. The MSI has no Authenticode signature, so SmartScreen may warn (docs/04).
+- From the earlier 3.1.0 build to 3.1.0 final there is no in-app update (same version number): replace it with the
+  installer. Linux Nautilus users run integrate.sh again after upgrading (docs/08 section 5).
 
 1. Two windows
 --------------
-- "Shield" (encryption window): Encrypt / Decrypt / Password & keys / Disk cleanup / Algorithms / Settings / Guide.
+- "Shield" (encryption window): Encrypt / Decrypt / Password & keys / Secure delete / Disk cleanup / Algorithms /
+  Settings / Guide.
 - "Shield File Manager": browse folders, open .shd containers, view, extract some, add files, delete items.
 - The button at the top right opens the other window. When a newer version was found a "new version" badge appears.
 - The bottom bar shows stage, progress, speed, time left and [Cancel]. Windows can't be closed during a task
@@ -38,6 +41,11 @@ This file opens again from "Shield user guide" in the Start menu and as "usage.t
 - Restore check: the new file is reopened, every chunk authenticated, everything unpacked and compared with the
   originals by size and SHA3-512.
 - Weak passwords show a confirmation with the reasons (default button [Cancel]). At most 256 bytes; longer is refused.
+  Refused (cannot continue): empty password without a key file, confirmation differs, PIM below the default (12) with no
+  key file and fewer than 20 characters. Warnings (usable after confirming): under 13 characters, digits only or one
+  kind of character, common passwords, repeats and sequences, contains a name, key file only.
+- Items selected in Explorer that cannot be used (gone, non-UTF-8 name, too many) are left out and their number is shown
+  in the window.
 - A pasted password stays on the clipboard: use [Clear clipboard].
 
 3. Key files
@@ -56,7 +64,13 @@ This file opens again from "Shield user guide" in the Start menu and as "usage.t
 -------------
 - Pick the .shd, give the same password, PIM and key files -> [Start decryption]. The whole body is authenticated first.
 - Unpacked into a private temp folder, checked, then moved next to the .shd ("(decrypted)" is added if the name is taken).
-- A container made from several items unpacks into a folder named after the container.
+- Where it goes (3.1.0; full decryption and [Extract all] in the manager window):
+    one file         -> the file itself (report.pdf in report.shd -> report.pdf)
+    one folder       -> the folder itself when it has the .shd's name (photos.shd -> photos/...),
+                        otherwise inside a folder named after the .shd (photos in trip.shd -> trip/photos/...)
+    several items    -> inside a folder named after the .shd (a.jpg, b.jpg in trip.shd -> trip/a.jpg, trip/b.jpg)
+  The folder name comes from the .shd file's current name, not from the name stored inside (a renamed .shd gives the new
+  name). [Extract selected] in the manager window extracts straight into the chosen folder.
 - A downloaded .shd passes its download mark on to every file (Windows Zone.Identifier, Linux user.xdg.origin.url).
 - Wrong password, PIM or key file, damage and "not a Shield file" all show the same message.
 
@@ -90,6 +104,33 @@ This file opens again from "Shield user guide" in the Start menu and as "usage.t
   cloud folders keep old blocks. There overwriting and TRIM cannot guarantee physical erasure. Full-disk encryption
   (BitLocker, LUKS) from the start is the reliable answer.
 
+8-1. Secure delete tab (3.1.0 final; design in docs/10)
+-----------------------------------------------------
+- Overwrites files and folders without encrypting them, then deletes them. This cannot be undone.
+- How to start: [Add files...]/[Add folder...] or drag and drop on the Secure delete tab, right-click "Secure delete
+  with SHIELD" (classic Explorer menu; Nautilus, Nemo, Dolphin, Thunar), or shield wipe on the console. The context menu
+  only opens the tab; the confirmation happens in the window.
+- Three confirmation steps (two when only .shd containers are selected):
+    1) Warning: real paths, number of files and folders, total size, passes, skipped items and why -> [Continue]
+    2) Limits: storage type, snapshot / cloud / COW warnings, and the checkbox "I understand copies can remain on SSDs,
+       snapshots and backups"
+    3) Type the 6-character code, accepted from 3 s on (case and spaces ignored). Three wrong answers start over with a
+       new code.
+  [Cancel] at any step, or changing the list, starts over. There is no "don't ask again" option.
+- Settings password: with a settings password set (Settings > Security), the settings password is asked once more after
+  the code. Settings > Security > Secure delete "Ask for the settings password before secure delete" (on by default)
+  decides; switching it off needs the settings password. It is typed every time; three wrong answers start over. The
+  console's shield wipe asks for it on the terminal right before deleting (refused without a terminal).
+- Refused: drive roots (C:\, /), system folders (Windows, Program Files, /usr, /etc ...), home folder roots, Shield's
+  own programs and config folder, special files such as devices and pipes; links and mount points into other volumes
+  are not followed (skipped). Open, locked .shd files are skipped.
+- Result: per item done / partial (a stream failed ...) / skipped / failed with the reason. Unless everything is done,
+  the result never says only "done". Cancelling midway: finished files are deleted, the file in progress stays
+  partly overwritten.
+- Limits: SSD/NVMe (wear levelling), snapshots and shadow copies, COW file systems (btrfs, ZFS ...), cloud sync folders,
+  backups and copies already in the recycle bin can keep old data. Malware running as the same user can get around the
+  confirmation (it guards against mistakes).
+
 9. Disk cleanup tab
 -------------------
 - Choose a volume (drive list or [Choose volume by folder...]); the storage type is shown.
@@ -114,7 +155,7 @@ Categories: General / Security / Encryption / File manager / Updates. Changes ap
   first. While locked, security items are greyed out; auto-lock locks again. Wrong passwords wait 1 s, doubling up to
   30 s. Only an Argon2id verifier is stored, never the password.
   The create / change button is always available: unusable passwords (under 8 characters, confirmation differs,
-  too long) are refused with the reason shown; usable but weak ones (under 12 characters, common words, sequences
+  too long) are refused with the reason shown; usable but weak ones (under 13 characters, common words, sequences
   ...) get the same "Weak password" confirmation as encryption.
 - Protected items: screen capture protection, mouse entropy, entropy sources, command-line password arguments, default
   passes, update mode, auto-lock time, lock on minimize and lock on focus loss, password [Show], clipboard clearing,
@@ -128,6 +169,9 @@ Categories: General / Security / Encryption / File manager / Updates. Changes ap
   settings.key by hand) -> everything returns to the safe defaults and a new settings password can be created.
   Containers are not affected. Location: Windows %LOCALAPPDATA%\Shield, Linux $XDG_CONFIG_HOME/shield (usually
   ~/.config/shield), portable: Shield_data.
+  Linux (3.1.0 final): with neither HOME nor XDG_CONFIG_HOME set, settings are not written (no other place is used
+  instead). The config folder must be owned by the user with mode 0700; a settings.toml others can write and a
+  settings.key that is not 0600 are ignored.
 - Language (Korean/English/system), theme (light/dark/system), date format, start screen, default PIM, compression.
 - File manager: hidden files, start folder, sorting, delete confirmation, context menu (this user) register/remove
   (for portable and AppImage copies).
@@ -157,6 +201,10 @@ Categories: General / Security / Encryption / File manager / Updates. Changes ap
   "Shield-Updater" are sent; offline checks fail silently (errors only for a manual check).
 - Downloads go to a private temp folder; the built-in key verifies the manifest signature -> version -> SHA-256 -> the
   installer's signature. Any failure deletes the download and stops. Same or older versions are never installed.
+- 3.1.0 final: automatic installs need a signed v2 manifest. An expired manifest ("manifest expired"), one issued in the
+  future ("check the computer's clock"), one signed by a revoked key, and a release older than one already seen
+  (rollback) are refused; only the release page link is shown. What was seen is kept in update_seen.txt in the config
+  folder (safe to delete; protection just becomes weaker).
 - Before installing, typed passwords and open containers are wiped. Windows closes Shield and starts the MSI. Linux deb
   asks for the admin password via pkexec; an AppImage is replaced in place. Portable exe and console-only files are
   not replaced; the release page is shown.
@@ -175,6 +223,9 @@ Categories: General / Security / Encryption / File manager / Updates. Changes ap
   shield change-password all.shd                  shield rekey all.shd --passes 7
   shield keyfile my.key --size 4                  shield verify file file.sig [--key key.asc]
   shield update [--check]                         shield entropy                shield version
+  shield wipe old.txt folder/ -r [--passes 7]     secure delete (warning, limits and 6-character code on the terminal; docs/10)
+  shield wipe folder/ -r --dry-run                print the plan and warnings and issue a confirmation token (deletes nothing)
+  shield wipe folder/ -r --confirm-token <token> --i-understand-irreversible   for scripts (only for the same plan)
   shield gui [encrypt|decrypt|explorer|settings|open <c>]
 - Passwords are read without echo (not even the length). Ctrl+U clears, Esc / Ctrl+C cancel.
 - --reveal: input is shown on a separate screen; after Enter that screen and the scrollback are cleared.
@@ -182,10 +233,14 @@ Categories: General / Security / Encryption / File manager / Updates. Changes ap
   visible to other programs (Task Manager, ps, shell history): not recommended. Passwords are never taken from
   environment variables, files or pipes.
 - Key files -k (repeatable), --pim; new values --new-keyfile, --new-pim, --new-password.
-- --yes answers questions with yes but warnings are still printed. --quiet prints errors only, --json prints the result
-  as one JSON line (never anything secret).
+- --yes answers questions with yes but warnings are still printed. It does not apply to weak new-password warnings or to
+  the secure delete confirmation. --quiet prints errors only, --json prints the result as one JSON line (never anything
+  secret).
+- --allow-weak (3.1.0 final): use a new password despite its warnings. Required to use a weak password where there is no
+  terminal (scripts); without it nothing is created and the command fails. The refusal rules (empty password, low PIM
+  with fewer than 20 characters ...) cannot be overridden by --allow-weak.
 - Exit codes: 0 done, 1 failed, 2 usage, 3 wrong credentials or damaged, 4 bad signature, 5 cancelled, 6 busy,
-  130 interrupted.
+  7 partly done (shield wipe), 8 refused (shield wipe: blocked item, confirmation failed, token mismatch, settings password), 130 interrupted.
 - The first Ctrl+C (or SIGTERM / SIGHUP) cancels and cleans up temp files; the second ends at once.
 
 16. Linux notes

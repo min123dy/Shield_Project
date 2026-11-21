@@ -32,15 +32,36 @@ pub fn repo_url() -> Option<String> {
     repo().map(|(o, r)| format!("https://github.com/{o}/{r}"))
 }
 
-/// The embedded release key, parsed once. None when the build has no key or it is unusable.
-pub fn release_key() -> Option<&'static Cert> {
-    static K: OnceLock<Option<Cert>> = OnceLock::new();
-    K.get_or_init(|| (!RELEASE_KEY.is_empty()).then(|| Cert::parse(RELEASE_KEY).ok()).flatten()).as_ref()
+const BACKUP_KEY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/release_key_backup.asc"));
+
+fn parse_key(b: &[u8]) -> Option<Cert> {
+    (!b.is_empty()).then(|| Cert::parse(b).ok()).flatten()
 }
 
-/// Release key fingerprint for the info and settings screens.
+/// The embedded main release key, parsed once. None when the build has no key or it is unusable.
+pub fn release_key() -> Option<&'static Cert> {
+    release_keys().first()
+}
+
+/// Every embedded release key, main key first, then the offline backup key (3.1.0 #3). A
+/// signature by any of them is accepted. An unusable or missing main key leaves the list empty:
+/// the backup alone never stands in for a build without a main key.
+pub fn release_keys() -> &'static [Cert] {
+    static K: OnceLock<Vec<Cert>> = OnceLock::new();
+    K.get_or_init(|| match parse_key(RELEASE_KEY) {
+        Some(main) => std::iter::once(main).chain(parse_key(BACKUP_KEY)).collect(),
+        None => Vec::new(),
+    })
+}
+
+/// Main release key fingerprint for the info and settings screens.
 pub fn fingerprint() -> Option<String> {
     release_key().map(Cert::fingerprint)
+}
+
+/// Backup release key fingerprint, when this build embeds one.
+pub fn backup_fingerprint() -> Option<String> {
+    release_keys().get(1).map(Cert::fingerprint)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,7 +80,10 @@ pub enum SelfCheck {
 /// detects a modified or corrupted program file, not a modified program that also replaced the
 /// embedded key (documented: check the fingerprint against the one published by the developer).
 pub fn self_check() -> SelfCheck {
-    let Some(key) = release_key() else { return SelfCheck::NoKey };
+    let keys = release_keys();
+    if keys.is_empty() {
+        return SelfCheck::NoKey;
+    }
     let Ok(exe) = std::env::current_exe() else { return SelfCheck::NoSignature };
     let mut sig = exe.clone().into_os_string();
     sig.push(".sig");
@@ -67,7 +91,7 @@ pub fn self_check() -> SelfCheck {
     if !sig.is_file() {
         return SelfCheck::NoSignature;
     }
-    match key.verify_file(&exe, &sig) {
+    match crate::sigverify::verify_file_any(keys, &exe, &sig) {
         Ok(v) => SelfCheck::Verified(v),
         Err(e) => SelfCheck::Invalid(e),
     }

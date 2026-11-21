@@ -1,4 +1,4 @@
-# Shield 3.0.0
+# Shield 3.1.0
 
 [한국어](#한국어) · [English](#english)
 
@@ -9,6 +9,21 @@
 Shield는 Windows와 Linux용 파일·폴더 암호화 프로그램입니다. 파일을 압축한 뒤 XChaCha20-Poly1305로 암호화해 `.shd`
 컨테이너에 저장하고, 파일 관리자 창에서 컨테이너 안을 보거나 일부만 꺼내고 파일을 더하거나 뺄 수 있습니다.
 창 프로그램(`shield-gui`)과 명령줄 프로그램(`shield`)이 있으며, 두 OS가 같은 파일 형식을 씁니다.
+
+> **릴리스 키 운영 참고**: `keys/release_key.asc`는 유효한 공개키여야 하지만, 별도 서명 부키·만료일·프로젝트 전용
+> 사용자 ID·백업 공개키는 빌드나 서명 검증의 필수 조건이 아닙니다. 주 키에 서명 권한이 있으면 주 키로 직접 서명할
+> 수 있습니다. 전용 서명 부키와 오프라인 백업 키는 보안 운영을 위한 권장 사항입니다. 서명된 태그 릴리스에는
+> 내장 공개키와 일치하는 서명 가능한 비밀키가 여전히 필요합니다. 자세한 내용은 `docs/07_서명키_교체.txt`를 참고하세요.
+
+### 3.1.0 최종에서 바뀐 것
+
+- **완전삭제**: 파일·폴더를 덮어쓴 뒤 지우는 기능(GUI 탭, `shield wipe`, 우클릭 "SHIELD로 완전삭제"). 경고 -> 한계
+  확인 -> 6자 코드 3단계, 시스템 폴더·드라이브 루트·홈 루트는 거부. SSD·스냅숏·클라우드에서는 물리적 삭제를 보장하지
+  않습니다. 설계: `docs/10_완전삭제_설계.txt`.
+- **업데이트 매니페스트 v2**: 발행·만료·최소 버전·릴리스 ID·폐기 키로 재생·롤백을 거부합니다(v1은 3.0.0용으로 함께 게시).
+- **CLI `--allow-weak`**: 약한 새 비밀번호는 터미널에서 답하거나 `--allow-weak`일 때만 씁니다(`--yes`로는 안 됨).
+- **검토 항목 A-J와 추가 분석 수정**: 크기 제한 읽기, Linux 설정 폴더 검사(/tmp 폴백 삭제), 파일 이름 위장 문자,
+  CI 고정·출처 증명, 빌드 경로 재매핑 등. `docs/08_3.1.0_최종_변경_내역.txt`, `docs/09_보안_분석_보고서.txt`.
 
 ### 3.0의 새 기능
 
@@ -39,9 +54,9 @@ Shield는 Windows와 Linux용 파일·폴더 암호화 프로그램입니다. �
 
 ### 설치
 
-- Windows: `Shield_v3.0.0_x64.msi` (창 프로그램 + PATH에 `shield`), 또는 `Shield_v3.0.0_x64_portable.exe`,
-  `shield-console_v3.0.0_windows_x64.exe`
-- Linux: `sudo apt install ./shield_v3.0.0_amd64.deb`, 또는 `Shield_v3.0.0_x86_64.AppImage`, `shield-console_v3.0.0_linux_x64`
+- Windows: `Shield_v3.1.0_x64.msi` (창 프로그램 + PATH에 `shield`), 또는 `Shield_v3.1.0_x64_portable.exe`,
+  `shield-console_v3.1.0_windows_x64.exe`
+- Linux: `sudo apt install ./shield_v3.1.0_amd64.deb`, 또는 `Shield_v3.1.0_x86_64.AppImage`, `shield-console_v3.1.0_linux_x64`
 - 받은 파일은 `.sig`로 검증하세요: `gpg --verify <파일>.sig <파일>` 또는 `shield verify <파일> <파일>.sig --key <공개키.asc>`
 
 ### 빠른 사용
@@ -51,6 +66,7 @@ shield encrypt 보고서.pdf 사진/ -o 묶음.shd     여러 항목을 하나�
 shield decrypt 묶음.shd -o 풀_폴더
 shield list 묶음.shd --json
 shield verify 파일 파일.sig
+shield wipe 옛자료/ -r                          완전삭제 (터미널에서 세 단계 확인)
 shield help                                    전체 도움말과 종료 코드
 ```
 
@@ -62,7 +78,10 @@ Linux:   ./build.sh --repo https://github.com/<owner>/<repo> --no-sign
 ```
 
 입력: 저장소 URL, 내장할 공개키 `.asc`(기본 `keys/release_key.asc`), 서명 여부, 변형. 서명 개인키는 저장소에 넣지 않고,
-CI에서는 GitHub 시크릿(서명 부키)으로만 씁니다. 자세한 내용은 `docs/02_빌드_방법.txt`.
+CI에서는 내장 공개키와 일치하는 서명 가능한 비밀키를 GitHub Environment 시크릿으로만 씁니다(전용 서명 부키 권장,
+필수 아님). 자세한 내용은 `docs/02_빌드_방법.txt`.
+
+라이선스: **Apache License 2.0** (`LICENSE`, Cargo 워크스페이스 메타데이터 및 배포 패키지 기준). 소스 ZIP의 비ASCII 파일명은 UTF-8로 저장합니다.
 
 ### 문서
 
@@ -73,15 +92,31 @@ CI에서는 GitHub 시크릿(서명 부키)으로만 씁니다. 자세한 내용
 | `docs/03_사용_방법.txt` | 사용 설명서 (창과 명령줄) |
 | `docs/04_설치_안내.txt` | 설치 첫 화면의 주의사항 |
 | `docs/05_테스트_및_점검_기록.txt` | 테스트 결과, 발견·수정한 문제, 보안 재점검 |
+| `docs/06_3.1.0_수정_기록.txt` | 이전 3.1.0 빌드의 보안 수정과 "SHIELD에서 열기" (항목별 내용, 테스트, 미확인 목록) |
+| `docs/07_서명키_교체.txt` | 릴리스 서명 키 운영·교체·백업 키, GitHub 수동 설정 체크리스트 |
+| `docs/08_3.1.0_최종_변경_내역.txt` | 이전 3.1.0 빌드 -> 3.1.0 최종 변경, 호환성, 사용자 조치 |
+| `docs/09_보안_분석_보고서.txt` | 보안 점검 범위, 새로 찾은 문제, 남은 위험, 실기 미검증 목록 |
+| `docs/10_완전삭제_설계.txt` | 완전삭제 흐름, 확인 상태 기계, 차단 목록, 한계, 테스트 대응 |
 | `docs/06_3.0.0_수정_기록.txt` | 3.0 변경, 의존성, 엔트로피 소스, OS 지원 표, 라이선스 검토 |
 | `docs/en/` | 영어판 |
 | `docs/history/` | 2.x 기록 |
 
-### 한계 (요약)
+### 한계 및 보완 도구 (요약)
 
 같은 사용자 권한의 악성 프로그램, 관리자/root, 커널, 물리적 접근은 막지 못합니다. SSD·COW 파일 시스템·스냅숏·클라우드
 폴더에서는 덮어쓰기와 TRIM이 물리적 삭제를 보장하지 않습니다. Linux에서는 설정 MAC 키가 봉인되지 않고 화면 캡처 방지가
-없습니다. 독립적인 외부 보안 감사를 받지 않았습니다. 전체 목록은 `docs/01_프로젝트_설명.txt` 7절.
+없습니다. MSI에는 Authenticode 서명이 없습니다(SmartScreen 경고; GPG `.sig`로 확인). 독립적인 제3자 보안 감사를
+받지 않았습니다. 전체 목록은 `docs/01_프로젝트_설명.txt` 7절, 보안 분석은 `docs/09_보안_분석_보고서.txt`.
+
+Shield는 `.shd` 파일·폴더 컨테이너의 암호화와 자체 완전삭제 기능을 제공하지만, **브라우저 캐시나 최근 파일·문서 열람 기록 등
+운영체제 및 다른 프로그램이 별도로 관리하는 사용 흔적을 검색하거나 삭제하지 않습니다.** 이러한 항목의 정리가 필요하다면
+별도 시스템 정리 도구인 [BleachBit](https://www.bleachbit.org/)를 보완적으로 사용할 수 있습니다. 정리 대상과 옵션을
+확인한 뒤 사용하세요. BleachBit 역시 모든 사용 흔적의 제거 또는 복구 불가능성을 보장하지는 않습니다.
+
+또한 Shield는 **디스크 전체 암호화나 파티션·장치 자체를 암호화하는 기능을 제공하지 않습니다.** 운영체제 드라이브를
+포함한 전체 디스크 암호화 또는 별도의 암호화 볼륨/컨테이너가 필요하다면 [VeraCrypt](https://www.veracrypt.fr/)를
+검토할 수 있습니다. VeraCrypt는 Shield와 목적 및 저장 형식이 다른 별도 프로젝트이며, 두 프로그램은 상호 보완적으로
+사용할 수 있습니다.
 
 ---
 
@@ -90,6 +125,24 @@ CI에서는 GitHub 시크릿(서명 부키)으로만 씁니다. 자세한 내용
 Shield encrypts files and folders on Windows and Linux. Items are compressed, encrypted with XChaCha20-Poly1305 and
 stored in a `.shd` container; the file manager window browses containers, extracts some items and adds or removes
 files. There is a windowed program (`shield-gui`) and a command-line program (`shield`); both OSes share one file format.
+
+> **Release-key operations**: `keys/release_key.asc` must be a valid public key, but a separate signing subkey, expiry,
+> project-specific user ID and backup public key are not prerequisites for building or verifying signatures. A primary
+> key with signing capability can sign directly. A dedicated signing subkey and an offline backup key are recommended
+> operational hardening, not mandatory gates. A signed tag release still needs a signing-capable secret key matching
+> the embedded public key. See `docs/en/07_key_rotation.txt`.
+
+### Changed in 3.1.0 final
+
+- **Secure delete**: overwrite and then delete files and folders (GUI tab, `shield wipe`, context menu "Secure delete
+  with SHIELD"). Three steps: warning -> limits -> 6-character code; system folders, drive roots and home roots are
+  refused. Physical erasure is not guaranteed on SSDs, snapshots or cloud folders. Design: `docs/en/10_secure_delete_design.txt`.
+- **Update manifest v2**: issue time, expiry, minimum version, release ID and revoked keys refuse replay and rollback (v1
+  is still published for 3.0.0).
+- **CLI `--allow-weak`**: a weak new password is used only after a terminal answer or with `--allow-weak` (not `--yes`).
+- **Review items A-J and further fixes**: bounded reads, Linux config folder checks (no /tmp fallback), spoofing
+  characters in file names, pinned CI with provenance attestations, build path remapping and more.
+  `docs/en/08_changes_3.1.0_final.txt`, `docs/en/09_security_report.txt`.
 
 ### New in 3.0
 
@@ -125,9 +178,9 @@ Keys are wiped after each task and the password is asked for every task. 3.0 ope
 
 ### Install
 
-- Windows: `Shield_v3.0.0_x64.msi` (windows + `shield` on PATH), or `Shield_v3.0.0_x64_portable.exe`,
-  `shield-console_v3.0.0_windows_x64.exe`
-- Linux: `sudo apt install ./shield_v3.0.0_amd64.deb`, or `Shield_v3.0.0_x86_64.AppImage`, `shield-console_v3.0.0_linux_x64`
+- Windows: `Shield_v3.1.0_x64.msi` (windows + `shield` on PATH), or `Shield_v3.1.0_x64_portable.exe`,
+  `shield-console_v3.1.0_windows_x64.exe`
+- Linux: `sudo apt install ./shield_v3.1.0_amd64.deb`, or `Shield_v3.1.0_x86_64.AppImage`, `shield-console_v3.1.0_linux_x64`
 - Verify downloads with the `.sig`: `gpg --verify <file>.sig <file>` or `shield verify <file> <file>.sig --key <key.asc>`
 
 ### Quick use
@@ -137,6 +190,7 @@ shield encrypt report.pdf photos/ -o all.shd    several items into one (--separa
 shield decrypt all.shd -o out_dir
 shield list all.shd --json
 shield verify file file.sig
+shield wipe old/ -r                             secure delete (three confirmation steps on the terminal)
 shield help                                     full help and exit codes
 ```
 
@@ -148,8 +202,11 @@ Linux:   ./build.sh --repo https://github.com/<owner>/<repo> --no-sign
 ```
 
 Inputs: repository URL, the public key `.asc` to embed (default `keys/release_key.asc`), signing yes/no, variants. The
-signing private key never goes into the repository; CI uses it only through GitHub secrets (signing subkey). Details in
+signing private key never goes into the repository; CI receives a signing-capable secret key matching the embedded
+public key through GitHub Environment secrets (a dedicated signing subkey is recommended, not required). Details in
 `docs/en/02_build.txt`.
+
+License: **Apache License 2.0** (`LICENSE`, Cargo workspace metadata and packaged notices). Non-ASCII source archive paths are stored as UTF-8.
 
 ### Documents
 
@@ -160,13 +217,30 @@ signing private key never goes into the repository; CI uses it only through GitH
 | `docs/en/03_usage.txt` | user guide (windows and command line) |
 | `docs/en/04_install_notes.txt` | notes on the first installer page |
 | `docs/en/05_test_and_audit.txt` | test results, bugs found and fixed, security re-audit |
+| `docs/en/06_changes_3.1.0.txt` | security fixes of the earlier 3.1.0 build and "Open in SHIELD" (per item, tests, unverified list) |
+| `docs/en/07_key_rotation.txt` | release signing key operation, rotation, backup key, GitHub manual settings checklist |
+| `docs/en/08_changes_3.1.0_final.txt` | earlier 3.1.0 build -> 3.1.0 final: changes, compatibility, user actions |
+| `docs/en/09_security_report.txt` | security review scope, new findings, remaining risks, unverified items |
+| `docs/en/10_secure_delete_design.txt` | secure delete flow, confirmation state machine, blocklist, limits, test map |
 | `docs/en/06_changes_3.0.0.txt` | 3.0 changes, dependencies, entropy sources, OS support table, license review |
 | `docs/` | Korean versions |
 | `docs/history/` | 2.x records (Korean) |
 
-### Limits (summary)
+### Limits and complementary tools (summary)
 
 Malware running as the same user, administrators/root, the kernel and physical access are out of reach. On SSDs, COW
 file systems, snapshots and cloud folders, overwriting and TRIM don't guarantee physical erasure. On Linux the settings
-MAC key is not sealed and there is no screen capture protection. No independent external audit. Full list:
-`docs/en/01_overview.txt` section 7.
+MAC key is not sealed and there is no screen capture protection. The MSI has no Authenticode signature (SmartScreen
+warns; check the GPG `.sig`). No independent third-party security audit. Full list: `docs/en/01_overview.txt` section 7;
+security analysis: `docs/en/09_security_report.txt`.
+
+Shield encrypts `.shd` file/folder containers and provides its own secure-delete function, but it **does not search for
+or remove usage traces managed separately by the operating system or other applications**, such as browser caches and
+recent-file or document-opening history. If you need to clean up those items, you can use a separate system-cleaning
+utility such as [BleachBit](https://www.bleachbit.org/) as a complementary tool. Review the selected items and options
+before running it. BleachBit also cannot guarantee that every usage trace is removed or made unrecoverable.
+
+Shield also **does not provide whole-disk encryption or encryption of an entire partition/device**. If you need to
+encrypt an operating-system drive or create a separate encrypted volume/container, consider
+[VeraCrypt](https://www.veracrypt.fr/). VeraCrypt is a separate project with a different purpose and storage format;
+it can complement Shield rather than replace its file-container workflow.

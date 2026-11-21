@@ -456,3 +456,118 @@ fn decrypted_output_arrives_with_the_download_mark() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn refused_folder_move_reads_as_a_translated_message() {
+    let x = std::io::Error::new(std::io::ErrorKind::PermissionDenied, shield_platform::NOREPLACE_DIR_REFUSED);
+    let y = crate::sysinfo::translate_noreplace(x);
+    assert_eq!(y.to_string(), crate::i18n::t("eng.noreplace_dir"));
+    let other = crate::sysinfo::translate_noreplace(std::io::Error::other("disk full"));
+    assert_eq!(other.to_string(), "disk full");
+}
+
+/// 3.1.0 #12: the part guard removes only the file it created.
+#[test]
+fn part_guard_removes_only_its_own_file() {
+    let d = tmpdir();
+    let (g, f) = PartGuard::create(d.join("x.part")).unwrap();
+    drop(f);
+    let p = g.path.clone();
+    drop(g);
+    assert!(!p.exists(), "its own file is removed");
+    assert!(PartGuard::create(d.join("taken")).is_ok());
+    fs::write(d.join("exists"), b"e").unwrap();
+    assert!(PartGuard::create(d.join("exists")).is_err(), "never an existing file");
+    assert_eq!(fs::read(d.join("exists")).unwrap(), b"e");
+    // the name is taken over by another file before the guard drops
+    let (g, f) = PartGuard::create(d.join("y.part")).unwrap();
+    drop(f);
+    fs::rename(&g.path, d.join("y.moved")).unwrap();
+    fs::write(d.join("y.part"), b"not ours").unwrap();
+    drop(g);
+    assert_eq!(fs::read(d.join("y.part")).unwrap(), b"not ours");
+    let w = crate::progress::take_cleanup_warnings();
+    assert!(w.iter().any(|w| w.contains("y.part")), "{w:?}");
+    // the folder vanished: no panic, nothing to remove
+    let sub = d.join("sub");
+    fs::create_dir(&sub).unwrap();
+    let (g, f) = PartGuard::create(sub.join("z.part")).unwrap();
+    drop(f);
+    fs::remove_dir_all(&sub).unwrap();
+    drop(g);
+    // the warnings are added to a failed task's message
+    crate::progress::cleanup_warning("left: q.part".into());
+    let e = crate::progress::with_cleanup_warnings::<()>(Err("failed".into())).unwrap_err();
+    assert!(e.starts_with("failed · ") && e.contains("q.part"), "{e}");
+    let _ = fs::remove_dir_all(d);
+}
+
+// ---- 3.1.0 review 2 #4: a folder or several items come out in a folder named after the archive ----
+
+#[test]
+fn several_items_or_a_renamed_folder_come_out_in_a_folder_named_after_the_archive() {
+    let dir = tmpdir();
+    let c = cred("archive name folder 123", 0);
+    let (a, b, photos) = (dir.join("a.txt"), dir.join("b.txt"), dir.join("photos"));
+    fs::write(&a, b"A").unwrap();
+    fs::write(&b, b"B").unwrap();
+    fs::create_dir_all(photos.join("sub")).unwrap();
+    fs::write(photos.join("sub").join("p.jpg"), b"P").unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(&out).unwrap();
+
+    // several files, archive renamed after encryption: the folder takes the archive's name
+    let many = dir.join("first.shd");
+    do_encrypt_many(&[a.clone(), b.clone()], &many, &c, &opts()).unwrap();
+    let trip = dir.join("trip.shd");
+    fs::rename(&many, &trip).unwrap();
+    dec(&trip, &out, &c).unwrap();
+    assert_eq!(fs::read(out.join("trip").join("a.txt")).unwrap(), b"A");
+    assert_eq!(fs::read(out.join("trip").join("b.txt")).unwrap(), b"B");
+    assert!(!out.join("first").exists());
+
+    // one folder with the archive's name: no second level (photos.shd -> photos/...)
+    let ph = dir.join("photos.shd");
+    do_encrypt(&photos, &ph, &c, &opts()).unwrap();
+    dec(&ph, &out, &c).unwrap();
+    assert_eq!(fs::read(out.join("photos").join("sub").join("p.jpg")).unwrap(), b"P");
+    assert!(!out.join("photos").join("photos").exists());
+
+    // the same folder in an archive with another name: inside the archive's folder
+    let holiday = dir.join("holiday.shd");
+    fs::rename(&ph, &holiday).unwrap();
+    dec(&holiday, &out, &c).unwrap();
+    assert_eq!(fs::read(out.join("holiday").join("photos").join("sub").join("p.jpg")).unwrap(), b"P");
+
+    // a single file keeps its own name whatever the archive is called
+    let one = dir.join("a.txt.shd");
+    do_encrypt(&a, &one, &c, &opts()).unwrap();
+    let renamed = dir.join("x.shd");
+    fs::rename(&one, &renamed).unwrap();
+    dec(&renamed, &out, &c).unwrap();
+    assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"A");
+    assert!(!out.join("x").exists());
+
+    // taken names get the usual suffix, nothing is overwritten
+    dec(&trip, &out, &c).unwrap();
+    assert_eq!(fs::read(out.join("trip (decrypted)").join("a.txt")).unwrap(), b"A");
+    let mut l = listing(&out);
+    l.sort();
+    assert_eq!(l, ["a.txt", "holiday", "photos", "trip", "trip (decrypted)"]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn output_folder_rule_table() {
+    // (items at the top: (name, is_dir)), archive name -> None = move the item itself out,
+    // Some(name) = everything into a folder `name`
+    let f = |items: &[(&str, bool)], arch: &str| out_folder(items, arch);
+    assert_eq!(f(&[("report.pdf", false)], "report.pdf"), None);
+    assert_eq!(f(&[("report.pdf", false)], "other"), None, "one file keeps its name");
+    assert_eq!(f(&[("photos", true)], "photos"), None, "no photos/photos");
+    assert_eq!(f(&[("Photos", true)], "photos"), None, "letter case alone does not nest");
+    assert_eq!(f(&[("photos", true)], "trip"), Some("trip".to_string()));
+    assert_eq!(f(&[("a", false), ("b", false)], "trip"), Some("trip".to_string()));
+    assert_eq!(f(&[("trip", true), ("b", false)], "trip"), Some("trip".to_string()), "several items always get a folder");
+    assert_eq!(f(&[], "trip"), Some("trip".to_string()), "an empty archive becomes an empty folder");
+}

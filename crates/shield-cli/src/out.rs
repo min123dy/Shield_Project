@@ -19,6 +19,10 @@ pub mod code {
     pub const VERIFY: i32 = 4;
     pub const CANCELLED: i32 = 5;
     pub const BUSY: i32 = 6;
+    /// `wipe`: something was not (fully) removed (3.1.0 final).
+    pub const PARTIAL: i32 = 7;
+    /// `wipe`: refused (protected item, confirmation failed or missing, wrong token).
+    pub const REFUSED: i32 = 8;
 }
 
 #[derive(Clone, Copy, Default)]
@@ -53,6 +57,25 @@ impl Out {
         } else {
             eprintln!("{} {}", t("cli.error"), strip_code(msg));
         }
+    }
+
+    /// y/N question that `--yes` does not answer (3.1.0 final, review E: weak passwords). Without
+    /// a terminal it fails with `needs` (the flag to give instead).
+    pub fn ask_tty(&self, lines: &[String], question: &str, needs: &str) -> Result<bool, String> {
+        for l in lines {
+            eprintln!("  {l}");
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err(needs.to_string());
+        }
+        if self.yes {
+            eprintln!("{}", t("cli.yes_not_for_this"));
+        }
+        eprint!("{question} {} ", t("cli.yes_no"));
+        let _ = std::io::stderr().flush();
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s).map_err(|e| e.to_string())?;
+        Ok(is_yes(&s))
     }
 
     /// y/N question on the terminal. `--yes` answers yes; without a terminal the answer is no
@@ -96,6 +119,8 @@ pub fn exit_for(msg: &str) -> i32 {
         code::CANCELLED
     } else if has_code(msg, crate::lock::C_BUSY) {
         code::BUSY
+    } else if crate::secure_delete::is_refusal(msg) {
+        code::REFUSED
     } else {
         code::FAILED
     }
@@ -148,6 +173,7 @@ mod tests {
         assert_eq!(exit_for(&crate::container::open_bad()), code::CREDENTIALS);
         assert_eq!(exit_for(&crate::progress::cancelled_msg()), code::CANCELLED);
         assert_eq!(exit_for("disk full"), code::FAILED);
+        assert_eq!(exit_for(&format!("protected [{}]", crate::secure_delete::C_REFUSED)), code::REFUSED);
         assert!(is_yes(" Y\n") && is_yes("예") && !is_yes("") && !is_yes("no"));
     }
 }

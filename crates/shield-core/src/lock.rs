@@ -69,19 +69,20 @@ fn unlock(f: &File) -> io::Result<()> {
     f.unlock()
 }
 
-fn lock_dir() -> PathBuf {
+fn lock_dir() -> R<PathBuf> {
     if cfg!(test) {
-        return std::env::temp_dir().join("shield_test_locks");
+        return Ok(std::env::temp_dir().join("shield_test_locks"));
     }
-    crate::settings::data_dir().join("locks")
+    // no usable data folder (review D): an error, never a lock somewhere else
+    Ok(crate::settings::data_dir()?.join("locks"))
 }
 
 /// Lock file of a container: name = SHA3-256 of the resolved, case-folded path.
-pub fn lock_path_for(container: &Path) -> PathBuf {
+pub fn lock_path_for(container: &Path) -> R<PathBuf> {
     let key = crate::sysinfo::path_key(&crate::sysinfo::resolve(container).unwrap_or_else(|| container.to_path_buf()));
     let d = Sha3_256::digest(key.as_bytes());
     let name: String = d.iter().take(16).map(|b| format!("{b:02x}")).collect();
-    lock_dir().join(format!("{name}.lck"))
+    Ok(lock_dir()?.join(format!("{name}.lck")))
 }
 
 /// Takes `m` on `lock_file`, waiting up to `wait` (cancel aware). After that the caller gets the
@@ -112,7 +113,7 @@ pub fn acquire(lock_file: &Path, m: Mode, wait: Duration) -> R<FileLock> {
 pub const WAIT: Duration = Duration::from_secs(3);
 
 pub fn lock_container(container: &Path, m: Mode) -> R<FileLock> {
-    acquire(&lock_path_for(container), m, WAIT)
+    acquire(&lock_path_for(container)?, m, WAIT)
 }
 
 #[cfg(test)]
@@ -120,7 +121,7 @@ mod tests {
     use super::*;
 
     fn tmp_lock() -> PathBuf {
-        lock_dir().join(format!("t_{}.lck", crate::entropy::rand_hex().unwrap()))
+        lock_dir().unwrap().join(format!("t_{}.lck", crate::entropy::rand_hex().unwrap()))
     }
 
     #[test]
@@ -159,12 +160,12 @@ mod tests {
     #[test]
     fn same_container_two_spellings_one_lock() {
         let d = std::env::temp_dir();
-        let a = lock_path_for(&d.join("Some.SHD"));
-        let b = lock_path_for(&d.join("some.shd"));
+        let a = lock_path_for(&d.join("Some.SHD")).unwrap();
+        let b = lock_path_for(&d.join("some.shd")).unwrap();
         if cfg!(windows) {
             assert_eq!(a, b);
         }
-        assert_ne!(a, lock_path_for(&d.join("other.shd")));
+        assert_ne!(a, lock_path_for(&d.join("other.shd")).unwrap());
         assert!(!a.to_string_lossy().contains("Some"), "no container name in the lock path");
     }
 }
