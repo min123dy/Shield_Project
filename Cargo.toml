@@ -12,7 +12,7 @@ publish = false
 
 [workspace.dependencies]
 zeroize = "1"
-sha3 = { version = "0.10", features = ["zeroize"] }
+sha3 = { version = "0.12", features = ["zeroize"] }
 
 [profile.release]
 opt-level = 3
