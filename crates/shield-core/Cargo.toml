@@ -19,7 +19,7 @@ hkdf = "0.12"
 hmac = "0.12"
 zeroize = { workspace = true }
 rand = "0.8"
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["compress", "zstd"] }
 unicode-normalization = "0.1"
 # password length is counted in user-perceived characters (grapheme clusters: Hangul, emoji)
